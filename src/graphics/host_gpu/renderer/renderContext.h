@@ -98,6 +98,7 @@ private:
 	bool                    m_occlusion_active = false;
 	uint64_t                m_occlusion_begin_address = 0;
 	std::vector<uint32_t>   m_occlusion_queries;
+	bool                    m_occlusion_fallback_visible = false;
 	std::optional<uint32_t> m_occlusion_pending_query;
 	std::optional<uint32_t> m_occlusion_current_query;
 
