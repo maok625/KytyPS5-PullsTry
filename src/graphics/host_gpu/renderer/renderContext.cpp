@@ -168,6 +168,11 @@ void RenderContext::BeginOcclusionEvent(CommandBuffer& command, uint64_t event_a
 
 	WriteOcclusionResult(event_address, false, 0);
 	m_occlusion_active = true;
+	m_occlusion_fallback_visible = false;
+	if (command.IsRendering()) {
+		PrepareOcclusionRendering(command);
+		BeginOcclusionRendering(command);
+	}
 	m_occlusion_begin_address = event_address;
 	m_occlusion_queries.clear();
 	m_occlusion_pending_query.reset();
@@ -196,6 +201,7 @@ void RenderContext::PrepareOcclusionRendering(CommandBuffer& command) {
 	} else if (m_next_occlusion_query < OcclusionQueryCount) {
 		query = m_next_occlusion_query++;
 	} else {
+		m_occlusion_fallback_visible = true;
 		static std::once_flag warning_once;
 		std::call_once(warning_once, [] {
 			std::printf("Warning: Vulkan occlusion query pool exhausted; using conservative visible result.\\n");
@@ -203,7 +209,7 @@ void RenderContext::PrepareOcclusionRendering(CommandBuffer& command) {
 		return;
 	}
 
-	command.Handle().resetQueryPool(m_occlusion_query_pool, query, 1);
+	m_graphics.device.resetQueryPool(m_occlusion_query_pool, query, 1);
 	m_occlusion_pending_query = query;
 }
 
@@ -247,10 +253,13 @@ void RenderContext::EndOcclusionEvent(CommandBuffer& command, uint64_t event_add
 
 	if (queries.empty() || m_occlusion_query_pool == nullptr) {
 		WriteOcclusionResult(begin_address, true, 0);
-		WriteOcclusionResult(event_address, true, 0);
+		WriteOcclusionResult(event_address, true, m_occlusion_fallback_visible ? 1 : 0);
+		m_occlusion_fallback_visible = false;
 		return;
 	}
 
+	const bool fallback_visible = m_occlusion_fallback_visible;
+	m_occlusion_fallback_visible = false;
 	auto pool = m_occlusion_query_pool;
 	auto* device = &m_graphics.device;
 	m_command_scheduler.DeferOperation(
@@ -267,7 +276,7 @@ void RenderContext::EndOcclusionEvent(CommandBuffer& command, uint64_t event_add
 				m_free_occlusion_queries.push_back(query);
 			}
 			WriteOcclusionResult(begin_address, true, 0);
-			WriteOcclusionResult(event_address, true, visible ? 1 : 0);
+			WriteOcclusionResult(event_address, true, (visible || fallback_visible) ? 1 : 0);
 		});
 }
 
