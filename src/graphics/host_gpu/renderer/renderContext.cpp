@@ -25,6 +25,10 @@ RenderContext::RenderContext(GraphicContext& graphics)
 RenderContext::~RenderContext() {
 	ShutdownGpu();
 	m_command_scheduler.Shutdown();
+	if (m_occlusion_query_pool != nullptr && m_graphics.device != nullptr) {
+		m_graphics.device.destroyQueryPool(m_occlusion_query_pool);
+		m_occlusion_query_pool = nullptr;
+	}
 }
 
 void RenderContext::InitializeGpu(VideoOut::VideoOutDriver* video_out) {
@@ -276,8 +280,10 @@ void RenderContext::EndOcclusionEvent(const CommandBuffer& command, uint64_t eve
 	m_occlusion_fallback_visible = false;
 
 	// Publish the temporally-filtered result now. The guest predication path therefore never waits
-	// on the host query worker. The Vulkan result below is only used to update the next prediction.
-	WriteOcclusionResult(event_address, true, predicted_visible ? 1 : 0);
+	// on the host query worker. Unknown/uninstrumented intervals stay visible.
+	const bool publish_visible =
+		predicted_visible || fallback_visible || queries.empty() || m_occlusion_query_pool == nullptr;
+	WriteOcclusionResult(event_address, true, publish_visible ? 1 : 0);
 
 	if (queries.empty() || m_occlusion_query_pool == nullptr) {
 		return;
