@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/render.h"
 
+#include <atomic>
 #include <condition_variable>
 #include <mutex>
 
