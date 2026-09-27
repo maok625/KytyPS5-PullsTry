@@ -1406,26 +1406,18 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 		case 0x00000039: {
 			if (event_index != 0x00000001 || event_address == 0 || (event_address & 0x7u) != 0) {
 				EXIT("invalid occlusion-counter dump: index=0x%08" PRIx32 ", address=0x%016" PRIx64
-				     "\n",
+				     "\\n",
 				     event_index, event_address);
 			}
-			static std::once_flag warning_once;
-			std::call_once(warning_once, [] {
-				std::printf("Warning: game uses occlusion queries, which are currently treated as "
-				            "always visible; GPU usage may be higher and FPS may be lower.\n");
-			});
-
-			// Until host occlusion queries are implemented, publish an always-visible result. The
-			// PS5 layout contains one interleaved begin/end pair per DB, and bit 63 marks a result
-			// ready.
-			constexpr uint64_t ready_bit    = 1ull << 63u;
-			constexpr uint64_t counter_mask = ready_bit - 1u;
-			auto*              results      = reinterpret_cast<volatile uint64_t*>(event_address);
-			const auto         value        = ready_bit | m_synthetic_occlusion_counter;
-			for (uint32_t db = 0; db < 16u; db++) {
-				results[db * 2u] = value;
+			// EVENT_WRITE 0x39 is emitted once for the begin slot and once for the
+			// interleaved end slot. The latter is one uint64_t past the begin address.
+			if ((event_address & 0x0fu) == 0u) {
+				m_renderer.BeginOcclusionEvent(CurrentBuffer(), event_address);
+			} else if ((event_address & 0x0fu) == 0x8u) {
+				m_renderer.EndOcclusionEvent(CurrentBuffer(), event_address);
+			} else {
+				EXIT("invalid occlusion-counter slot: address=0x%016" PRIx64 "\\n", event_address);
 			}
-			m_synthetic_occlusion_counter = (m_synthetic_occlusion_counter + 1u) & counter_mask;
 			break;
 		}
 		default:
