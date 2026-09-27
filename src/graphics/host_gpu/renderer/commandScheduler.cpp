@@ -222,6 +222,7 @@ void CommandScheduler::PopPendingOperations() {
 				return;
 			}
 			operation = std::move(m_pending_operations.front());
+			m_pending_operations.pop();
 			m_pending_operation_count.fetch_sub(1, std::memory_order_release);
 		}
 		WaitPriorityOperations(operation.tick);
