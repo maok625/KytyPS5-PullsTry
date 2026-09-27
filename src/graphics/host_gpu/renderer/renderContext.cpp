@@ -7,6 +7,7 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <array>
 
 namespace Libs::Graphics {
 
@@ -134,6 +135,138 @@ void RenderContext::RunGarbageCollector() {
 	m_texture_cache.ProcessDownloadImages();
 	m_texture_cache.RunGarbageCollector();
 	m_buffer_cache.RunGarbageCollector();
+}
+
+
+namespace {
+constexpr uint64_t OcclusionReadyBit = 1ull << 63u;
+constexpr uint32_t OcclusionDbCount = 16u;
+
+void WriteOcclusionResult(uint64_t address, bool ready, uint64_t value) {
+	if (address == 0) {
+		return;
+	}
+	auto* results = reinterpret_cast<volatile uint64_t*>(address);
+	const uint64_t result = ready ? (OcclusionReadyBit | value) : 0;
+	for (uint32_t db = 0; db < OcclusionDbCount; db++) {
+		results[db * 2u] = result;
+	}
+}
+} // namespace
+
+void RenderContext::BeginOcclusionEvent(CommandBuffer& command, uint64_t event_address) {
+	(void)command;
+	if (m_occlusion_active) {
+		WriteOcclusionResult(m_occlusion_begin_address, true, 1);
+		m_occlusion_active = false;
+		m_occlusion_pending_query.reset();
+		m_occlusion_current_query.reset();
+		m_occlusion_queries.clear();
+	}
+
+	WriteOcclusionResult(event_address, false, 0);
+	m_occlusion_active = true;
+	m_occlusion_begin_address = event_address;
+	m_occlusion_queries.clear();
+	m_occlusion_pending_query.reset();
+	m_occlusion_current_query.reset();
+}
+
+void RenderContext::PrepareOcclusionRendering(CommandBuffer& command) {
+	if (!m_occlusion_active || m_occlusion_pending_query.has_value() ||
+	    m_occlusion_current_query.has_value()) {
+		return;
+	}
+
+	if (m_occlusion_query_pool == nullptr) {
+		vk::QueryPoolCreateInfo info {};
+		info.queryType = vk::QueryType::eOcclusion;
+		info.queryCount = OcclusionQueryCount;
+		auto [result, pool] = m_graphics.device.createQueryPool(info);
+		EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+		m_occlusion_query_pool = pool;
+	}
+
+	uint32_t query = 0;
+	if (!m_free_occlusion_queries.empty()) {
+		query = m_free_occlusion_queries.back();
+		m_free_occlusion_queries.pop_back();
+	} else if (m_next_occlusion_query < OcclusionQueryCount) {
+		query = m_next_occlusion_query++;
+	} else {
+		static std::once_flag warning_once;
+		std::call_once(warning_once, [] {
+			std::printf("Warning: Vulkan occlusion query pool exhausted; using conservative visible result.\\n");
+		});
+		return;
+	}
+
+	command.Handle().resetQueryPool(m_occlusion_query_pool, query, 1);
+	m_occlusion_pending_query = query;
+}
+
+void RenderContext::BeginOcclusionRendering(CommandBuffer& command) {
+	if (!m_occlusion_active || !m_occlusion_pending_query.has_value() ||
+	    m_occlusion_current_query.has_value()) {
+		return;
+	}
+	const uint32_t query = *m_occlusion_pending_query;
+	command.Handle().beginQuery(m_occlusion_query_pool, query, {});
+	m_occlusion_current_query = query;
+	m_occlusion_pending_query.reset();
+}
+
+void RenderContext::EndOcclusionRendering(CommandBuffer& command) {
+	if (!m_occlusion_current_query.has_value()) {
+		return;
+	}
+	const uint32_t query = *m_occlusion_current_query;
+	command.Handle().endQuery(m_occlusion_query_pool, query);
+	m_occlusion_queries.push_back(query);
+	m_occlusion_current_query.reset();
+}
+
+void RenderContext::EndOcclusionEvent(CommandBuffer& command, uint64_t event_address) {
+	WriteOcclusionResult(event_address, false, 0);
+
+	if (!m_occlusion_active) {
+		WriteOcclusionResult(event_address, true, 0);
+		return;
+	}
+
+	EndOcclusionRendering(command);
+
+	const uint64_t begin_address = m_occlusion_begin_address;
+	auto queries = std::move(m_occlusion_queries);
+	m_occlusion_queries.clear();
+	m_occlusion_active = false;
+	m_occlusion_pending_query.reset();
+	m_occlusion_current_query.reset();
+
+	if (queries.empty() || m_occlusion_query_pool == nullptr) {
+		WriteOcclusionResult(begin_address, true, 0);
+		WriteOcclusionResult(event_address, true, 0);
+		return;
+	}
+
+	auto pool = m_occlusion_query_pool;
+	auto* device = &m_graphics.device;
+	m_command_scheduler.DeferOperation(
+		[pool, device, begin_address, event_address, queries = std::move(queries), this]() mutable {
+			bool visible = false;
+			std::array<uint64_t, 1> result {};
+			for (const uint32_t query : queries) {
+				const auto status = device->getQueryPoolResults(
+					pool, query, 1, sizeof(uint64_t), result.data(), sizeof(uint64_t),
+					vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait);
+				if (status == vk::Result::eSuccess && result[0] != 0) {
+					visible = true;
+				}
+				m_free_occlusion_queries.push_back(query);
+			}
+			WriteOcclusionResult(begin_address, true, 0);
+			WriteOcclusionResult(event_address, true, visible ? 1 : 0);
+		});
 }
 
 void RenderContext::AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id) {
