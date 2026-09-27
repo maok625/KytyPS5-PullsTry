@@ -1405,18 +1405,13 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 			break;
 		case 0x00000039: {
 			if (event_index != 0x00000001 || event_address == 0 || (event_address & 0x7u) != 0) {
-				EXIT("invalid occlusion-counter dump: index=0x%08" PRIx32 ", address=0x%016" PRIx64
-				     "\\n",
+				EXIT("invalid occlusion-counter dump: index=0x%08" PRIx32 ", address=0x%016" PRIx64 "\n",
 				     event_index, event_address);
 			}
-			// EVENT_WRITE 0x39 is emitted once for the begin slot and once for the
-			// interleaved end slot. The latter is one uint64_t past the begin address.
-			if ((event_address & 0x0fu) == 0u) {
-				m_renderer.BeginOcclusionEvent(CurrentBuffer(), event_address);
-			} else if ((event_address & 0x0fu) == 0x8u) {
+			if (m_renderer.IsOcclusionEventActive()) {
 				m_renderer.EndOcclusionEvent(CurrentBuffer(), event_address);
 			} else {
-				EXIT("invalid occlusion-counter slot: address=0x%016" PRIx64 "\\n", event_address);
+				m_renderer.BeginOcclusionEvent(CurrentBuffer(), event_address);
 			}
 			break;
 		}
