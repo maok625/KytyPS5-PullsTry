@@ -68,6 +68,8 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	        state.num_color_attachments > RENDER_COLOR_ATTACHMENTS_MAX);
 	EndRendering();
 
+	m_context.PrepareOcclusionRendering(*this);
+
 	std::array<vk::RenderingAttachmentInfo, RENDER_COLOR_ATTACHMENTS_MAX> colors {};
 	for (uint32_t i = 0; i < state.num_color_attachments; i++) {
 		const auto& attachment = state.color_attachments[i];
@@ -104,6 +106,7 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	rendering.pDepthAttachment     = depth_stencil.has_depth ? &depth : nullptr;
 	rendering.pStencilAttachment   = depth_stencil.has_stencil ? &stencil : nullptr;
 	Handle().beginRendering(rendering);
+	m_context.BeginOcclusionRendering(*this);
 	m_render_state = state;
 	m_rendering    = true;
 }
