@@ -16,6 +16,7 @@
 #include "kernel/eventQueue.h"
 
 #include <memory>
+#include <optional>
 #include <shared_mutex>
 #include <vector>
 
@@ -26,6 +27,7 @@ class VideoOutDriver;
 namespace Libs::Graphics {
 
 class GuestGpu;
+class CommandBuffer;
 
 class RenderContext {
 public:
@@ -56,6 +58,12 @@ public:
 	void               PrepareBda();
 	void               RunGarbageCollector();
 
+	void BeginOcclusionEvent(CommandBuffer& command, uint64_t event_address);
+	void EndOcclusionEvent(CommandBuffer& command, uint64_t event_address);
+	void PrepareOcclusionRendering(CommandBuffer& command);
+	void BeginOcclusionRendering(CommandBuffer& command);
+	void EndOcclusionRendering(CommandBuffer& command);
+
 	void AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
 	void DeleteInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
 	void TriggerInterrupt(int event_id, uint32_t context_id);
@@ -81,6 +89,17 @@ private:
 	std::unique_ptr<GuestGpu> m_gpu;
 	VideoOut::VideoOutDriver* m_video_out = nullptr;
 	bool                      m_fault_process_pending = false;
+
+	static constexpr uint32_t OcclusionQueryCount = 1024;
+
+	vk::QueryPool           m_occlusion_query_pool = nullptr;
+	uint32_t                m_next_occlusion_query = 0;
+	std::vector<uint32_t>   m_free_occlusion_queries;
+	bool                    m_occlusion_active = false;
+	uint64_t                m_occlusion_begin_address = 0;
+	std::vector<uint32_t>   m_occlusion_queries;
+	std::optional<uint32_t> m_occlusion_pending_query;
+	std::optional<uint32_t> m_occlusion_current_query;
 
 	Common::Mutex                        m_interrupt_mutex;
 	std::vector<InterruptEqRegistration> m_interrupt_eqs;
