@@ -58,11 +58,11 @@ public:
 	void               PrepareBda();
 	void               RunGarbageCollector();
 
-	void BeginOcclusionEvent(CommandBuffer& command, uint64_t event_address);
-	void EndOcclusionEvent(CommandBuffer& command, uint64_t event_address);
-	void PrepareOcclusionRendering(CommandBuffer& command);
-	void BeginOcclusionRendering(CommandBuffer& command);
-	void EndOcclusionRendering(CommandBuffer& command);
+	void BeginOcclusionEvent(const CommandBuffer& command, uint64_t event_address);
+	void EndOcclusionEvent(const CommandBuffer& command, uint64_t event_address);
+	void PrepareOcclusionRendering(const CommandBuffer& command);
+	void BeginOcclusionRendering(const CommandBuffer& command);
+	void EndOcclusionRendering(const CommandBuffer& command);
 
 	void AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
 	void DeleteInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
