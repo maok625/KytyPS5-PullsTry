@@ -1,0 +1,1 @@
+GitHub write authorization test. This file is safe to remove after verification.
