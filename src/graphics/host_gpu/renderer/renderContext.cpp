@@ -142,7 +142,8 @@ void RenderContext::RunGarbageCollector() {
 
 namespace {
 constexpr uint64_t OcclusionReadyBit = 1ull << 63u;
-constexpr uint32_t OcclusionDbCount = 16u;
+constexpr uint32_t OcclusionDbCount   = 16u;
+constexpr uint8_t  OcclusionHysteresisFrames = 2u;
 
 void WriteOcclusionResult(uint64_t address, bool ready, uint64_t value) {
 	if (address == 0) {
@@ -158,6 +159,8 @@ void WriteOcclusionResult(uint64_t address, bool ready, uint64_t value) {
 
 void RenderContext::BeginOcclusionEvent(const CommandBuffer& command, uint64_t event_address) {
 	if (m_occlusion_active) {
+		// Nested/overlapping occlusion events are not expected by the guest. Do not let a malformed
+		// stream affect subsequent rendering; finish the previous interval conservatively.
 		WriteOcclusionResult(m_occlusion_begin_address, true, 1);
 		m_occlusion_active = false;
 		m_occlusion_pending_query.reset();
@@ -165,9 +168,24 @@ void RenderContext::BeginOcclusionEvent(const CommandBuffer& command, uint64_t e
 		m_occlusion_queries.clear();
 	}
 
-	WriteOcclusionResult(event_address, false, 0);
-	m_occlusion_active = true;
-	m_occlusion_begin_address = event_address;
+	bool predicted_visible = true;
+	{
+		std::lock_guard lock(m_occlusion_mutex);
+		const auto it = m_occlusion_history.find(event_address);
+		if (it != m_occlusion_history.end()) {
+			predicted_visible =
+				it->second.occluded_frames < OcclusionHysteresisFrames;
+		}
+	}
+
+	// Never make the PM4 stream wait for a future Vulkan result. The guest sees a completed,
+	// conservative result immediately; the current GPU query updates the prediction for the next
+	// use of this result slot.
+	WriteOcclusionResult(event_address, true, 0);
+
+	m_occlusion_active           = true;
+	m_occlusion_begin_address   = event_address;
+	m_occlusion_predicted_visible = predicted_visible;
 	m_occlusion_fallback_visible = false;
 	m_occlusion_queries.clear();
 	m_occlusion_pending_query.reset();
@@ -184,6 +202,8 @@ void RenderContext::PrepareOcclusionRendering(const CommandBuffer& command) {
 	    m_occlusion_current_query.has_value()) {
 		return;
 	}
+
+	std::lock_guard lock(m_occlusion_mutex);
 
 	if (m_occlusion_query_pool == nullptr) {
 		vk::QueryPoolCreateInfo info {};
@@ -235,10 +255,10 @@ void RenderContext::EndOcclusionRendering(const CommandBuffer& command) {
 }
 
 void RenderContext::EndOcclusionEvent(const CommandBuffer& command, uint64_t event_address) {
-	WriteOcclusionResult(event_address, false, 0);
-
 	if (!m_occlusion_active) {
-		WriteOcclusionResult(event_address, true, 0);
+		// A stray end event is kept conservative and, importantly, does not touch an unrelated
+		// memory location asynchronously.
+		WriteOcclusionResult(event_address, true, 1);
 		return;
 	}
 
@@ -247,36 +267,61 @@ void RenderContext::EndOcclusionEvent(const CommandBuffer& command, uint64_t eve
 	const uint64_t begin_address = m_occlusion_begin_address;
 	auto queries = std::move(m_occlusion_queries);
 	m_occlusion_queries.clear();
+	const bool fallback_visible = m_occlusion_fallback_visible;
+	const bool predicted_visible = m_occlusion_predicted_visible;
+
 	m_occlusion_active = false;
 	m_occlusion_pending_query.reset();
 	m_occlusion_current_query.reset();
+	m_occlusion_fallback_visible = false;
+
+	// Publish the temporally-filtered result now. The guest predication path therefore never waits
+	// on the host query worker. The Vulkan result below is only used to update the next prediction.
+	WriteOcclusionResult(event_address, true, predicted_visible ? 1 : 0);
 
 	if (queries.empty() || m_occlusion_query_pool == nullptr) {
-		WriteOcclusionResult(begin_address, true, 0);
-		WriteOcclusionResult(event_address, true, m_occlusion_fallback_visible ? 1 : 0);
-		m_occlusion_fallback_visible = false;
 		return;
 	}
 
-	const bool fallback_visible = m_occlusion_fallback_visible;
-	m_occlusion_fallback_visible = false;
-	auto pool = m_occlusion_query_pool;
-	auto* device = &m_graphics.device;
-	m_command_scheduler.DeferOperation(
-		[pool, device, begin_address, event_address, queries = std::move(queries), fallback_visible, this]() mutable {
+	const auto pool = m_occlusion_query_pool;
+	auto* const device = &m_graphics.device;
+
+	m_command_scheduler.DeferPriorityOperation(
+		[pool, device, begin_address, queries = std::move(queries), fallback_visible, this]() mutable {
 			bool visible = false;
+			bool query_failed = false;
 			std::array<uint64_t, 1> result {};
+
 			for (const uint32_t query : queries) {
 				const auto status = device->getQueryPoolResults(
 					pool, query, 1, sizeof(uint64_t), result.data(), sizeof(uint64_t),
-					vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait);
-				if (status == vk::Result::eSuccess && result[0] != 0) {
-					visible = true;
+					vk::QueryResultFlagBits::e64);
+				if (status == vk::Result::eSuccess) {
+					visible |= result[0] != 0;
+				} else {
+					query_failed = true;
 				}
-				m_free_occlusion_queries.push_back(query);
+
+			std::lock_guard lock(m_occlusion_mutex);
+			m_free_occlusion_queries.push_back(query);
 			}
-			WriteOcclusionResult(begin_address, true, 0);
-			WriteOcclusionResult(event_address, true, (visible || fallback_visible) ? 1 : 0);
+
+			// Any retrieval failure or exhausted-pool interval is treated as visible. Never train the
+			// temporal predictor from an invalid/unknown result.
+			visible |= fallback_visible || query_failed;
+
+			std::lock_guard lock(m_occlusion_mutex);
+			auto& history = m_occlusion_history[begin_address];
+		if (visible) {
+				history.occluded_frames = 0;
+		} else {
+				history.occluded_frames =
+					static_cast<uint8_t>(std::min<uint32_t>(
+						history.occluded_frames + 1u, OcclusionHysteresisFrames));
+			}
+			if (m_occlusion_history.size() > 4096u) {
+				m_occlusion_history.clear();
+			}
 		});
 }
 
