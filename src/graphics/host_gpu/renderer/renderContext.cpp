@@ -8,6 +8,8 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
+#include <mutex>
 
 namespace Libs::Graphics {
 
