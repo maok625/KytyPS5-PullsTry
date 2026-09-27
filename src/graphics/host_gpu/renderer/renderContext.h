@@ -16,8 +16,10 @@
 #include "kernel/eventQueue.h"
 
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <shared_mutex>
+#include <unordered_map>
 #include <vector>
 
 namespace Libs::VideoOut {
@@ -63,6 +65,7 @@ public:
 	void PrepareOcclusionRendering(const CommandBuffer& command);
 	void BeginOcclusionRendering(const CommandBuffer& command);
 	void EndOcclusionRendering(const CommandBuffer& command);
+	[[nodiscard]] bool IsOcclusionEventActive() const noexcept { return m_occlusion_active; }
 
 	void AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
 	void DeleteInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
@@ -98,9 +101,16 @@ private:
 	bool                    m_occlusion_active = false;
 	uint64_t                m_occlusion_begin_address = 0;
 	std::vector<uint32_t>   m_occlusion_queries;
-	bool                    m_occlusion_fallback_visible = false;
+	bool                    m_occlusion_fallback_visible   = false;
+	bool                    m_occlusion_predicted_visible   = true;
 	std::optional<uint32_t> m_occlusion_pending_query;
 	std::optional<uint32_t> m_occlusion_current_query;
+
+	struct OcclusionHistory {
+		uint8_t occluded_frames = 0;
+	};
+	std::unordered_map<uint64_t, OcclusionHistory> m_occlusion_history;
+	mutable std::mutex m_occlusion_mutex;
 
 	Common::Mutex                        m_interrupt_mutex;
 	std::vector<InterruptEqRegistration> m_interrupt_eqs;
