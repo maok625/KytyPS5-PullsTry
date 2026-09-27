@@ -108,7 +108,7 @@ void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
 		return;
 	}
 	static std::atomic_int id = 0;
-	const auto path = Config::GetShaderLogFolder() / fmt::format("{:04d}_new_shader_{}_{:016x}.spv",
+	const auto path = Config::GetShaderLogFolder() / fmt::format("{:04d}_new_shader_{}_ {:016x}.spv",
 	                                                             id++, stage_name, shader_hash);
 	Common::File::CreateDirectories(path.parent_path());
 	Common::File file(path);
@@ -222,8 +222,9 @@ struct PipelineCache::ProgramCache {
 			PipelineKeyHash::Mix(hash, key.user_data_count);
 			PipelineKeyHash::Mix(hash, key.code_size);
 			PipelineKeyHash::Mix(hash, key.static_state.size());
-			// Bucket same-shape static variants by source. ProgramKey equality performs the one
-			// exact state comparison needed on a stable hit without hashing up to 429 words first.
+			for (const auto word: key.static_state) {
+				PipelineKeyHash::Mix(hash, static_cast<std::size_t>(word));
+			}
 			return hash;
 		}
 	};
@@ -322,7 +323,7 @@ struct PipelineCache::ProgramCache {
 				                   ShaderRecompiler::IR::PushData::StartFor(
 				                       push_data_cursor, layout.ShaderDataDwords()) &&
 				               candidate.specialization == entry->second.specialization;
-			        });
+				});
 			    permutation != entry->second.permutations.end()) {
 				input_info.stage = {.program   = &permutation->program,
 				                    .resources = &entry->second.resources};
