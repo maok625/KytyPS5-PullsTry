@@ -156,7 +156,7 @@ void WriteOcclusionResult(uint64_t address, bool ready, uint64_t value) {
 }
 } // namespace
 
-void RenderContext::BeginOcclusionEvent(CommandBuffer& command, uint64_t event_address) {
+void RenderContext::BeginOcclusionEvent(const CommandBuffer& command, uint64_t event_address) {
 	if (m_occlusion_active) {
 		WriteOcclusionResult(m_occlusion_begin_address, true, 1);
 		m_occlusion_active = false;
@@ -179,7 +179,7 @@ void RenderContext::BeginOcclusionEvent(CommandBuffer& command, uint64_t event_a
 	}
 }
 
-void RenderContext::PrepareOcclusionRendering(CommandBuffer& command) {
+void RenderContext::PrepareOcclusionRendering(const CommandBuffer& command) {
 	if (!m_occlusion_active || m_occlusion_pending_query.has_value() ||
 	    m_occlusion_current_query.has_value()) {
 		return;
@@ -213,7 +213,7 @@ void RenderContext::PrepareOcclusionRendering(CommandBuffer& command) {
 	m_occlusion_pending_query = query;
 }
 
-void RenderContext::BeginOcclusionRendering(CommandBuffer& command) {
+void RenderContext::BeginOcclusionRendering(const CommandBuffer& command) {
 	if (!m_occlusion_active || !m_occlusion_pending_query.has_value() ||
 	    m_occlusion_current_query.has_value()) {
 		return;
@@ -224,7 +224,7 @@ void RenderContext::BeginOcclusionRendering(CommandBuffer& command) {
 	m_occlusion_pending_query.reset();
 }
 
-void RenderContext::EndOcclusionRendering(CommandBuffer& command) {
+void RenderContext::EndOcclusionRendering(const CommandBuffer& command) {
 	if (!m_occlusion_current_query.has_value()) {
 		return;
 	}
@@ -234,7 +234,7 @@ void RenderContext::EndOcclusionRendering(CommandBuffer& command) {
 	m_occlusion_current_query.reset();
 }
 
-void RenderContext::EndOcclusionEvent(CommandBuffer& command, uint64_t event_address) {
+void RenderContext::EndOcclusionEvent(const CommandBuffer& command, uint64_t event_address) {
 	WriteOcclusionResult(event_address, false, 0);
 
 	if (!m_occlusion_active) {
