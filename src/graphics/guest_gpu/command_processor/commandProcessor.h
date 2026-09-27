@@ -176,7 +176,6 @@ private:
 	FlipInfo  m_flip;
 	const int m_interrupt_event_id;
 	uint64_t  m_submit_id                   = 0;
-	uint64_t  m_synthetic_occlusion_counter = 0;
 	bool      m_predicate_skip              = false;
 };
 
