@@ -115,6 +115,7 @@ void CommandBuffer::EndRendering() const {
 	if (!m_rendering) {
 		return;
 	}
+	m_context.EndOcclusionRendering(*this);
 	Handle().endRendering();
 	m_rendering    = false;
 	m_render_state = {};
