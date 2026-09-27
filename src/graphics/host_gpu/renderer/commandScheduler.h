@@ -91,6 +91,7 @@ private:
 	CommandBuffer                m_command;
 	std::queue<PendingOperation> m_pending_operations;
 	std::queue<PendingOperation> m_priority_operations;
+	std::atomic<uint32_t>        m_pending_operation_count {0};
 	std::mutex                   m_operation_mutex;
 	std::condition_variable      m_operation_available;
 	std::jthread                 m_priority_thread;
