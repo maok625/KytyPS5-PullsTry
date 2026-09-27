@@ -208,6 +208,13 @@ void CommandScheduler::Wait(uint64_t tick) {
 }
 
 void CommandScheduler::PopPendingOperations() {
+	{
+		std::lock_guard lock(m_operation_mutex);
+		if (m_pending_operations.empty()) {
+			return;
+		}
+	}
+
 	m_master.Refresh();
 	for (;;) {
 		PendingOperation operation;
