@@ -157,7 +157,6 @@ void WriteOcclusionResult(uint64_t address, bool ready, uint64_t value) {
 } // namespace
 
 void RenderContext::BeginOcclusionEvent(CommandBuffer& command, uint64_t event_address) {
-	(void)command;
 	if (m_occlusion_active) {
 		WriteOcclusionResult(m_occlusion_begin_address, true, 1);
 		m_occlusion_active = false;
@@ -168,15 +167,16 @@ void RenderContext::BeginOcclusionEvent(CommandBuffer& command, uint64_t event_a
 
 	WriteOcclusionResult(event_address, false, 0);
 	m_occlusion_active = true;
+	m_occlusion_begin_address = event_address;
 	m_occlusion_fallback_visible = false;
+	m_occlusion_queries.clear();
+	m_occlusion_pending_query.reset();
+	m_occlusion_current_query.reset();
+
 	if (command.IsRendering()) {
 		PrepareOcclusionRendering(command);
 		BeginOcclusionRendering(command);
 	}
-	m_occlusion_begin_address = event_address;
-	m_occlusion_queries.clear();
-	m_occlusion_pending_query.reset();
-	m_occlusion_current_query.reset();
 }
 
 void RenderContext::PrepareOcclusionRendering(CommandBuffer& command) {
@@ -263,7 +263,7 @@ void RenderContext::EndOcclusionEvent(CommandBuffer& command, uint64_t event_add
 	auto pool = m_occlusion_query_pool;
 	auto* device = &m_graphics.device;
 	m_command_scheduler.DeferOperation(
-		[pool, device, begin_address, event_address, queries = std::move(queries), this]() mutable {
+		[pool, device, begin_address, event_address, queries = std::move(queries), fallback_visible, this]() mutable {
 			bool visible = false;
 			std::array<uint64_t, 1> result {};
 			for (const uint32_t query : queries) {
