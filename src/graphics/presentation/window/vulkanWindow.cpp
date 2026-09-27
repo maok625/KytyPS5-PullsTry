@@ -55,6 +55,7 @@ vk::PhysicalDeviceVulkan12Features WindowContext::RequiredVulkan12Features() noe
 	features.shaderOutputViewportIndex = VK_TRUE;
 	features.bufferDeviceAddress       = VK_TRUE;
 	features.shaderBufferInt64Atomics  = VK_TRUE;
+	features.hostQueryReset             = VK_TRUE;
 	return features;
 }
 
@@ -276,6 +277,11 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		if (required_features12.shaderBufferInt64Atomics == VK_TRUE &&
 		    features12.shaderBufferInt64Atomics != VK_TRUE) {
 			LOGF("shaderBufferInt64Atomics is not supported\n");
+			skip_device = true;
+		}
+		if (required_features12.hostQueryReset == VK_TRUE &&
+		    features12.hostQueryReset != VK_TRUE) {
+			LOGF("hostQueryReset is not supported\n");
 			skip_device = true;
 		}
 		if (features13.robustImageAccess != VK_TRUE) {
