@@ -308,19 +308,18 @@ void RenderContext::EndOcclusionEvent(const CommandBuffer& command, uint64_t eve
 					query_failed = true;
 				}
 
-			std::lock_guard lock(m_occlusion_mutex);
-			m_free_occlusion_queries.push_back(query);
+				std::lock_guard lock(m_occlusion_mutex);
+				m_free_occlusion_queries.push_back(query);
 			}
 
-			// Any retrieval failure or exhausted-pool interval is treated as visible. Never train the
-			// temporal predictor from an invalid/unknown result.
+			// Never train the temporal predictor from an invalid or unknown result.
 			visible |= fallback_visible || query_failed;
 
 			std::lock_guard lock(m_occlusion_mutex);
 			auto& history = m_occlusion_history[begin_address];
-		if (visible) {
+			if (visible) {
 				history.occluded_frames = 0;
-		} else {
+			} else {
 				history.occluded_frames =
 					static_cast<uint8_t>(std::min<uint32_t>(
 						history.occluded_frames + 1u, OcclusionHysteresisFrames));
@@ -329,8 +328,6 @@ void RenderContext::EndOcclusionEvent(const CommandBuffer& command, uint64_t eve
 				m_occlusion_history.clear();
 			}
 		});
-}
-
 void RenderContext::AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id) {
 	Common::LockGuard lock(m_interrupt_mutex);
 
