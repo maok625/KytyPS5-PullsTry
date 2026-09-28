@@ -1005,9 +1005,11 @@ void TestUniformizedMaterialImageKeys() {
         0, sentinel);
     const auto bit_index = fixture.Emit(
         ValueOpcode::SelectU32, {bit_guard, first, sentinel_index}, 0, bit);
+	carry_phi.AddPhiOperand(entry, arbitrary);
+    carry_phi.AddPhiOperand(bit, variant == Variant::WrongBackedge ? arbitrary : bit_index);
     auto &index_phi = merge->AppendNewInst(
         ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
-    index_phi.AddPhiOperand(inactive, arbitrary);
+    index_phi.AddPhiOperand(inactive, carry);
     index_phi.AddPhiOperand(sentinel, sentinel_index);
     index_phi.AddPhiOperand(bit, bit_index);
     const auto index = Value(&index_phi);
@@ -1038,17 +1040,18 @@ void TestUniformizedMaterialImageKeys() {
         ValueOpcode::LoadAddressU32,
         {base, material_offset, Value(0u), material_guard},
         fixture.AddMemory(material_memory, 0x1a88u), choose);
-    const auto local = fixture.Emit(
+    const auto local_key = fixture.Emit(
         ValueOpcode::SelectU32, {material_guard, loaded, arbitrary}, 0, choose);
     const auto key = fixture.Emit(
-        ValueOpcode::ReadLane, {local, Value(0u)}, 0, choose);
+        ValueOpcode::ReadLane, {local_key, Value(0u)}, 0, choose);
     const auto compared = fixture.Emit(
         ValueOpcode::IEqual32,
-        {key, wrong_equality ? arbitrary : local}, 0, choose);
+        {key, variant == Variant::WrongEquality ? arbitrary : local_key}, 0, choose);
     const auto sample_guard = fixture.Emit(
         ValueOpcode::LogicalAnd, {material_guard, compared}, 0, choose);
-    fixture.program.block_info[6].condition = fixture.Emit(
-        ValueOpcode::LogicalNot, {sample_guard}, 0, choose);
+    fixture.program.block_info[6].condition = branch(
+        fixture.Emit(ValueOpcode::LogicalNot, {sample_guard}, 0, choose),
+        CFG::BranchCondition::ExecZero, choose);
     fixture.program.block_info[6].terminator = {
         .kind = CFG::TerminatorKind::ConditionalBranch,
         .true_block = 8u, .false_block = 7u};
@@ -1108,7 +1111,8 @@ void TestUniformizedMaterialImageKeys() {
           "uniformized image key lost its finite material range");
     return ExtractResourcePlan(fixture.program);
   };
-  auto plan = make_plan(false, false);
+  auto plan = make_plan(Variant::Valid);
+  make_plan(Variant::Plain);
   Check(plan.requires_specialization_memory &&
             plan.descriptor_sources[plan.info.images[0].source]
                 .indirect_image->selector_mask.Resolve().TryInstruction() != nullptr,
@@ -1162,10 +1166,16 @@ void TestUniformizedMaterialImageKeys() {
   user_data[8] = first_table;
   Check(!MaterializeResources(plan, runtime, snapshot, specialization),
         "written buffer alias with an image record was accepted");
-  CheckFatal([&] { make_plan(true, false); }, "not a valid runtime value",
+  CheckFatal([&] { make_plan(Variant::WrongUpdate); }, "not a valid runtime value",
              "non-clearing material mask was accepted");
-  CheckFatal([&] { make_plan(false, true); }, "not a valid runtime value",
+  CheckFatal([&] { make_plan(Variant::WrongEquality); }, "not a valid runtime value",
              "unrelated ReadLane key was accepted");
+  CheckFatal([&] { make_plan(Variant::WrongExit); }, "not a valid runtime value",
+             "one inactive lane bypassed material index initialization for active lanes");
+  for (const auto variant : {Variant::WrongCarry, Variant::WrongBackedge}) {
+    CheckFatal([&] { make_plan(variant); }, "not a valid runtime value",
+               "inactive material lane did not preserve its selected index across iterations");
+  }
 }
 
 void TestImageDescriptorFields() {
