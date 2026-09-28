@@ -94,7 +94,7 @@ vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r, bool intege
 	};
 
 	vk::BorderColor border = integer_border ? vk::BorderColor::eIntTransparentBlack
-	                                       : vk::BorderColor::eFloatTransparentBlack;
+											: vk::BorderColor::eFloatTransparentBlack;
 	switch (static_cast<Prospero::SamplerBorderColor>(r.BorderColorType())) {
 		case Prospero::SamplerBorderColor::kTransBlack: break;
 		case Prospero::SamplerBorderColor::kOpaqueBlack:
