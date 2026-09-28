@@ -4,10 +4,12 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include <algorithm>
 #include <fmt/format.h>
+#include <optional>
 #include <span>
 #include <utility>
 
@@ -84,7 +86,10 @@ uint32_t ByteExtent(const MemoryInfo& memory) {
 
 class Tracker {
 public:
-	explicit Tracker(Program& program): m_program(program), m_info(program.info) {
+	Tracker(Program& program, const Decoder::Program& decoded, const CFG::Graph& native_cfg)
+	    : m_program(program), m_decoded(decoded), m_native_cfg(native_cfg),
+	      m_scalar_writes(std::move(program.scalar_writes)), m_info(program.info) {
+		std::ranges::sort(m_scalar_writes, {}, &Program::ScalarWrite::pc);
 		m_info.buffers.clear();
 		m_info.images.clear();
 		m_info.samplers.clear();
@@ -98,10 +103,8 @@ public:
 			Fail(0, "resources already tracked");
 			return;
 		}
-		if (!m_program.srt_plan_complete) {
-			Fail(0, "SRT plan is not ready");
-			return;
-		}
+		PlanScalarReads();
+		EliminateDeadCode(m_program.blocks);
 		PlanIndirectImages();
 		if (m_failed) {
 			return;
