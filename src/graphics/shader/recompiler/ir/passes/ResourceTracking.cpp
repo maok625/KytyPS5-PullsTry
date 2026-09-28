@@ -1502,8 +1502,8 @@ private:
 		uint32_t resource = 0;
 
 		if (buffer != BufferAccess::None) {
-			if (!GetHandle(inst.Arg(0), ValueOpcode::GetBufferResource, 4, flags.pc, handle,
-			               source)) {
+			if (!GetHandle(inst.Arg(0), ValueOpcode::GetBufferResource, 4, flags.pc,
+			               memory.resource * 4u, handle, source)) {
 				if (m_failed) {
 					return;
 				}
@@ -1561,7 +1561,8 @@ private:
 		if (indirect != nullptr) {
 			source = indirect->source;
 		} else {
-			GetHandle(inst.Arg(0), ValueOpcode::GetImageResource, 8, flags.pc, handle, source);
+			GetHandle(inst.Arg(0), ValueOpcode::GetImageResource, 8, flags.pc,
+			          memory.resource * 4u, handle, source);
 		}
 		if (m_failed) {
 			return;
@@ -1582,8 +1583,8 @@ private:
 			uint32_t   sampler_source = 0;
 			const bool sample_adjust =
 			    (memory.image_sample_flags & Decoder::ImageSampleFlagAdjust) != 0;
-			GetHandle(inst.Arg(1), ValueOpcode::GetSamplerResource, 4, flags.pc, sampler_handle,
-			          sampler_source, true, sample_adjust);
+			GetHandle(inst.Arg(1), ValueOpcode::GetSamplerResource, 4, flags.pc,
+			          memory.sampler * 4u, sampler_handle, sampler_source, true, sample_adjust);
 			if (m_failed) {
 				return;
 			}
@@ -1628,6 +1629,13 @@ private:
 	}
 
 	Program&                                   m_program;
+	const Decoder::Program&                    m_decoded;
+	const CFG::Graph&                          m_native_cfg;
+	std::vector<Program::ScalarWrite>          m_scalar_writes;
+	std::vector<ResolvedHandle>                m_resolved_handles;
+	std::vector<const Inst*>                   m_srt_visiting;
+	std::vector<const Inst*>                   m_srt_visited;
+	std::vector<Inst*>                         m_scalar_reads;
 	ShaderInfo                                 m_info;
 	std::vector<DescriptorSource>              m_sources;
 	std::vector<HandlePatch>                   m_handle_patches;
@@ -1639,10 +1647,8 @@ private:
 
 } // namespace
 
-bool TrackResources(Program& program) {
-	Tracker tracker(program);
-	tracker.Run();
-	return !tracker.Failed();
+void TrackResources(Program& program, const Decoder::Program& decoded, const CFG::Graph& native_cfg) {
+	Tracker(program, decoded, native_cfg).Run();
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
