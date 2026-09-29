@@ -4,7 +4,6 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
-#include "common/threads.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/shader.h"
@@ -103,6 +102,7 @@ struct ShaderProgram {
 	explicit operator bool() const { return id != 0 && module != nullptr; }
 };
 
+// The owning renderer serializes access, including saves while the GPU is running.
 class PipelineCache {
 public:
 	explicit PipelineCache(GraphicContext& graphics);
@@ -166,45 +166,10 @@ private:
 			hash ^= value + static_cast<std::size_t>(0x9e3779b97f4a7c15ull) + (hash << 6u) +
 			        (hash >> 2u);
 		}
-
-		static void MixStaticParams(std::size_t& hash, const PipelineStaticParameters& params) {
-			const auto* bytes = reinterpret_cast<const uint8_t*>(&params);
-			for (std::size_t i = 0; i < sizeof(params); i++) {
-				Mix(hash, bytes[i]);
-			}
-		}
-
-		static void MixRendering(std::size_t& hash, const PipelineRenderingState& rendering) {
-			Mix(hash, rendering.color_count);
-			for (uint32_t i = 0; i < rendering.color_count; i++) {
-				Mix(hash, static_cast<uint32_t>(rendering.color_formats[i]));
-			}
-			Mix(hash, static_cast<uint32_t>(rendering.depth_format));
-			Mix(hash, static_cast<uint32_t>(rendering.stencil_format));
-		}
 	};
 
 	struct GraphicsPipelineKeyHash {
-		std::size_t operator()(const GraphicsPipelineKey& key) const {
-			std::size_t hash = 0;
-			PipelineKeyHash::MixRendering(hash, key.rendering);
-			for (const auto id: key.vertex_shader_ids) {
-				PipelineKeyHash::Mix(hash, id);
-			}
-			PipelineKeyHash::Mix(hash, key.ps_shader_id);
-			PipelineKeyHash::Mix(hash, key.vertex_input.binding_count);
-			for (uint32_t i = 0; i < key.vertex_input.binding_count; i++) {
-				PipelineKeyHash::Mix(hash, key.vertex_input.bindings[i].stride);
-				PipelineKeyHash::Mix(hash, key.vertex_input.bindings[i].instance);
-			}
-			PipelineKeyHash::Mix(hash, key.vertex_input.attribute_count);
-			for (uint32_t i = 0; i < key.vertex_input.attribute_count; i++) {
-				PipelineKeyHash::Mix(hash, key.vertex_input.attributes[i].offset);
-				PipelineKeyHash::Mix(hash, key.vertex_input.attributes[i].binding);
-			}
-			PipelineKeyHash::MixStaticParams(hash, key.static_params);
-			return hash;
-		}
+		std::size_t operator()(const GraphicsPipelineKey& key) const;
 	};
 
 	GraphicContext&               m_graphics;
@@ -214,7 +179,6 @@ private:
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
-	Common::Mutex m_mutex;
 
 	void InitializeDriverCache();
 };

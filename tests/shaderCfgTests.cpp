@@ -1702,6 +1702,61 @@ void TestShaderStageBarriers() {
         "independent vertex invocations retained a workgroup barrier");
 }
 
+void TestVertexBufferGrouping() {
+  const uint32_t shader[] = {EncodeSopp(0x01)};
+  std::array<uint16_t, static_cast<size_t>(AgcDirectResourceType::Last) + 1> offsets;
+  offsets.fill(AGC_ILLEGAL_DIRECT_OFFSET);
+  offsets[static_cast<size_t>(AgcDirectResourceType::PtrVertexBufferTable)] = 0;
+  offsets[static_cast<size_t>(AgcDirectResourceType::PtrVertexAttribDescTable)] = 2;
+  ShaderUserData user_data{};
+  user_data.direct_resource_count = offsets.size();
+  user_data.direct_resource_offset = offsets.data();
+  std::array<ShaderSemantic, 4> semantics{};
+  for (uint32_t i = 0; i < semantics.size(); i++) {
+    semantics[i].semantic = i;
+    semantics[i].hardware_mapping = i;
+    semantics[i].size_in_elements = 1;
+  }
+  ShaderMappedData mapped{};
+  mapped.user_data = &user_data;
+  mapped.code_size_bytes = sizeof(shader);
+  mapped.input_semantics = semantics.data();
+  mapped.num_input_semantics = semantics.size();
+  HW::VertexShaderInfo regs{};
+  regs.es_regs.data_addr = reinterpret_cast<uint64_t>(shader);
+  regs.gs_regs.rsrc2.user_sgpr = 4;
+  ShaderMapUserData(regs.es_regs.data_addr, mapped);
+  std::array<ShaderBufferResource, 4> descriptors{};
+  const std::array<uint32_t, 4> attributes{0, 1u | (1u << 26u), 2, 3};
+  const std::array<uint64_t, 2> pointers{
+      reinterpret_cast<uint64_t>(descriptors.data()),
+      reinterpret_cast<uint64_t>(attributes.data())};
+  std::memcpy(regs.gs_user_sgpr.value, pointers.data(), sizeof(pointers));
+  ShaderVertexInputInfo input{};
+  for (const uint64_t base : {0x1000u, 0x3000u}) {
+    for (auto &descriptor : descriptors) {
+      descriptor.fields[1] = 16u << 16u;
+      descriptor.fields[2] = 8;
+      descriptor.UpdateAddress48(base);
+    }
+    descriptors[0].UpdateAddress48(base + 8);
+    descriptors[1].UpdateAddress48(base + 4);
+    descriptors[3].fields[1] = 0; // Constant attributes use their own buffer.
+    (void)PrepareProgram(regs, HW::Context{}, HW::UserConfig{}, input);
+    Check(input.resources_num == 4 && input.buffers_num == 3 &&
+              input.resources_dst[0].buffer_index == 0 &&
+              input.resources_dst[1].buffer_index == 1 &&
+              input.resources_dst[2].buffer_index == 0 &&
+              input.resources_dst[3].buffer_index == 2,
+          "interleaved vertex attributes lost their stride or instance-rate binding");
+    Check(input.buffers[0].addr == base && input.buffers[1].addr == base + 4 &&
+              input.buffers[1].fetch_index == 1 && input.buffers[2].stride == 0 &&
+              input.resources[0].Base48() - input.buffers[0].addr == 8 &&
+              input.resources[2].Base48() == input.buffers[0].addr,
+          "a later lower-address attribute or changed table left stale vertex offsets");
+  }
+}
+
 void TestNggVertexEntryState() {
   using namespace ShaderRecompiler;
   // PPSA03309 shader 5a39eb2021a5d2c1: retain its NGG prologue and replace
@@ -10571,15 +10626,31 @@ void TestNewShaderRecompilerClipDisabledPosition() {
   ShaderVertexInputInfo layout_a{};
   layout_a.resources_num = 1;
   layout_a.buffers_num = 1;
-  layout_a.buffers[0].attr_num = 1;
-  layout_a.buffers[0].attr_indices[0] = 0;
   layout_a.buffers[0].stride = 16;
   auto layout_b = layout_a;
   layout_b.buffers[0].stride = 32;
   layout_b.buffers[0].fetch_index = 1;
-  layout_b.buffers[0].attr_offsets[0] = 4;
+  layout_b.resources[0].UpdateAddress48(4);
   Check(MakeStageStaticKey(layout_a) == MakeStageStaticKey(layout_b),
         "pipeline-only vertex layout fragmented the shader module cache key");
+
+  const auto descriptor_state = [](const ShaderBufferResource &resource) {
+    return std::array<uint32_t, 9>{
+        resource.Stride(), resource.SwizzleEnabled(), resource.DstSelX(),
+        resource.DstSelY(), resource.DstSelZ(), resource.DstSelW(),
+        resource.RawFormat(), resource.OutOfBounds(), resource.AddTid()};
+  };
+  const auto key = MakeStageStaticKey(layout_a);
+  const auto state = descriptor_state(layout_a.resources[0]);
+  for (uint32_t word = 0; word < 4; word++) {
+    for (uint32_t bit = 0; bit < 32; bit++) {
+      auto changed = layout_a;
+      changed.resources[0].fields[word] ^= 1u << bit;
+      Check((MakeStageStaticKey(changed) == key) ==
+                (descriptor_state(changed.resources[0]) == state),
+            "vertex key lost a descriptor field or included runtime-only bits");
+    }
+  }
 }
 
 void TestNewShaderRecompilerAuxPositionExports() {
@@ -13855,6 +13926,7 @@ int main() {
   TestDemandDrivenSpirvDeclarations();
   TestNewShaderRecompilerSMovB32();
   TestShaderStageBarriers();
+  TestVertexBufferGrouping();
   TestNggVertexEntryState();
   TestNewShaderRecompilerClipDisabledPosition();
   TestNewShaderRecompilerAuxPositionExports();
