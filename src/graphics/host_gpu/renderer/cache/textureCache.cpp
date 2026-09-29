@@ -1825,9 +1825,9 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 		mapped    = oversized->Mapped().data();
 		offset    = 0;
 	} else {
-		auto& destination = oversized != nullptr ? *oversized : download;
+		download.Commit();
 	}
-	download.Commit();
+	auto& destination = oversized != nullptr ? *oversized : download;
 	if (!LibKernel::Memory::TryReadBacking(range.address, mapped, range.size)) {
 		return false;
 	}
