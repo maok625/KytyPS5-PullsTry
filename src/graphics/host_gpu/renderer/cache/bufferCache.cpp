@@ -133,11 +133,16 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	// each reserves its own region, and the stream keeps that region reserved until its
 	// deferred write-back has consumed it, so consecutive batches cannot overlap.
 	for (const auto& batch: SplitBufferDownload(ranges, m_download_buffer.MaxReservation(), 64)) {
-		const auto [mapped, offset] = m_download_buffer.Map(batch.total_size, 64);
+		auto [mapped, offset] = m_download_buffer.Map(total_size, 64);
+		std::unique_ptr<Buffer> temporary;
 		if (mapped == nullptr) {
-			EXIT("BufferCache: download batch could not be staged\n");
+			temporary = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+		                                     vk::BufferUsageFlagBits::eTransferDst, total_size);
+			mapped = temporary->Mapped().data();
+		} else {
+			m_download_buffer.Commit();
 		}
-		m_download_buffer.Commit();
+		const auto& download = temporary ? *temporary : m_download_buffer;
 		// Map can wait for a pending use of the staging buffer to retire. Waiting submits the
 		// current command buffer and begins a new one, so re-read the handle after every Map
 		// instead of recording later batches into a handle captured before the loop.
@@ -162,13 +167,13 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 		                       vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1, &before, 0,
 		                       nullptr);
-		native.copyBuffer(buffer.Handle(), m_download_buffer.Handle(),
+		native.copyBuffer(buffer.Handle(), download.Handle(),
 		                  static_cast<uint32_t>(copies.size()), copies.data());
 
 		auto after          = before;
 		after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
 		after.dstAccessMask = vk::AccessFlagBits::eHostRead;
-		after.buffer        = m_download_buffer.Handle();
+		after.buffer        = download.Handle();
 		after.offset        = offset;
 		after.size          = batch.total_size;
 		native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
@@ -177,8 +182,8 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		                       {}, 0, nullptr, 1, &after, 0, nullptr);
 		const uint64_t total = batch.total_size;
 		m_scheduler.DeferPriorityOperation([this, mapped, offset, total, buffer_address,
-		                                    copies = std::move(copies)] {
-			m_download_buffer.Invalidate(offset, total);
+		                                    copies = std::move(copies), owner = std::move(temporary)] {
+		(owner ? *owner : m_download_buffer).Invalidate(offset, total_size);
 			for (const auto& copy: copies) {
 				const auto* const staged = mapped + (copy.dstOffset - offset);
 				Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset, staged,
