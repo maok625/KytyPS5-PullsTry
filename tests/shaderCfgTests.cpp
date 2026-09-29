@@ -7,6 +7,7 @@
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
+#include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
@@ -12281,6 +12282,116 @@ void TestRenderTargetReverseExportMapping() {
       "active reverse MRT mapping was lost before shader specialization");
 }
 
+void TestBlendMappingClassification() {
+  using Factor = Prospero::BlendFactor;
+  using Support = BlendMappingSupport;
+  HW::BlendControl blend{};
+  blend.separate_alpha_blend = false;
+  const auto classify = [&](Prospero::ColorComponentMapping mapping) {
+    return ClassifyBlendMapping(blend, mapping);
+  };
+  for (const auto factor : {Factor::kConstantAlpha, Factor::kOneMinusConstantAlpha}) {
+    blend.color_srcblend = static_cast<uint8_t>(factor);
+    Check(classify(Prospero::ColorMappingAbgr) == Support::Direct,
+          "scalar blend constant incorrectly required physical alpha");
+  }
+  for (const auto factor : {Factor::kConstantColor, Factor::kOneMinusConstantColor}) {
+    blend.color_srcblend = static_cast<uint8_t>(factor);
+    Check(classify(Prospero::ColorMappingRgba) == Support::Direct &&
+              classify(Prospero::ColorMappingBgra) == Support::Unsupported &&
+              classify(Prospero::ColorMappingAbgr) == Support::Unsupported,
+          "logical blend constants were accepted with shuffled color components");
+  }
+  blend.color_srcblend = static_cast<uint8_t>(Factor::kOne);
+  blend.alpha_srcblend = static_cast<uint8_t>(Factor::kConstantColor);
+  blend.separate_alpha_blend = true;
+  Check(classify(Prospero::ColorMappingBgra) == Support::Direct &&
+            classify(Prospero::ColorMappingAbgr) == Support::Unsupported,
+        "separate constant-color alpha equation ignored the physical alpha location");
+  blend.color_srcblend = static_cast<uint8_t>(Factor::kSrcAlpha);
+  blend.separate_alpha_blend = false;
+  Check(classify(Prospero::ColorMappingAbgr) == Support::SourceAlpha,
+        "reversed source-alpha blending did not request logical alpha");
+  blend.separate_alpha_blend = true;
+  Check(classify(Prospero::ColorMappingAbgr) == Support::Unsupported,
+        "different alpha equations were accepted on a reversed target");
+  blend.separate_alpha_blend = false;
+  blend.color_srcblend = static_cast<uint8_t>(Factor::kDstAlpha);
+  Check(classify(Prospero::ColorMappingAbgr) == Support::Unsupported,
+        "destination alpha incorrectly used the physical alpha channel");
+}
+
+void TestLogicalAlphaBlendExport() {
+  ShaderPixelInputInfo pixel{};
+  pixel.target_output_mode[0] = 4;
+  pixel.target_export_mapping[0] = Prospero::ColorMappingAbgr;
+  const auto ordinary_key = MakeStageStaticKey(pixel);
+  pixel.dual_source_blending = true;
+  const auto guest_key = MakeStageStaticKey(pixel);
+  pixel.alpha_blend_source_remap = true;
+  const auto remapped_key = MakeStageStaticKey(pixel);
+  Check(ordinary_key != guest_key && guest_key != remapped_key &&
+            ordinary_key != remapped_key,
+        "ordinary, guest dual-source, and logical-alpha shaders share a cache key");
+
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  options.input_info.pixel = &pixel;
+  for (const bool compressed : {false, true}) {
+    const uint32_t shader[] = {
+        // RGBA = (1000, 2, 3, 0.25), packed into two half pairs when compressed.
+        EncodeVop1(0x01, 0, 255), compressed ? 0x400063d0u : 0x447a0000u,
+        EncodeVop1(0x01, 1, 255), compressed ? 0x34004200u : 0x40000000u,
+        EncodeVop1(0x01, 2, 255), 0x40400000u,
+        EncodeVop1(0x01, 3, 255), 0x3e800000u,
+        EncodeExp0(0, 0xf, false, compressed), EncodeExp1(0, 1, 2, 3),
+        EncodeExp0(1, 0xf, false), EncodeExp1(0, 0, 0, 0),
+        EncodeExp0(2, 0xf, true, false, true), EncodeExp1(0, 0, 0, 0),
+        EncodeSopp(0x01),
+    };
+    const auto result = RecompileForTest(shader, options);
+    CheckSpirvBinaryValidates(result.spirv);
+    const auto source = DisassembleSpirvBinary(result.spirv);
+    Check(source.find("OpDecorate %out_mrt_1 Location 0") != std::string::npos &&
+              source.find("OpDecorate %out_mrt_1 Index 1") != std::string::npos &&
+              CountSourceOccurrences(source, "OpStore %out_mrt_1 ") == 1 &&
+              source.find("out_mrt_2") == std::string::npos,
+          "inactive MRT exports overwrote the logical-alpha output");
+    Check(SpirvInstructionOpcodeCount(result.spirv, 252u) != 0,
+          "ignoring inactive MRT stores discarded their valid-mask export");
+    uint32_t alpha_input = 0;
+    uint32_t color_input = 0;
+    for (size_t i = 5; i < result.spirv.size(); i += result.spirv[i] >> 16u) {
+      if ((result.spirv[i] & 0xffffu) != 79u || (result.spirv[i] >> 16u) != 9u) {
+        continue;
+      }
+      const auto selectors = std::span(result.spirv).subspan(i + 5, 4);
+      if (std::ranges::equal(selectors, std::array{3u, 3u, 3u, 3u})) {
+        alpha_input = result.spirv[i + 3];
+      } else if (std::ranges::equal(selectors, std::array{3u, 2u, 1u, 0u})) {
+        color_input = result.spirv[i + 3];
+      }
+    }
+    Check(alpha_input != 0 && alpha_input == color_input,
+          "blend source did not broadcast logical alpha before the physical export swizzle");
+  }
+
+  const uint32_t guest_shader[] = {
+      EncodeExp0(0, 0xf, false), EncodeExp1(0, 1, 2, 3),
+      EncodeExp0(1, 0xf), EncodeExp1(4, 5, 6, 7), EncodeSopp(0x01),
+  };
+  pixel.alpha_blend_source_remap = false;
+  pixel.target_output_mode[1] = pixel.target_output_mode[0];
+  pixel.target_export_mapping = {};
+  const auto guest = RecompileForTest(guest_shader, options);
+  CheckSpirvBinaryValidates(guest.spirv);
+  const auto source = DisassembleSpirvBinary(guest.spirv);
+  Check(source.find("OpDecorate %out_mrt_1 Location 0") != std::string::npos &&
+            source.find("OpDecorate %out_mrt_1 Index 1") != std::string::npos &&
+            CountSourceOccurrences(source, "OpStore %out_mrt_1 ") == 1 &&
+            SpirvInstructionOpcodeCount(guest.spirv, 81u) == 8u,
+        "guest dual-source export was replaced by synthetic alpha");
+}
+
 void TestNewShaderRecompilerEarlyZDisabledWhenPixelKillEnabled() {
   constexpr uint32_t ExecutionModeEarlyFragmentTests = 9;
 
@@ -14043,6 +14154,8 @@ int main() {
   TestNewShaderRecompilerPerInvocationU64Complement();
   TestNewShaderRecompilerExpPixelOutputs();
   TestRenderTargetReverseExportMapping();
+  TestBlendMappingClassification();
+  TestLogicalAlphaBlendExport();
   TestNewShaderRecompilerEarlyZDisabledWhenPixelKillEnabled();
   TestTypedDescriptorRealWideMoveTranslation();
   TestComputeImageFill();
