@@ -213,6 +213,8 @@ struct VopcOpcodeInfo {
 };
 
 constexpr VopcOpcodeInfo VOPC_OPCODE_LIST[] = {
+    {0x22u, Opcode::V_CMP_EQ_F64, false},  {0x23u, Opcode::V_CMP_LE_F64, false},
+    {0x33u, Opcode::V_CMPX_LE_F64, false}, {0x36u, Opcode::V_CMPX_GE_F64, false},
     {0x00u, Opcode::V_CMP_F_F32},          {0x01u, Opcode::V_CMP_LT_F32},
     {0x02u, Opcode::V_CMP_EQ_F32},         {0x03u, Opcode::V_CMP_LE_F32},
     {0x04u, Opcode::V_CMP_GT_F32},         {0x05u, Opcode::V_CMP_LG_F32},
@@ -261,7 +263,12 @@ constexpr VopcOpcodeInfo VOPC_OPCODE_LIST[] = {
     {0xe2u, Opcode::V_CMP_EQ_U64, false},  {0xe3u, Opcode::V_CMP_LE_U64, false},
     {0xe4u, Opcode::V_CMP_GT_U64, false},  {0xe5u, Opcode::V_CMP_NE_U64, false},
     {0xe6u, Opcode::V_CMP_GE_U64, false},  {0xf3u, Opcode::V_CMPX_LE_U64, false},
+<<<<<<< ours
     {0xf5u, Opcode::V_CMPX_NE_U64, false}, {0xc9u, Opcode::V_CMP_LT_F16},
+=======
+    {0xf5u, Opcode::V_CMPX_NE_U64, false},
+    {0xc9u, Opcode::V_CMP_LT_F16},
+>>>>>>> theirs
     {0xcau, Opcode::V_CMP_EQ_F16},         {0xcbu, Opcode::V_CMP_LE_F16},
     {0xccu, Opcode::V_CMP_GT_F16},         {0xcdu, Opcode::V_CMP_LG_F16},
     {0xceu, Opcode::V_CMP_GE_F16},         {0xe9u, Opcode::V_CMP_NGE_F16},
@@ -834,6 +841,10 @@ bool IsVop1FloatResultOpcode(Opcode opcode) {
 
 bool IsVopcFloatCompareOpcode(Opcode opcode) {
 	switch (opcode) {
+		case Opcode::V_CMP_EQ_F64:
+		case Opcode::V_CMP_LE_F64:
+		case Opcode::V_CMPX_LE_F64:
+		case Opcode::V_CMPX_GE_F64:
 		case Opcode::V_CMP_F_F32:
 		case Opcode::V_CMP_LT_F32:
 		case Opcode::V_CMP_EQ_F32:
@@ -952,7 +963,8 @@ constexpr Vop2SdwaRule VOP2_SDWA_RULES[] = {
     {SdwaSelAll(), SdwaSelAll(), SdwaSelAll(), true, false},
     {SdwaSelFull(), SdwaSelAll(), SdwaSelAll(), false, false},
     {SdwaSelFull(), SdwaSelAll(), SdwaSelAll(), false, false},
-    {SdwaSelWords() | SdwaSelFull(), SdwaSelAll(), SdwaSelAll(), true, false},
+    // Bitwise: WriteRawU32 inserts a byte or word destination like any other partial write.
+    {SdwaSelAll(), SdwaSelAll(), SdwaSelAll(), true, false},
 };
 static_assert(sizeof(VOP2_SDWA_RULES) / sizeof(VOP2_SDWA_RULES[0]) ==
               static_cast<size_t>(Vop2SdwaProfile::Count));
@@ -1493,6 +1505,12 @@ bool IsVopcCompareExec(Opcode opcode) {
 		case Opcode::V_CMPX_NEQ_F32:
 		case Opcode::V_CMPX_NLT_F32:
 		case Opcode::V_CMPX_LT_I32:
+		case Opcode::V_CMPX_LT_I16:
+		case Opcode::V_CMPX_EQ_I16:
+		case Opcode::V_CMPX_LE_I16:
+		case Opcode::V_CMPX_GT_I16:
+		case Opcode::V_CMPX_NE_I16:
+		case Opcode::V_CMPX_GE_I16:
 		case Opcode::V_CMPX_EQ_I32:
 		case Opcode::V_CMPX_LE_I32:
 		case Opcode::V_CMPX_GT_I32:
@@ -1508,12 +1526,15 @@ bool IsVopcCompareExec(Opcode opcode) {
 		case Opcode::V_CMPX_NE_I64:
 		case Opcode::V_CMPX_LE_U64:
 		case Opcode::V_CMPX_NE_U64:
+<<<<<<< ours
 		case Opcode::V_CMPX_LT_I16:
 		case Opcode::V_CMPX_EQ_I16:
 		case Opcode::V_CMPX_LE_I16:
 		case Opcode::V_CMPX_GT_I16:
 		case Opcode::V_CMPX_NE_I16:
 		case Opcode::V_CMPX_GE_I16:
+=======
+>>>>>>> theirs
 		case Opcode::V_CMPX_LT_U16:
 		case Opcode::V_CMPX_EQ_U16:
 		case Opcode::V_CMPX_GT_U16:

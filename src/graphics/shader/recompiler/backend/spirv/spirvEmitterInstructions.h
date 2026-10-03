@@ -157,6 +157,8 @@ EMIT_NATIVE(FPSub32, OpFSub, F32, uint32_t, uint32_t)
 EMIT_NATIVE(FPMul32, OpFMul, F32, uint32_t, uint32_t)
 EMIT_NATIVE(FPAdd64, OpFAdd, F64, uint32_t, uint32_t)
 EMIT_NATIVE(FPMul64, OpFMul, F64, uint32_t, uint32_t)
+EMIT_NATIVE(FPOrdLessThanEqual64, OpFOrdLessThanEqual, U1, uint32_t, uint32_t)
+EMIT_NATIVE(FPOrdGreaterThanEqual64, OpFOrdGreaterThanEqual, U1, uint32_t, uint32_t)
 inline constexpr auto EmitFPFma64 =
     EmitGlsl<GLSLstd450Fma, IR::Type::F64, uint32_t, uint32_t, uint32_t>;
 uint32_t              EmitFPRecip64(EmitterState& state, uint32_t arg0);
@@ -193,13 +195,14 @@ inline constexpr auto EmitSendmsg      = EmitVoid;
 inline constexpr auto EmitTtraceData   = EmitVoid;
 inline constexpr auto EmitInstPrefetch = EmitVoid;
 void                  EmitBarrier(EmitterState& state);
-void                  EmitMeshAllocate(ValueEmitContext& ctx, const IR::Inst& inst);
-uint32_t              EmitMeshDrawParameter(ValueEmitContext& ctx, const IR::Inst& inst);
-uint32_t              EmitGetTessellationAttribute(ValueEmitContext& ctx, const IR::Inst& inst);
-void                  EmitSetTessellationAttribute(ValueEmitContext& ctx, const IR::Inst& inst);
-uint32_t              EmitGetUserData(EmitterState& state, IR::ScalarReg reg);
-uint32_t              EmitGetBuiltin(ValueEmitContext& ctx, IR::Value kind, IR::Value index);
-uint32_t              EmitUndefU1(EmitterState& state, const IR::Inst& inst);
+void     EmitShaderTrap(EmitterState& state, uint32_t pc, uint32_t code);
+void     EmitMeshAllocate(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t EmitMeshDrawParameter(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t EmitGetTessellationAttribute(ValueEmitContext& ctx, const IR::Inst& inst);
+void     EmitSetTessellationAttribute(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t EmitGetUserData(EmitterState& state, IR::ScalarReg reg);
+uint32_t EmitGetBuiltin(ValueEmitContext& ctx, IR::Value kind, IR::Value index);
+uint32_t EmitUndefU1(EmitterState& state, const IR::Inst& inst);
 inline constexpr auto EmitUndefU8  = EmitUndefU1;
 inline constexpr auto EmitUndefU16 = EmitUndefU1;
 inline constexpr auto EmitUndefU32 = EmitUndefU1;
@@ -218,6 +221,7 @@ uint32_t              EmitGetAttribute(ValueEmitContext& ctx, const IR::Inst& in
 uint32_t              EmitGetInterpolationParameter(ValueEmitContext& ctx, const IR::Inst& inst);
 void                  EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitGetShaderBase(ValueEmitContext& ctx);
+uint32_t              EmitReadClockRealtime64(ValueEmitContext& ctx);
 inline constexpr auto EmitGetSrtResource     = EmitVoid;
 inline constexpr auto EmitGetBufferResource  = EmitGetSrtResource;
 inline constexpr auto EmitGetAddressResource = EmitGetSrtResource;
