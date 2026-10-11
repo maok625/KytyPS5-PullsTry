@@ -52,6 +52,7 @@
 #if defined(__APPLE__)
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
+#include <mach/vm_region.h>
 #endif
 #endif
 
