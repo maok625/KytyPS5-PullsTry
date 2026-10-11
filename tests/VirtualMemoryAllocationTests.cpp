@@ -2564,8 +2564,8 @@ void TestFixedReserveRangeAddRollbackKeepsPlaceholder() {
 }
 
 #if defined(__APPLE__) && defined(__x86_64__)
-void TestAppleRosettaGpuCarveoutDirectMapRedirect() {
-	const char* test = "AppleRosettaGpuCarveoutDirectMapRedirect";
+void TestAppleRosettaGpuCarveoutDirectMapRejectedSafely() {
+	const char* test = "AppleRosettaGpuCarveoutDirectMapRejectedSafely";
 
 	int    translated      = 0;
 	size_t translated_size = sizeof(translated);
@@ -2590,31 +2590,21 @@ void TestAppleRosettaGpuCarveoutDirectMapRedirect() {
 	    &no_overwrite, size, SceKernelProtCpuRw,
 	    SceKernelMapFixed | SceKernelMapNoOverwrite, physical, alignment);
 	Check(test, no_overwrite_result == Libs::LibKernel::KERNEL_ERROR_ENOMEM,
-	      "MAP_FIXED|NO_OVERWRITE unexpectedly relocated an unavailable address");
+	      "unmappable NO_OVERWRITE request did not return ENOMEM");
 	Check(test, reinterpret_cast<uint64_t>(no_overwrite) == blocked_address,
 	      "failed NO_OVERWRITE request changed its address output");
 
-	void* mapped = reinterpret_cast<void*>(blocked_address);
-	CheckOk(test,
-	        Libs::LibKernel::Memory::KernelMapDirectMemory(
-	            &mapped, size, SceKernelProtCpuRw, SceKernelMapFixed, physical, alignment),
-	        "KernelMapDirectMemory(Rosetta carve-out)");
-	const auto actual_address = reinterpret_cast<uint64_t>(mapped);
-	Check(test, actual_address != blocked_address,
-	      "fixed map remained inside the host-reserved GPU carve-out");
-	Check(test, actual_address >= 0x7000000000ull,
-	      "relocated mapping did not land beyond the Rosetta GPU carve-out");
-
-	constexpr uint64_t sentinel = 0x4b595459524f5341ull; // "KYTYROSA"
-	*reinterpret_cast<uint64_t*>(mapped) = sentinel;
-	uint64_t value = 0;
+	void* fixed = reinterpret_cast<void*>(blocked_address);
+	const int fixed_result = Libs::LibKernel::Memory::KernelMapDirectMemory(
+	    &fixed, size, SceKernelProtCpuRw, SceKernelMapFixed, physical, alignment);
+	Check(test, fixed_result == Libs::LibKernel::KERNEL_ERROR_ENOMEM,
+	      "unmappable fixed request was incorrectly reported as successful");
+	Check(test, reinterpret_cast<uint64_t>(fixed) == blocked_address,
+	      "failed fixed request changed its address output");
 	Check(test,
-	      Libs::LibKernel::Memory::TryReadBacking(actual_address, &value, sizeof(value)) &&
-	          value == sentinel,
-	      "relocated mapping lost its shared direct-memory backing");
+	      !Libs::LibKernel::Memory::TestGuestAddressRangeIsOwned(blocked_address, size),
+	      "rejected map incorrectly claimed the Rosetta host carve-out");
 
-	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(actual_address, size),
-	        "KernelMunmap(relocated)");
 	CheckOk(test, Libs::LibKernel::Memory::KernelReleaseDirectMemory(physical, size),
 	        "KernelReleaseDirectMemory");
 	std::printf("[host]    %-48s ok\n", test);
@@ -4587,7 +4577,7 @@ int main(int argc, char** argv) {
 	RunTest(TestFixedReserveRangeAddRollbackKeepsPlaceholder);
 	RunTest(TestLargeHintedReserveHostsSmallDirectMap);
 #if defined(__APPLE__) && defined(__x86_64__)
-	RunTest(TestAppleRosettaGpuCarveoutDirectMapRedirect);
+	RunTest(TestAppleRosettaGpuCarveoutDirectMapRejectedSafely);
 #endif
 	RunTest(TestExtendedAndUserMappingsDoNotAlias);
 	RunTest(TestAutomaticMemoryReuseAndAliases);
