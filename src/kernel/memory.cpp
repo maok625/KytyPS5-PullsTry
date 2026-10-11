@@ -15,6 +15,8 @@
 #include <atomic>
 #include <bit>
 #include <cstddef>
+#include <cstdarg>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <magic_enum.hpp>
@@ -52,6 +54,14 @@
 namespace Libs::LibKernel::Memory {
 
 namespace VirtualMemory = Common::VirtualMemory;
+
+static void LogMemoryFailureToStderr(const char* format, ...) {
+	std::va_list args;
+	va_start(args, format);
+	std::vfprintf(stderr, format, args);
+	va_end(args);
+	std::fflush(stderr);
+}
 
 LIB_NAME("libkernel", "libkernel");
 
@@ -2281,7 +2291,7 @@ static int MapFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags
 	}
 	const auto flexible_available = g_flexible_memory->Available();
 	if (len > flexible_available) {
-		LOGF_COLOR(Log::Color::Red,
+		LogMemoryFailureToStderr(
 		           "\t [MapFlexibleMemory] ENOMEM: request exceeds flexible-memory budget"
 		           " requested=0x%016" PRIx64 " available=0x%016" PRIx64 "\n",
 		           static_cast<uint64_t>(len), flexible_available);
@@ -2349,7 +2359,7 @@ static int MapFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags
 	*addr_in_out = reinterpret_cast<void*>(out_addr);
 
 	if (out_addr == 0) {
-		LOGF_COLOR(Log::Color::Red,
+		LogMemoryFailureToStderr(
 		           "\t [MapFlexibleMemory] ENOMEM: no suitable guest virtual range"
 		           " in_addr=0x%016" PRIx64 " length=0x%016" PRIx64
 		           " fixed=%d flags=0x%08" PRIx32 "\n",
@@ -2359,7 +2369,7 @@ static int MapFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags
 	}
 
 	if (!g_flexible_memory->Map(out_addr, len, prot, mode, gpu_mode, name)) {
-		LOGF_COLOR(Log::Color::Red,
+		LogMemoryFailureToStderr(
 		           "\t [MapFlexibleMemory] ENOMEM: flexible backing allocation failed"
 		           " addr=0x%016" PRIx64 " length=0x%016" PRIx64 "\n",
 		           out_addr, static_cast<uint64_t>(len));
@@ -3031,7 +3041,7 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 		return KERNEL_ERROR_EINVAL;
 	}
 	if (!g_physical_memory->CanMapDirect(static_cast<uint64_t>(direct_memory_start), len)) {
-		LOGF_COLOR(Log::Color::Red,
+		LogMemoryFailureToStderr(
 		           "\t [MapDirectMemory] ENOMEM: physical range is not allocated/mappable"
 		           " dmem=0x%016" PRIx64 " length=0x%016" PRIx64 "\n",
 		           static_cast<uint64_t>(direct_memory_start), static_cast<uint64_t>(len));
@@ -3069,7 +3079,7 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 			return KERNEL_ERROR_EINVAL;
 		}
 		if (no_overwrite && g_virtual_ranges->HasOverlap(in_addr, len)) {
-			LOGF_COLOR(Log::Color::Red,
+			LogMemoryFailureToStderr(
 			           "\t [MapDirectMemory] ENOMEM: NO_OVERWRITE virtual-range collision"
 			           " addr=0x%016" PRIx64 " length=0x%016" PRIx64 "\n",
 			           in_addr, static_cast<uint64_t>(len));
@@ -3133,7 +3143,7 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 				reserved_target = true;
 			}
 			if (!reserved_target) {
-				LOGF_COLOR(Log::Color::Red,
+				LogMemoryFailureToStderr(
 				           "\t [MapDirectMemory] ENOMEM: failed to reserve fixed guest range"
 				           " addr=0x%016" PRIx64 " length=0x%016" PRIx64 "\n",
 				           in_addr, static_cast<uint64_t>(len));
@@ -3193,7 +3203,7 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 	     magic_enum::enum_name(gpu_mode), shared_backing ? "yes" : "no", shared_reason);
 
 	if (out_addr == 0) {
-		LOGF_COLOR(Log::Color::Red,
+		LogMemoryFailureToStderr(
 		           "\t [MapDirectMemory] ENOMEM: no output address/shared backing map failed"
 		           " in_addr=0x%016" PRIx64 " dmem=0x%016" PRIx64
 		           " length=0x%016" PRIx64 " fixed=%d no_overwrite=%d reserved=%d"
@@ -4081,7 +4091,7 @@ int KYTY_SYSV_ABI KernelBatchMap2(KernelBatchMapEntry* entries, int num_entries,
 				case MAP_OP_TYPE_PROTECT: operation_name = "TYPE_PROTECT"; break;
 				default: break;
 			}
-			LOGF_COLOR(Log::Color::Red,
+			LogMemoryFailureToStderr(
 			           "\t [KernelBatchMap] FAILED entry %d/%d op=%s(%d) start=0x%016" PRIx64
 			           " offset=0x%016" PRIx64 " length=0x%016" PRIx64
 			           " prot=0x%08" PRIx32 " type=0x%08" PRIx32
