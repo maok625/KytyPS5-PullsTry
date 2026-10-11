@@ -2279,7 +2279,12 @@ static int MapFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags
 	if (len == 0 || (len & (PAGE_SIZE - 1)) != 0) {
 		return KERNEL_ERROR_EINVAL;
 	}
-	if (len > g_flexible_memory->Available()) {
+	const auto flexible_available = g_flexible_memory->Available();
+	if (len > flexible_available) {
+		LOGF_COLOR(Log::Color::Red,
+		           "\t [MapFlexibleMemory] ENOMEM: request exceeds flexible-memory budget"
+		           " requested=0x%016" PRIx64 " available=0x%016" PRIx64 "\n",
+		           static_cast<uint64_t>(len), flexible_available);
 		return KERNEL_ERROR_ENOMEM;
 	}
 
@@ -2344,11 +2349,20 @@ static int MapFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags
 	*addr_in_out = reinterpret_cast<void*>(out_addr);
 
 	if (out_addr == 0) {
+		LOGF_COLOR(Log::Color::Red,
+		           "\t [MapFlexibleMemory] ENOMEM: no suitable guest virtual range"
+		           " in_addr=0x%016" PRIx64 " length=0x%016" PRIx64
+		           " fixed=%d flags=0x%08" PRIx32 "\n",
+		           in_addr, static_cast<uint64_t>(len), (flags & GUEST_MAP_FIXED) != 0 ? 1 : 0,
+		           map_flags);
 		return KERNEL_ERROR_ENOMEM;
 	}
 
 	if (!g_flexible_memory->Map(out_addr, len, prot, mode, gpu_mode, name)) {
-		LOGF_COLOR(Log::Color::Red, "\t [Fail]\n");
+		LOGF_COLOR(Log::Color::Red,
+		           "\t [MapFlexibleMemory] ENOMEM: flexible backing allocation failed"
+		           " addr=0x%016" PRIx64 " length=0x%016" PRIx64 "\n",
+		           out_addr, static_cast<uint64_t>(len));
 		return KERNEL_ERROR_ENOMEM;
 	}
 
@@ -3017,6 +3031,10 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 		return KERNEL_ERROR_EINVAL;
 	}
 	if (!g_physical_memory->CanMapDirect(static_cast<uint64_t>(direct_memory_start), len)) {
+		LOGF_COLOR(Log::Color::Red,
+		           "\t [MapDirectMemory] ENOMEM: physical range is not allocated/mappable"
+		           " dmem=0x%016" PRIx64 " length=0x%016" PRIx64 "\n",
+		           static_cast<uint64_t>(direct_memory_start), static_cast<uint64_t>(len));
 		return KERNEL_ERROR_ENOMEM;
 	}
 
@@ -3051,6 +3069,10 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 			return KERNEL_ERROR_EINVAL;
 		}
 		if (no_overwrite && g_virtual_ranges->HasOverlap(in_addr, len)) {
+			LOGF_COLOR(Log::Color::Red,
+			           "\t [MapDirectMemory] ENOMEM: NO_OVERWRITE virtual-range collision"
+			           " addr=0x%016" PRIx64 " length=0x%016" PRIx64 "\n",
+			           in_addr, static_cast<uint64_t>(len));
 			return KERNEL_ERROR_ENOMEM;
 		}
 
@@ -3111,6 +3133,10 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 				reserved_target = true;
 			}
 			if (!reserved_target) {
+				LOGF_COLOR(Log::Color::Red,
+				           "\t [MapDirectMemory] ENOMEM: failed to reserve fixed guest range"
+				           " addr=0x%016" PRIx64 " length=0x%016" PRIx64 "\n",
+				           in_addr, static_cast<uint64_t>(len));
 				return KERNEL_ERROR_ENOMEM;
 			}
 			if (map_shared_fixed(in_addr)) {
@@ -3167,6 +3193,14 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 	     magic_enum::enum_name(gpu_mode), shared_backing ? "yes" : "no", shared_reason);
 
 	if (out_addr == 0) {
+		LOGF_COLOR(Log::Color::Red,
+		           "\t [MapDirectMemory] ENOMEM: no output address/shared backing map failed"
+		           " in_addr=0x%016" PRIx64 " dmem=0x%016" PRIx64
+		           " length=0x%016" PRIx64 " fixed=%d no_overwrite=%d reserved=%d"
+		           " backing_reason=%s\n",
+		           in_addr, static_cast<uint64_t>(direct_memory_start), static_cast<uint64_t>(len),
+		           fixed ? 1 : 0, no_overwrite ? 1 : 0, reserved_target ? 1 : 0,
+		           GuestBackingStore::GetFailureReasonName(shared_failure));
 		return KERNEL_ERROR_ENOMEM;
 	}
 
@@ -4038,6 +4072,24 @@ int KYTY_SYSV_ABI KernelBatchMap2(KernelBatchMapEntry* entries, int num_entries,
 		}
 
 		if (result != OK) {
+			const char* operation_name = "unknown";
+			switch (entry->operation) {
+				case MAP_OP_MAP_DIRECT: operation_name = "MAP_DIRECT"; break;
+				case MAP_OP_UNMAP: operation_name = "UNMAP"; break;
+				case MAP_OP_PROTECT: operation_name = "PROTECT"; break;
+				case MAP_OP_MAP_FLEXIBLE: operation_name = "MAP_FLEXIBLE"; break;
+				case MAP_OP_TYPE_PROTECT: operation_name = "TYPE_PROTECT"; break;
+				default: break;
+			}
+			LOGF_COLOR(Log::Color::Red,
+			           "\t [KernelBatchMap] FAILED entry %d/%d op=%s(%d) start=0x%016" PRIx64
+			           " offset=0x%016" PRIx64 " length=0x%016" PRIx64
+			           " prot=0x%08" PRIx32 " type=0x%08" PRIx32
+			           " flags=0x%08" PRIx32 " result=0x%08" PRIx32 "\n",
+			           i, num_entries, operation_name, entry->operation,
+			           reinterpret_cast<uint64_t>(entry->start), entry->offset, entry->length,
+			           static_cast<uint32_t>(entry->protection), static_cast<uint32_t>(entry->type),
+			           static_cast<uint32_t>(flags), static_cast<uint32_t>(result));
 			if (num_entries_out != nullptr) {
 				*num_entries_out = processed;
 			}
