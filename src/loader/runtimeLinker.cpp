@@ -815,7 +815,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 									            sizeof(got_value));
 								}
 								std::printf("candidate PLT/GOT slot: slot=0x%016" PRIx64
-								            " current_target=0x%016" PRIx64 "\\n",
+								            " current_target=0x%016" PRIx64 "\n",
 								            got_slot, got_value);
 								const auto count = std::min(
 								    g_plt_import_diagnostic_count.load(std::memory_order_acquire),
@@ -825,7 +825,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 									if (record.ready.load(std::memory_order_acquire) &&
 									    record.got_slot == got_slot) {
 										std::printf("candidate CALL import: PLT[%u] name=%s debug_name=%s "
-										            "module=%s resolved=0x%016" PRIx64 "\\n",
+										            "module=%s resolved=0x%016" PRIx64 "\n",
 										            record.index, record.name.c_str(),
 										            record.dbg_name.c_str(), record.program.c_str(),
 										            record.resolved_value);
