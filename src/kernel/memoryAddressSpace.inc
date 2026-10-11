@@ -1402,12 +1402,11 @@ private:
 					LogMemoryFailureToStderr(
 					    "[GuestAddressSpace] pre-existing macOS VM region overlaps GTA V map: "
 					    "region=[0x%016" PRIx64 ",0x%016" PRIx64
-					    ") protection=0x%x max_protection=0x%x user_tag=%u shared=%d\n",
+					    ") protection=0x%x max_protection=0x%x reserved=%d shared=%d\n",
 					    static_cast<uint64_t>(region_address), static_cast<uint64_t>(region_end),
 					    static_cast<unsigned int>(region_info.protection),
 					    static_cast<unsigned int>(region_info.max_protection),
-					    static_cast<unsigned int>(region_info.user_tag),
-					    region_info.shared ? 1 : 0);
+					    region_info.reserved ? 1 : 0, region_info.shared ? 1 : 0);
 				}
 				if (region_address > scan) {
 					reserve_hole(scan, std::min(region_address, gap_end));
