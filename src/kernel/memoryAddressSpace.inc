@@ -4,8 +4,13 @@
 static constexpr uint64_t HOST_SYSTEM_MANAGED_MIN  = 0x0000040000ull;
 static constexpr uint64_t HOST_SYSTEM_MANAGED_MAX  = 0x07ffffbfffull;
 #if defined(__APPLE__) && (defined(__x86_64__) || defined(_M_X64))
-static constexpr uint64_t HOST_SYSTEM_RESERVED_MAX = 0x0fbfffffffull;
+// Keep the low guest reservation contiguous with USER_AREA on macOS. GTA V can request
+// fixed guest mappings in this interval; leaving it unowned makes ReserveFixed reject them
+// before the host mapping is attempted.
+static constexpr uint64_t HOST_SYSTEM_RESERVED_MAX = 0x6fffffffffull;
 static constexpr uint64_t HOST_USER_MIN            = 0x7000000000ull;
+static_assert(HOST_SYSTEM_RESERVED_MAX + 1u == HOST_USER_MIN,
+              "macOS guest reservation regions must be contiguous");
 #else
 static constexpr uint64_t HOST_SYSTEM_RESERVED_MAX = 0x0fffffffffull;
 static constexpr uint64_t HOST_USER_MIN            = 0x1000000000ull;
