@@ -71,6 +71,7 @@ constexpr uint64_t DEFAULT_FLEXIBLE_MEMORY_SIZE = 1ull * 1024ull * 1024ull * 102
 
 static uint64_t                      g_flexible_memory_size        = DEFAULT_FLEXIBLE_MEMORY_SIZE;
 static bool                          g_flexible_memory_size_frozen = false;
+static std::atomic_uint64_t          g_system_direct_memory_reserve {0};
 static Graphics::RenderContext*       g_gpu_resources               = nullptr;
 
 static Graphics::RenderContext& GetGpuResources() {
@@ -1009,6 +1010,7 @@ static bool SelfTestSub64SharedPlaceholderAlias() {
 static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size);
 
 void Initialize() {
+	g_system_direct_memory_reserve.store(0, std::memory_order_relaxed);
 	g_flexible_memory_size_frozen = true;
 	VirtualMemory::Init();
 	g_guest_address_space = std::make_unique<GuestAddressSpace>(PhysicalMemory::TotalSize());
@@ -2624,10 +2626,16 @@ int KYTY_SYSV_ABI KernelMunmap(uint64_t vaddr, size_t len) {
 	return UnmapMemory(vaddr, len);
 }
 
+void SetSystemDirectMemoryReserve(uint64_t size) {
+	EXIT_IF(size >= PhysicalMemory::Size());
+	g_system_direct_memory_reserve.store(size, std::memory_order_relaxed);
+}
+
 size_t KYTY_SYSV_ABI KernelGetDirectMemorySize() {
 	PRINT_NAME();
 
-	return PhysicalMemory::Size();
+	const auto size = PhysicalMemory::Size();
+	return size - g_system_direct_memory_reserve.load(std::memory_order_relaxed);
 }
 
 int KYTY_SYSV_ABI KernelAvailableDirectMemorySize(int64_t search_start, int64_t search_end,
