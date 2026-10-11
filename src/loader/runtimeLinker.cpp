@@ -704,6 +704,37 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			}
 			std::printf("\n");
 		}
+
+		// On macOS/Rosetta, an x86 software interrupt can arrive here as a SIGSEGV
+		// with si_addr == 0. That is not evidence that the guest dereferenced NULL.
+		// Label INT imm8 explicitly so the guest trap is not mistaken for a data fault.
+		if (IsReadableRange(info->exception_address, 2)) {
+			uint8_t instruction[2] {};
+			std::memcpy(instruction, reinterpret_cast<const void*>(info->exception_address),
+			            sizeof(instruction));
+			if (instruction[0] == 0xCD) {
+				std::printf("faulting instruction: INT 0x%02x (guest software interrupt); "
+				            "the reported access address may be incidental\n",
+				            instruction[1]);
+			}
+		}
+
+		// The raw stack dump below is useful for memory inspection but is hard to read.
+		// Walk only the guest frame-pointer chain here; do not call RuntimeLinker methods
+		// that take locks from the host exception/signal path.
+		void* guest_frames[20] {};
+		const int guest_frame_count =
+		    WalkGuestStack(info->rbp, info->rsp, guest_frames,
+		                   static_cast<int>(std::size(guest_frames)));
+		if (guest_frame_count > 0) {
+			std::printf("guest return-address frames (top to bottom):");
+			for (int i = 0; i < guest_frame_count; i++) {
+				std::printf("%s%016" PRIx64, (i % 2 == 0) ? "\n " : " ",
+				            reinterpret_cast<uint64_t>(guest_frames[i]));
+			}
+			std::printf("\n");
+		}
+
 		if (IsReadableRange(info->rsp, 32 * sizeof(uint64_t))) {
 			const auto* stack = reinterpret_cast<const uint64_t*>(info->rsp);
 			std::printf("stack:");
