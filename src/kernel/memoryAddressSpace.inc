@@ -1282,22 +1282,33 @@ private:
 #if defined(__APPLE__) && defined(__x86_64__)
 		// Do not encode the entire >400-GiB gap as a Mach-O zero-fill segment. On macOS/Rosetta,
 		// that oversized segment can make otherwise valid x86_64 test executables fail to launch
-		// with posix_spawn EIO. Claim the gap after process start using a non-fixed mmap hint, so
-		// this code never replaces a host mapping it does not own.
+		// with posix_spawn EIO. Unlike mmap(addr, ...), mach_vm_allocate with VM_FLAGS_FIXED
+		// requires this exact address and, without VM_FLAGS_OVERWRITE, will not clobber an existing
+		// mapping. Protect the successful zero-fill reservation so it acts as a guest placeholder.
 		const auto gap_start = HOST_SYSTEM_RESERVED_MAX + 1u;
 		const auto gap_end   = HOST_USER_MIN;
 		if (gap_end > gap_start) {
-			const auto gap_size = gap_end - gap_start;
-			void*      ptr      = mmap(reinterpret_cast<void*>(gap_start), gap_size, PROT_NONE,
-			                           MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
-			if (ptr == MAP_FAILED || reinterpret_cast<uint64_t>(ptr) != gap_start) {
-				const int error = errno;
-				if (ptr != MAP_FAILED) {
-					munmap(ptr, gap_size);
+			const auto       gap_size = gap_end - gap_start;
+			mach_vm_address_t address = gap_start;
+			const auto alloc_result =
+			    mach_vm_allocate(mach_task_self(), &address, gap_size, VM_FLAGS_FIXED);
+			if (alloc_result != KERN_SUCCESS || address != gap_start) {
+				if (alloc_result == KERN_SUCCESS) {
+					(void)mach_vm_deallocate(mach_task_self(), address, gap_size);
 				}
 				EXIT("failed to reserve macOS guest address gap at 0x%016" PRIx64
-				     ", size 0x%016" PRIx64 ", mmap returned %p, errno=%d\n",
-				     gap_start, gap_size, ptr, error);
+				     ", size 0x%016" PRIx64 ", mach_vm_allocate result=0x%08x, address=0x%016" PRIx64
+				     "\n",
+				     gap_start, gap_size, static_cast<unsigned int>(alloc_result),
+				     static_cast<uint64_t>(address));
+			}
+			const auto protect_result =
+			    mach_vm_protect(mach_task_self(), address, gap_size, FALSE, VM_PROT_NONE);
+			if (protect_result != KERN_SUCCESS) {
+				(void)mach_vm_deallocate(mach_task_self(), address, gap_size);
+				EXIT("failed to protect macOS guest address gap at 0x%016" PRIx64
+				     ", size 0x%016" PRIx64 ", mach_vm_protect result=0x%08x\n",
+				     gap_start, gap_size, static_cast<unsigned int>(protect_result));
 			}
 			AddFreeUnlocked(gap_start, gap_size);
 			m_owned.emplace_back(gap_start, gap_size);
