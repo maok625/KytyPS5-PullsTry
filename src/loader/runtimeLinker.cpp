@@ -708,15 +708,46 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		// On macOS/Rosetta, an x86 software interrupt can arrive here as a SIGSEGV
 		// with si_addr == 0. That is not evidence that the guest dereferenced NULL.
 		// Label INT imm8 explicitly so the guest trap is not mistaken for a data fault.
+		bool is_software_interrupt = false;
 		if (IsReadableRange(info->exception_address, 2)) {
 			uint8_t instruction[2] {};
 			std::memcpy(instruction, reinterpret_cast<const void*>(info->exception_address),
 			            sizeof(instruction));
 			if (instruction[0] == 0xCD) {
+				is_software_interrupt = true;
 				std::printf("faulting instruction: INT 0x%02x (guest software interrupt); "
 				            "the reported access address may be incidental\n",
 				            instruction[1]);
+
+				// In the GTA V report, the INT is preceded by a direct CALL at pc - 15,
+				// followed by a status check. Report that candidate callee to help locate
+				// the operation that returned the fatal status without symbol information.
+				if (info->exception_address >= 15 &&
+				    IsReadableRange(info->exception_address - 15, 5)) {
+					uint8_t call_instruction[5] {};
+					std::memcpy(call_instruction,
+					            reinterpret_cast<const void*>(info->exception_address - 15),
+					            sizeof(call_instruction));
+					if (call_instruction[0] == 0xE8) {
+						int32_t relative_target = 0;
+						std::memcpy(&relative_target, call_instruction + 1, sizeof(relative_target));
+						const auto return_address = static_cast<int64_t>(info->exception_address) - 10;
+						const auto call_target = return_address + relative_target;
+						std::printf("candidate preceding CALL: callsite=0x%016" PRIx64
+						            " return=0x%016" PRIx64 " target=0x%016" PRIx64 "\n",
+						            info->exception_address - 15,
+						            static_cast<uint64_t>(return_address),
+						            static_cast<uint64_t>(call_target));
+					}
+				}
 			}
+		}
+
+		// 0x8002000C is SCE_KERNEL_ERROR_ENOMEM in the PS5 kernel errno range.
+		// Print it explicitly when it is preserved in RAX at a guest INT trap.
+		if (is_software_interrupt && static_cast<uint32_t>(info->rax) == 0x8002000Cu) {
+			std::printf("RAX status: SCE_KERNEL_ERROR_ENOMEM (0x8002000C); "
+			            "trace the preceding allocation/resource operation\n");
 		}
 
 		// The raw stack dump below is useful for memory inspection but is hard to read.
