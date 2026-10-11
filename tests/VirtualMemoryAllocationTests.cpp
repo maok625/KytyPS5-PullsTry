@@ -2597,7 +2597,7 @@ void TestAppleRosettaGpuCarveoutDirectMapRedirect() {
 	void* mapped = reinterpret_cast<void*>(blocked_address);
 	CheckOk(test,
 	        Libs::LibKernel::Memory::KernelMapDirectMemory(
-	            &mapped, size, SceKernelProtCpuRw, SceKernelMapFixed, physical, SceKernelPageSize),
+	            &mapped, size, SceKernelProtCpuRw, SceKernelMapFixed, physical, alignment),
 	        "KernelMapDirectMemory(Rosetta carve-out)");
 	const auto actual_address = reinterpret_cast<uint64_t>(mapped);
 	Check(test, actual_address != blocked_address,
