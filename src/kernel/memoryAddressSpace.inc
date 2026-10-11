@@ -890,19 +890,79 @@ public:
 			return false;
 		}
 		std::lock_guard lock(m_mutex);
-		const bool is_free = FindContaining(vaddr, size) != m_free.end();
+		if (FindContaining(vaddr, size) != m_free.end()) {
+			return true;
+		}
+
+#if defined(__APPLE__) && defined(__x86_64__)
+		// If the broad startup scan skipped a hole, try to reserve this exact fixed guest
+		// mapping on demand. VM_FLAGS_FIXED without VM_FLAGS_OVERWRITE cannot replace a host
+		// mapping, so this is safe even when the original reason for the missed hole is unknown.
+		const auto gap_start = HOST_SYSTEM_RESERVED_MAX + 1u;
+		const auto gap_end   = HOST_USER_MIN;
+		const bool in_guest_gap =
+		    vaddr >= gap_start && vaddr < gap_end && size <= gap_end - vaddr;
+		const bool overlaps_owned = std::any_of(m_owned.begin(), m_owned.end(),
+		                                        [vaddr, size](const auto& range) {
+		                                        return VirtualRangesOverlap(
+		                                            vaddr, size, range.first, range.second);
+		                                        });
+		if (in_guest_gap && !overlaps_owned) {
+			mach_vm_address_t address = vaddr;
+			auto result = mach_vm_allocate(mach_task_self(), &address, size, VM_FLAGS_FIXED);
+			if (result == KERN_SUCCESS && address == vaddr) {
+				result = mach_vm_protect(mach_task_self(), address, size, FALSE, VM_PROT_NONE);
+				if (result == KERN_SUCCESS) {
+					AddFreeUnlocked(vaddr, size);
+					m_owned.emplace_back(vaddr, size);
+					std::sort(m_owned.begin(), m_owned.end());
+					std::vector<std::pair<uint64_t, uint64_t>> merged_owned;
+					merged_owned.reserve(m_owned.size());
+					for (const auto& range: m_owned) {
+						if (!merged_owned.empty() &&
+						    range.first <= merged_owned.back().first + merged_owned.back().second) {
+							const auto merged_end = std::max(
+							    merged_owned.back().first + merged_owned.back().second,
+							    range.first + range.second);
+							merged_owned.back().second = merged_end - merged_owned.back().first;
+						} else {
+							merged_owned.push_back(range);
+						}
+					}
+					m_owned.swap(merged_owned);
+					LogMemoryFailureToStderr(
+					    "[GuestAddressSpace] lazily reserved fixed GTA guest range "
+					    "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+					    vaddr, size);
+					return FindContaining(vaddr, size) != m_free.end();
+				}
+				(void)mach_vm_deallocate(mach_task_self(), address, size);
+			} else if (result == KERN_SUCCESS) {
+				(void)mach_vm_deallocate(mach_task_self(), address, size);
+			}
+			if (vaddr == 0x1559c00000ull) {
+				LogMemoryFailureToStderr(
+				    "[GuestAddressSpace] lazy fixed reservation failed addr=0x%016" PRIx64
+				    " size=0x%016" PRIx64 " result=0x%08x returned=0x%016" PRIx64 "\n",
+				    vaddr, size, static_cast<unsigned int>(result),
+				    static_cast<uint64_t>(address));
+			}
+		}
+#endif
+
 		if (vaddr == 0x1559c00000ull) {
 			const bool is_owned = std::any_of(m_owned.begin(), m_owned.end(),
 			                                  [vaddr, size](const auto& range) {
 				                                  return vaddr >= range.first &&
 				                                         vaddr + size <= range.first + range.second;
 			                                  });
+			const bool is_free = FindContaining(vaddr, size) != m_free.end();
 			LogMemoryFailureToStderr(
 			    "[GuestAddressSpace] ReserveFixed diagnostic addr=0x%016" PRIx64
 			    " size=0x%016" PRIx64 " owned=%d free=%d\n",
 			    vaddr, size, is_owned ? 1 : 0, is_free ? 1 : 0);
 		}
-		return is_free;
+		return false;
 	}
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
