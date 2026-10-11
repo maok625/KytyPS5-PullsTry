@@ -3015,6 +3015,48 @@ int KYTY_SYSV_ABI KernelCheckedReleaseDirectMemory(int64_t start, size_t len) {
 	return result == KERNEL_ERROR_EACCES ? KERNEL_ERROR_ENOENT : result;
 }
 
+#if defined(__APPLE__) && defined(__x86_64__)
+// Rosetta 2 can reserve this guest-address interval for host GPU resources. Never try to
+// replace those host mappings with MAP_FIXED; relocate only fixed requests that the
+// emulator does not already own and that intersect a real host VM region.
+static constexpr uint64_t APPLE_ROSETTA_GPU_CARVEOUT_START = 0x1000000000ull;
+static constexpr uint64_t APPLE_ROSETTA_GPU_CARVEOUT_END   = 0x7000000000ull;
+
+static bool OverlapsAppleRosettaGpuCarveout(uint64_t vaddr, uint64_t size) {
+	if (size == 0 || UINT64_MAX - vaddr < size) {
+		return false;
+	}
+	return vaddr < APPLE_ROSETTA_GPU_CARVEOUT_END &&
+	       vaddr + size > APPLE_ROSETTA_GPU_CARVEOUT_START;
+}
+
+static bool IsAppleHostRangeOccupied(uint64_t vaddr, uint64_t size) {
+	if (size == 0 || UINT64_MAX - vaddr < size) {
+		return false;
+	}
+
+	mach_vm_address_t region_address = vaddr;
+	mach_vm_size_t    region_size    = 0;
+	vm_region_basic_info_data_64_t region_info {};
+	mach_msg_type_number_t info_count = VM_REGION_BASIC_INFO_COUNT_64;
+	mach_port_t object_name = MACH_PORT_NULL;
+	const auto result = mach_vm_region(
+	    mach_task_self(), &region_address, &region_size, VM_REGION_BASIC_INFO_64,
+	    reinterpret_cast<vm_region_info_t>(&region_info), &info_count, &object_name);
+	if (object_name != MACH_PORT_NULL) {
+		(void)mach_port_deallocate(mach_task_self(), object_name);
+	}
+	if (result != KERN_SUCCESS || region_size == 0 ||
+	    UINT64_MAX - region_address < region_size) {
+		return false;
+	}
+
+	const auto request_end = vaddr + size;
+	const auto region_end  = region_address + region_size;
+	return region_address < request_end && vaddr < region_end;
+}
+#endif
+
 // The ABI entry points and batch operations hold g_memory_operation_mutex.
 static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
                            int64_t direct_memory_start, size_t alignment, const char* name,
@@ -3090,7 +3132,27 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 			           in_addr, static_cast<uint64_t>(len));
 			return KERNEL_ERROR_ENOMEM;
 		}
+#if defined(__APPLE__) && defined(__x86_64__)
+		if (OverlapsAppleRosettaGpuCarveout(in_addr, len) &&
+		    !g_guest_address_space->Owns(in_addr, len) &&
+		    IsAppleHostRangeOccupied(in_addr, len)) {
+			if (no_overwrite) {
+				LogMemoryFailureToStderr(
+				           "\t [MapDirectMemory] ENOMEM: NO_OVERWRITE cannot target Rosetta GPU carve-out"
+				           " addr=0x%016" PRIx64 " length=0x%016" PRIx64 "\n",
+				           in_addr, static_cast<uint64_t>(len));
+				return KERNEL_ERROR_ENOMEM;
+			}
+			fixed = false;
+			LogMemoryFailureToStderr(
+			           "\t [MapDirectMemory] macOS Rosetta GPU carve-out: relocating fixed guest map"
+			           " addr=0x%016" PRIx64 " length=0x%016" PRIx64 "\n",
+			           in_addr, static_cast<uint64_t>(len));
+		}
+#endif
+	}
 
+	if (fixed) {
 		std::vector<VirtualRanges::Range> reserved_ranges;
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 		if (g_virtual_ranges->QuerySpan(in_addr, len, &reserved_ranges) &&

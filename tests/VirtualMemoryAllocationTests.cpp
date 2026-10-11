@@ -30,6 +30,10 @@
 #include <utility>
 #include <vector>
 
+#if defined(__APPLE__) && defined(__x86_64__)
+#include <sys/sysctl.h>
+#endif
+
 #if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <csignal>
 #include <immintrin.h>
@@ -2559,6 +2563,63 @@ void TestFixedReserveRangeAddRollbackKeepsPlaceholder() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+#if defined(__APPLE__) && defined(__x86_64__)
+void TestAppleRosettaGpuCarveoutDirectMapRedirect() {
+	const char* test = "AppleRosettaGpuCarveoutDirectMapRedirect";
+
+	int    translated      = 0;
+	size_t translated_size = sizeof(translated);
+	if (sysctlbyname("sysctl.proc_translated", &translated, &translated_size, nullptr, 0) != 0 ||
+	    translated != 1) {
+		std::printf("[host]    %-48s skipped (not running under Rosetta 2)\n", test);
+		return;
+	}
+
+	constexpr uint64_t blocked_address = 0x1559c00000ull;
+	constexpr uint64_t size            = SceKernelPageSize;
+	int64_t            physical         = -1;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+	            0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), size, SceKernelPageSize,
+	            SceKernelMtypeC, &physical),
+	        "KernelAllocateDirectMemory");
+
+	void* no_overwrite = reinterpret_cast<void*>(blocked_address);
+	const int no_overwrite_result = Libs::LibKernel::Memory::KernelMapDirectMemory(
+	    &no_overwrite, size, SceKernelProtCpuRw,
+	    SceKernelMapFixed | SceKernelMapNoOverwrite, physical, SceKernelPageSize);
+	Check(test, no_overwrite_result == Libs::LibKernel::KERNEL_ERROR_ENOMEM,
+	      "MAP_FIXED|NO_OVERWRITE unexpectedly relocated an unavailable address");
+	Check(test, reinterpret_cast<uint64_t>(no_overwrite) == blocked_address,
+	      "failed NO_OVERWRITE request changed its address output");
+
+	void* mapped = reinterpret_cast<void*>(blocked_address);
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapDirectMemory(
+	            &mapped, size, SceKernelProtCpuRw, SceKernelMapFixed, physical, SceKernelPageSize),
+	        "KernelMapDirectMemory(Rosetta carve-out)");
+	const auto actual_address = reinterpret_cast<uint64_t>(mapped);
+	Check(test, actual_address != blocked_address,
+	      "fixed map remained inside the host-reserved GPU carve-out");
+	Check(test, actual_address >= 0x7000000000ull,
+	      "relocated mapping did not land beyond the Rosetta GPU carve-out");
+
+	constexpr uint64_t sentinel = 0x4b595459524f5341ull; // "KYT YROSA"
+	*reinterpret_cast<uint64_t*>(mapped) = sentinel;
+	uint64_t value = 0;
+	Check(test,
+	      Libs::LibKernel::Memory::TryReadBacking(actual_address, &value, sizeof(value)) &&
+	          value == sentinel,
+	      "relocated mapping lost its shared direct-memory backing");
+
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(actual_address, size),
+	        "KernelMunmap(relocated)");
+	CheckOk(test, Libs::LibKernel::Memory::KernelReleaseDirectMemory(physical, size),
+	        "KernelReleaseDirectMemory");
+	std::printf("[host]    %-48s ok\n", test);
+}
+#endif
+
 void TestExtendedAndUserMappingsDoNotAlias() {
 	const char* test = "ExtendedAndUserMappingsDoNotAlias";
 	// macOS starts its ordinary guest range at 448 GiB.
@@ -4524,6 +4585,9 @@ int main(int argc, char** argv) {
 	RunTest(TestFixedReserveRollbackSkipsUntouchedChunks);
 	RunTest(TestFixedReserveRangeAddRollbackKeepsPlaceholder);
 	RunTest(TestLargeHintedReserveHostsSmallDirectMap);
+#if defined(__APPLE__) && defined(__x86_64__)
+	RunTest(TestAppleRosettaGpuCarveoutDirectMapRedirect);
+#endif
 	RunTest(TestExtendedAndUserMappingsDoNotAlias);
 	RunTest(TestAutomaticMemoryReuseAndAliases);
 	RunTest(TestAutomaticMemoryFragmentedMapRollback);
