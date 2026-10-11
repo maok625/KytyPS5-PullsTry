@@ -3136,18 +3136,15 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 		if (OverlapsAppleRosettaGpuCarveout(in_addr, len) &&
 		    !g_guest_address_space->Owns(in_addr, len) &&
 		    IsAppleHostRangeOccupied(in_addr, len)) {
-			if (no_overwrite) {
-				LogMemoryFailureToStderr(
-				           "\t [MapDirectMemory] ENOMEM: NO_OVERWRITE cannot target Rosetta GPU carve-out"
-				           " addr=0x%016" PRIx64 " length=0x%016" PRIx64 "\n",
-				           in_addr, static_cast<uint64_t>(len));
-				return KERNEL_ERROR_ENOMEM;
-			}
-			fixed = false;
+			// MAP_FIXED is an identity-address contract. Relocating this mapping can make
+			// MapDirectMemory return success while guest code continues to access in_addr,
+			// which is still unmappable under Rosetta and can crash the host process.
 			LogMemoryFailureToStderr(
-			           "\t [MapDirectMemory] macOS Rosetta GPU carve-out: relocating fixed guest map"
-			           " addr=0x%016" PRIx64 " length=0x%016" PRIx64 "\n",
+			           "\t [MapDirectMemory] ENOMEM: macOS Rosetta GPU carve-out blocks fixed guest map;"
+			           " refusing unsafe relocation addr=0x%016" PRIx64
+			           " length=0x%016" PRIx64 "\n",
 			           in_addr, static_cast<uint64_t>(len));
+			return KERNEL_ERROR_ENOMEM;
 		}
 #endif
 	}
