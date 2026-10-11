@@ -514,13 +514,13 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	    supported_features12.shaderBufferInt64Atomics == VK_TRUE;
 	graphics.shader_cull_distance_enabled = supported_features2.features.shaderCullDistance == VK_TRUE;
 	if (!graphics.image_view_min_lod_enabled) {
-		LOGF("WARNING: image view minLod is unavailable; texture min-LOD will be approximated.\\n");
+		LOGF("WARNING: image view minLod is unavailable; texture min-LOD will be approximated.\n");
 	}
 	if (!graphics.shader_buffer_int64_atomics_enabled) {
-		LOGF("WARNING: shaderBufferInt64Atomics is unavailable; shaders using 64-bit buffer atomics may fail pipeline creation.\\n");
+		LOGF("WARNING: shaderBufferInt64Atomics is unavailable; shaders using 64-bit buffer atomics may fail pipeline creation.\n");
 	}
 	if (!graphics.shader_cull_distance_enabled) {
-		LOGF("WARNING: shaderCullDistance is unavailable; shaders exporting cull distances may fail pipeline creation.\\n");
+		LOGF("WARNING: shaderCullDistance is unavailable; shaders exporting cull distances may fail pipeline creation.\n");
 	}
 
 	auto features12 = WindowContext::RequiredVulkan12Features();
