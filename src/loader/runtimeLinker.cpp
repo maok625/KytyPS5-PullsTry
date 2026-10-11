@@ -708,49 +708,71 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		// On macOS/Rosetta, an x86 software interrupt can arrive here as a SIGSEGV
 		// with si_addr == 0. That is not evidence that the guest dereferenced NULL.
 		// Label INT imm8 explicitly so the guest trap is not mistaken for a data fault.
-		bool is_software_interrupt = false;
+		bool     is_software_interrupt = false;
+		uint64_t interrupt_opcode_addr = 0;
+		uint8_t  interrupt_vector = 0;
+
+		// Depending on how the host reports the x86 trap, the saved PC can point
+		// either at INT's 0xCD opcode or at its immediate byte (e.g. the 0x41 in
+		// `CD 41`). Check both positions so the diagnostics handle either form.
 		if (IsReadableRange(info->exception_address, 2)) {
 			uint8_t instruction[2] {};
 			std::memcpy(instruction, reinterpret_cast<const void*>(info->exception_address),
 			            sizeof(instruction));
 			if (instruction[0] == 0xCD) {
-				is_software_interrupt = true;
-				std::printf("faulting instruction: INT 0x%02x (guest software interrupt); "
-				            "the reported access address may be incidental\n",
-				            instruction[1]);
+				interrupt_opcode_addr = info->exception_address;
+				interrupt_vector = instruction[1];
+			}
+		}
+		if (interrupt_opcode_addr == 0 && info->exception_address > 0 &&
+		    IsReadableRange(info->exception_address - 1, 2)) {
+			uint8_t instruction[2] {};
+			std::memcpy(instruction,
+			            reinterpret_cast<const void*>(info->exception_address - 1),
+			            sizeof(instruction));
+			if (instruction[0] == 0xCD) {
+				interrupt_opcode_addr = info->exception_address - 1;
+				interrupt_vector = instruction[1];
+			}
+		}
 
-				// In the GTA V report, the INT is preceded by a direct CALL at pc - 15,
-				// followed by a status check. Report that candidate callee to help locate
-				// the operation that returned the fatal status without symbol information.
-				if (info->exception_address >= 15 &&
-				    IsReadableRange(info->exception_address - 15, 5)) {
-					uint8_t call_instruction[5] {};
-					std::memcpy(call_instruction,
-					            reinterpret_cast<const void*>(info->exception_address - 15),
-					            sizeof(call_instruction));
-					if (call_instruction[0] == 0xE8) {
-						int32_t relative_target = 0;
-						std::memcpy(&relative_target, call_instruction + 1, sizeof(relative_target));
-						const auto return_address = static_cast<int64_t>(info->exception_address) - 10;
-						const auto call_target = return_address + relative_target;
-						std::printf("candidate preceding CALL: callsite=0x%016" PRIx64
-						            " return=0x%016" PRIx64 " target=0x%016" PRIx64 "\n",
-						            info->exception_address - 15,
-						            static_cast<uint64_t>(return_address),
-						            static_cast<uint64_t>(call_target));
-						if (call_target > 0 &&
-						    IsReadableRange(static_cast<uint64_t>(call_target), 32)) {
-							const auto* target_bytes =
-							    reinterpret_cast<const uint8_t*>(static_cast<uint64_t>(call_target));
-							std::printf("candidate CALL target bytes:");
-							for (int i = 0; i < 32; i++) {
-								std::printf("%s%02x", (i % 16 == 0) ? "\n " : " ",
-								            target_bytes[i]);
-							}
-							std::printf("\n");
+		if (interrupt_opcode_addr != 0) {
+			is_software_interrupt = true;
+			std::printf("faulting instruction: INT 0x%02x (opcode at 0x%016" PRIx64
+			            "); reported access address may be incidental\n",
+			            interrupt_vector, interrupt_opcode_addr);
+
+			// In the GTA V report, the INT is preceded by a direct CALL at
+			// opcode_addr - 15, followed by a status check. Derive the callsite from
+			// the decoded opcode address, not the host-reported PC, which may point
+			// at INT's immediate byte instead.
+			if (interrupt_opcode_addr >= 15 &&
+			    IsReadableRange(interrupt_opcode_addr - 15, 5)) {
+				uint8_t call_instruction[5] {};
+				std::memcpy(call_instruction,
+				            reinterpret_cast<const void*>(interrupt_opcode_addr - 15),
+				            sizeof(call_instruction));
+				if (call_instruction[0] == 0xE8) {
+					int32_t relative_target = 0;
+					std::memcpy(&relative_target, call_instruction + 1, sizeof(relative_target));
+					const auto return_address = static_cast<int64_t>(interrupt_opcode_addr) - 10;
+					const auto call_target = return_address + relative_target;
+					std::printf("candidate preceding CALL: callsite=0x%016" PRIx64
+					            " return=0x%016" PRIx64 " target=0x%016" PRIx64 "\n",
+					            interrupt_opcode_addr - 15,
+					            static_cast<uint64_t>(return_address),
+					            static_cast<uint64_t>(call_target));
+					if (call_target > 0 &&
+					    IsReadableRange(static_cast<uint64_t>(call_target), 32)) {
+						const auto* target_bytes =
+						    reinterpret_cast<const uint8_t*>(static_cast<uint64_t>(call_target));
+						std::printf("candidate CALL target bytes:");
+						for (int i = 0; i < 32; i++) {
+							std::printf("%s%02x", (i % 16 == 0) ? "\n " : " ",
+							            target_bytes[i]);
 						}
+						std::printf("\n");
 					}
-				}
 			}
 		}
 
