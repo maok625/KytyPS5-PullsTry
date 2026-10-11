@@ -890,7 +890,19 @@ public:
 			return false;
 		}
 		std::lock_guard lock(m_mutex);
-		return FindContaining(vaddr, size) != m_free.end();
+		const bool is_free = FindContaining(vaddr, size) != m_free.end();
+		if (vaddr == 0x1559c00000ull) {
+			const bool is_owned = std::any_of(m_owned.begin(), m_owned.end(),
+			                                  [vaddr, size](const auto& range) {
+				                                  return vaddr >= range.first &&
+				                                         vaddr + size <= range.first + range.second;
+			                                  });
+			LogMemoryFailureToStderr(
+			    "[GuestAddressSpace] ReserveFixed diagnostic addr=0x%016" PRIx64
+			    " size=0x%016" PRIx64 " owned=%d free=%d\n",
+			    vaddr, size, is_owned ? 1 : 0, is_free ? 1 : 0);
+		}
+		return is_free;
 	}
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
@@ -1305,6 +1317,15 @@ private:
 				if (result == KERN_SUCCESS && address == start) {
 					result = mach_vm_protect(task, address, size, FALSE, VM_PROT_NONE);
 					if (result == KERN_SUCCESS) {
+						constexpr uint64_t kGtaVFailedMapStart = 0x1559c00000ull;
+						constexpr uint64_t kGtaVFailedMapSize  = 0x10000ull;
+						if (start <= kGtaVFailedMapStart &&
+						    kGtaVFailedMapStart + kGtaVFailedMapSize <= start + size) {
+							LogMemoryFailureToStderr(
+							    "[GuestAddressSpace] reserved GTA V map in gap chunk "
+							    "[0x%016" PRIx64 ",0x%016" PRIx64 ")\n",
+							    start, start + size);
+						}
 						AddFreeUnlocked(start, size);
 						m_owned.emplace_back(start, size);
 						return;
@@ -1374,6 +1395,20 @@ private:
 				}
 
 				const auto region_end = region_address + region_size;
+				constexpr uint64_t kGtaVFailedMapStart = 0x1559c00000ull;
+				constexpr uint64_t kGtaVFailedMapSize  = 0x10000ull;
+				if (region_address < kGtaVFailedMapStart + kGtaVFailedMapSize &&
+				    kGtaVFailedMapStart < region_end) {
+					LogMemoryFailureToStderr(
+					    "[GuestAddressSpace] pre-existing macOS VM region overlaps GTA V map: "
+					    "region=[0x%016" PRIx64 ",0x%016" PRIx64
+					    ") protection=0x%x max_protection=0x%x user_tag=%u shared=%d\n",
+					    static_cast<uint64_t>(region_address), static_cast<uint64_t>(region_end),
+					    static_cast<unsigned int>(region_info.protection),
+					    static_cast<unsigned int>(region_info.max_protection),
+					    static_cast<unsigned int>(region_info.user_tag),
+					    region_info.shared ? 1 : 0);
+				}
 				if (region_address > scan) {
 					reserve_hole(scan, std::min(region_address, gap_end));
 				}
