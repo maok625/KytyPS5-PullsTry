@@ -738,6 +738,17 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 						            info->exception_address - 15,
 						            static_cast<uint64_t>(return_address),
 						            static_cast<uint64_t>(call_target));
+						if (call_target > 0 &&
+						    IsReadableRange(static_cast<uint64_t>(call_target), 32)) {
+							const auto* target_bytes =
+							    reinterpret_cast<const uint8_t*>(static_cast<uint64_t>(call_target));
+							std::printf("candidate CALL target bytes:");
+							for (int i = 0; i < 32; i++) {
+								std::printf("%s%02x", (i % 16 == 0) ? "\n " : " ",
+								            target_bytes[i]);
+							}
+							std::printf("\n");
+						}
 					}
 				}
 			}
