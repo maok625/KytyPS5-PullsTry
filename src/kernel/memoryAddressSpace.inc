@@ -1296,7 +1296,7 @@ private:
 					munmap(ptr, gap_size);
 				}
 				EXIT("failed to reserve macOS guest address gap at 0x%016" PRIx64
-				     ", size 0x%016" PRIx64 ", mmap returned %p, errno=%d\\n",
+				     ", size 0x%016" PRIx64 ", mmap returned %p, errno=%d\n",
 				     gap_start, gap_size, ptr, error);
 			}
 			AddFreeUnlocked(gap_start, gap_size);
