@@ -4160,6 +4160,8 @@ int Initialize() {
 	if (g_driver_dmem.physical_offset >= 0) {
 		return OK;
 	}
+	// Place this system-owned block at the top of the pool so the guest-visible
+	// direct-memory budget can be clamped below the block and any alignment tail.
 	int64_t    physical_offset = -1;
 	const auto reported_end    = LibKernel::Memory::KernelGetDirectMemorySize();
 	const auto end             = Common::AlignDown(reported_end, DriverDmemSize);
