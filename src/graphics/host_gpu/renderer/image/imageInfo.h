@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/gpu_format.h"
+#include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
@@ -12,8 +13,11 @@
 #include <bit>
 #include <cmath>
 #include <cstdint>
+#include <vector>
 
 namespace Libs::Graphics {
+
+enum class ColorTransform : uint32_t { None, SwapBgra16, Reverse10_11_11 };
 
 enum class VideoOutCompression : uint8_t { Uncompressed, Dcc256_256_0, Dcc256_64_64, Unsupported };
 
@@ -45,11 +49,19 @@ struct ImageSubresourceRange {
 };
 
 struct ImageMipInfo {
+	// Guest mip chains run backwards within each layer or volume block-slice.
+	// Tail levels share an offset and use tail_x/tail_y within that block.
 	uint64_t offset                                 = 0;
 	uint64_t size                                   = 0;
 	// Padded dimensions in storage elements (compressed blocks for BC formats).
 	uint32_t pitch                                  = 0;
 	uint32_t height                                 = 0;
+	uint64_t linear_offset                          = 0;
+	uint64_t linear_size                            = 0; // Per transfer slice.
+	uint32_t linear_pitch                           = 0; // Storage elements.
+	uint32_t tail_x                                 = 0;
+	uint32_t tail_y                                 = 0;
+	uint32_t surface_z                              = 0;
 	auto     operator<=>(const ImageMipInfo&) const = default;
 };
 
@@ -69,7 +81,26 @@ struct ImageInfo {
 	Prospero::TileMode           tile_mode       = Prospero::TileMode::kLinear;
 	bool                         bgra16          = false;
 	std::array<ImageMipInfo, 16> mip_layout {};
+	TileTextureBlockLayout       tiling;
+	uint64_t                     tiled_slice_stride = 0;
+	// Nonzero for guest-linear and depth-plane transfers; tiled colors are mip-major.
+	uint64_t linear_slice_stride = 0;
+	uint32_t first_tail_level    = 16;
 
+	void                                           UpdateSize();
+	[[nodiscard]] uint64_t                         LinearSize(uint32_t levels = 0) const;
+	[[nodiscard]] vk::Extent3D                     MipExtent(uint32_t level) const;
+	[[nodiscard]] std::vector<vk::BufferImageCopy> BufferCopies(uint64_t buffer_offset = 0,
+	                                                            uint32_t levels        = 0) const;
+
+	[[nodiscard]] ColorTransform GetColorTransform() const noexcept {
+		if (bgra16) return ColorTransform::SwapBgra16;
+		switch (guest_format) {
+			case Prospero::BufferFormat::k10_11_11Float:
+				return ColorTransform::Reverse10_11_11;
+			default: return ColorTransform::None;
+		}
+	}
 	[[nodiscard]] constexpr bool HasStencil() const noexcept { return !stencil.Empty(); }
 	[[nodiscard]] constexpr bool HasMetadata() const noexcept {
 		return metadata.kind != ImageMetadataKind::None;
@@ -91,7 +122,8 @@ struct ImageInfo {
 	}
 	[[nodiscard]] bool IsCompatible(const ImageInfo& other) const noexcept {
 		return pixel_format == other.pixel_format && samples == other.samples &&
-		       bytes_per_block == other.bytes_per_block;
+		       bytes_per_block == other.bytes_per_block &&
+		       GetColorTransform() == other.GetColorTransform();
 	}
 	[[nodiscard]] int32_t MipOf(const ImageInfo& container) const noexcept {
 		if (container.resources.levels > container.mip_layout.size()) {
@@ -379,7 +411,28 @@ inline constexpr std::array<VideoOutFormatPolicy, 7> VIDEO_OUT_FORMAT_POLICIES {
 		const auto encoded = static_cast<float>(value & 0xffu) / 255.0f;
 		return encoded <= 0.04045f ? encoded / 12.92f : std::pow((encoded + 0.055f) / 1.055f, 2.4f);
 	};
+	const auto float16 = [](uint32_t value) {
+		const auto sign = (value & 0x8000u) << 16u;
+		const auto exponent = (value >> 10u) & 0x1fu;
+		const auto mantissa = value & 0x3ffu;
+		if (exponent == 0) {
+			return std::copysign(static_cast<float>(mantissa) * 0x1p-24f,
+			                     std::bit_cast<float>(sign));
+		}
+		return std::bit_cast<float>(sign | ((exponent == 31 ? 255u : exponent + 112u) << 23u) |
+		                            (mantissa << 13u));
+	};
 	switch (format) {
+		case vk::Format::eR16G16Sfloat:
+			next.float32[1] = float16(packed >> 16u);
+			[[fallthrough]];
+		case vk::Format::eR16Sfloat: next.float32[0] = float16(packed); break;
+		case vk::Format::eR16G16Unorm:
+			next.float32[1] = static_cast<float>(packed >> 16u) / 65535.0f;
+			[[fallthrough]];
+		case vk::Format::eR16Unorm:
+			next.float32[0] = static_cast<float>(packed & 0xffffu) / 65535.0f;
+			break;
 		// A single-plane float target carries its clear as raw float bits, the same encoding the
 		// depth decoder below uses. Without this the clear is discarded and the target keeps stale
 		// contents.
@@ -432,6 +485,10 @@ inline constexpr std::array<VideoOutFormatPolicy, 7> VIDEO_OUT_FORMAT_POLICIES {
 // Keep this separate: the first register word alone cannot describe a 64-bit color.
 [[nodiscard]] inline bool DecodeColorDwordFill(vk::Format format, uint32_t packed,
                                                vk::ClearColorValue& clear) {
+	if ((format == vk::Format::eR16Sfloat || format == vk::Format::eR16Unorm) &&
+	    (packed & 0xffffu) != (packed >> 16u)) {
+		return false;
+	}
 	if (format == vk::Format::eR16G16B16A16Sfloat) {
 		if (packed != 0) {
 			return false;

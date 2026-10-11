@@ -832,10 +832,6 @@ namespace Net {
 
 LIB_NAME("Net", "Net");
 
-struct NetEtherAddr {
-	uint8_t data[6] = {0};
-};
-
 #if defined(_WIN32)
 using NativeSocket                                  = SOCKET;
 static constexpr NativeSocket INVALID_NATIVE_SOCKET = INVALID_SOCKET;
@@ -849,20 +845,38 @@ using SocketIoLength                                = size_t;
 #endif
 
 struct SocketTransport {
-	explicit SocketTransport(NativeSocket value): socket(value) {}
+	SocketTransport(NativeSocket value, int socket_type): socket(value), type(socket_type) {}
 	~SocketTransport() { Close(); }
+	bool HasPendingReceive() const {
+#if defined(_WIN32)
+		return buffered_bytes.load(std::memory_order_relaxed) != 0 ||
+		       receive_shutdown.load(std::memory_order_relaxed);
+#else
+		return false;
+#endif
+	}
 	int Close() {
-		if (socket == INVALID_NATIVE_SOCKET) {
+#if defined(_WIN32)
+		receive_shutdown.store(true, std::memory_order_relaxed);
+#endif
+		const auto value = socket.exchange(INVALID_NATIVE_SOCKET);
+		if (value == INVALID_NATIVE_SOCKET) {
 			return 0;
 		}
-		const auto value = std::exchange(socket, INVALID_NATIVE_SOCKET);
 #if defined(_WIN32)
 		return closesocket(value);
 #else
 		return ::close(value);
 #endif
 	}
-	NativeSocket socket;
+	std::atomic<NativeSocket> socket;
+	const int                type;
+#if defined(_WIN32)
+	std::mutex         receive_mutex;
+	std::vector<char>  receive_buffer;
+	std::atomic_size_t buffered_bytes   = 0;
+	std::atomic_bool   receive_shutdown = false;
+#endif
 };
 
 struct P2pEndpoint {
@@ -974,6 +988,7 @@ static int ConvertHostSocketError(int error) {
 		case WSAENETUNREACH: posix_error = Posix::POSIX_ENETUNREACH; break;
 		case WSAENOTCONN: posix_error = Posix::POSIX_ENOTCONN; break;
 		case WSAENOTSOCK: posix_error = Posix::POSIX_ENOTSOCK; break;
+		case WSAENOPROTOOPT: posix_error = Posix::POSIX_ENOPROTOOPT; break;
 		case WSAEOPNOTSUPP: posix_error = Posix::POSIX_EOPNOTSUPP; break;
 		case WSAEPROTONOSUPPORT: posix_error = Posix::POSIX_EPROTONOSUPPORT; break;
 		case WSAESHUTDOWN: posix_error = Posix::POSIX_ESHUTDOWN; break;
@@ -1010,6 +1025,7 @@ static int ConvertHostSocketError(int error) {
 		case ENETUNREACH: posix_error = Posix::POSIX_ENETUNREACH; break;
 		case ENOTCONN: posix_error = Posix::POSIX_ENOTCONN; break;
 		case ENOTSOCK: posix_error = Posix::POSIX_ENOTSOCK; break;
+		case ENOPROTOOPT: posix_error = Posix::POSIX_ENOPROTOOPT; break;
 		case EOPNOTSUPP: posix_error = Posix::POSIX_EOPNOTSUPP; break;
 		case EPIPE: posix_error = Posix::POSIX_EPIPE; break;
 		case EPROTONOSUPPORT: posix_error = Posix::POSIX_EPROTONOSUPPORT; break;
@@ -1046,6 +1062,26 @@ static int ConvertFamily(int family) {
 
 static int ConvertSocketOptionLevel(int level) {
 	return (level == 0xffff ? SOL_SOCKET : level);
+}
+
+static int ConvertSocketOptionName(int level, int option) {
+	if (level == 0xffff) {
+		switch (option) {
+			case 0x0020: return SO_BROADCAST;
+			case 0x1001: return SO_SNDBUF;
+			case 0x1002: return SO_RCVBUF;
+			case 0x1007: return SO_ERROR;
+			case 0x1105: return SO_SNDTIMEO;
+			default: break;
+		}
+	} else if (level == 6 && option == 1) {
+		return TCP_NODELAY;
+	}
+#if defined(_WIN32)
+	return option;
+#else
+	return -1;
+#endif
 }
 
 static int* P2pSocketOption(P2pEndpoint& endpoint, int option) {
@@ -1164,7 +1200,8 @@ static int ConvertHostSockaddr(const sockaddr_storage* addr, SocketLength addrle
 	return 0;
 }
 
-static bool GetSocketBackend(int guest_fd, NativeSocket* out, SocketSlot* state = nullptr) {
+static bool GetSocketBackend(int guest_fd, NativeSocket* out, SocketSlot* state = nullptr,
+                             std::shared_ptr<SocketTransport>* transport = nullptr) {
 	EXIT_IF(out == nullptr);
 
 	if (guest_fd < 0 || guest_fd >= SOCKET_FD_MAX) {
@@ -1187,6 +1224,9 @@ static bool GetSocketBackend(int guest_fd, NativeSocket* out, SocketSlot* state 
 	*out = slot.transport->socket;
 	if (state != nullptr) {
 		*state = slot;
+	}
+	if (transport != nullptr) {
+		*transport = slot.transport;
 	}
 	return true;
 }
@@ -1232,6 +1272,63 @@ static int AllocSocketFd(const std::shared_ptr<SocketTransport>& transport, bool
 	}
 
 	return -1;
+}
+
+static int SelectSockets(int nfds, fd_set* readfds, fd_set* writefds, fd_set* exceptfds,
+                         timeval* timeout,
+                         const std::vector<std::shared_ptr<SocketTransport>>& stream_reads) {
+#if defined(_WIN32)
+	if (!stream_reads.empty()) {
+		const auto requested_read   = *readfds;
+		const auto requested_write  = writefds != nullptr ? *writefds : fd_set {};
+		const auto requested_except = exceptfds != nullptr ? *exceptfds : fd_set {};
+		std::optional<std::chrono::steady_clock::time_point> deadline;
+		if (timeout != nullptr) {
+			deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout->tv_sec) +
+			           std::chrono::microseconds(timeout->tv_usec);
+		}
+		for (;;) {
+			*readfds = requested_read;
+			if (writefds != nullptr) {
+				*writefds = requested_write;
+			}
+			if (exceptfds != nullptr) {
+				*exceptfds = requested_except;
+			}
+			const bool ready = std::any_of(stream_reads.begin(), stream_reads.end(),
+			    [](const auto& transport) { return transport->HasPendingReceive(); });
+			// A concurrent peek can move native bytes into the guest buffer after this check.
+			// Bound native waits so both readiness sources are rechecked without holding receive locks.
+			auto wait = std::chrono::microseconds(ready ? 0 : 10'000);
+			if (deadline) {
+				const auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(
+				    *deadline - std::chrono::steady_clock::now());
+				wait = std::min(wait, std::max(remaining, std::chrono::microseconds::zero()));
+			}
+			timeval slice {};
+			slice.tv_usec = static_cast<long>(wait.count());
+			int result = ::select(nfds, readfds, writefds, exceptfds, &slice);
+			if (result < 0) {
+				return result;
+			}
+			for (const auto& transport: stream_reads) {
+				const auto socket = transport->socket.load();
+				if (socket == INVALID_NATIVE_SOCKET) {
+					WSASetLastError(WSAENOTSOCK);
+					return SOCKET_ERROR;
+				}
+				if (transport->HasPendingReceive() && !FD_ISSET(socket, readfds)) {
+					FD_SET(socket, readfds);
+					result++;
+				}
+			}
+			if (result != 0 || (deadline && std::chrono::steady_clock::now() >= *deadline)) {
+				return result;
+			}
+		}
+	}
+#endif
+	return ::select(nfds, readfds, writefds, exceptfds, timeout);
 }
 
 static bool GuestFdIsSet(const void* fds, int fd) {
@@ -1463,14 +1560,12 @@ const char* KYTY_SYSV_ABI NetInetNtop(int af, const void* src, char* dst, uint32
 int KYTY_SYSV_ABI NetEtherNtostr(const NetEtherAddr* n, char* str, size_t len) {
 	PRINT_NAME();
 
-	NetEtherAddr zero {};
+	if (n == nullptr || str == nullptr || len < 18) {
+		return NET_ERROR_EINVAL;
+	}
 
-	EXIT_NOT_IMPLEMENTED(len != 18);
-	EXIT_NOT_IMPLEMENTED(n == nullptr);
-	EXIT_NOT_IMPLEMENTED(str == nullptr);
-	EXIT_NOT_IMPLEMENTED(memcmp(n->data, zero.data, sizeof(zero.data)) != 0);
-
-	strcpy(str, "00:00:00:00:00:00"); // NOLINT
+	std::snprintf(str, len, "%02x:%02x:%02x:%02x:%02x:%02x", n->data[0], n->data[1],
+	              n->data[2], n->data[3], n->data[4], n->data[5]);
 
 	return OK;
 }
@@ -1621,6 +1716,7 @@ int KYTY_SYSV_ABI EpollWait(int eid, NetEpollEvent* events, int maxevents, int t
 	FD_ZERO(&host_except);
 
 	std::vector<HostRegistration> host_registrations;
+	std::vector<std::shared_ptr<SocketTransport>> stream_reads;
 	host_registrations.reserve(registrations.size());
 	int host_nfds = 0;
 	for (const auto& registration: registrations) {
@@ -1641,6 +1737,11 @@ int KYTY_SYSV_ABI EpollWait(int eid, NetEpollEvent* events, int maxevents, int t
 #endif
 		if ((registration.event.events & EPOLL_IN) != 0) {
 			FD_SET(socket, &host_read);
+#if defined(_WIN32)
+			if (state.transport->type == SOCK_STREAM) {
+				stream_reads.push_back(state.transport);
+			}
+#endif
 		}
 		if ((registration.event.events & EPOLL_OUT) != 0) {
 			FD_SET(socket, &host_write);
@@ -1660,8 +1761,8 @@ int KYTY_SYSV_ABI EpollWait(int eid, NetEpollEvent* events, int maxevents, int t
 		host_timeout.tv_usec = timeout % 1000000;
 		host_timeout_ptr     = &host_timeout;
 	}
-
-	const int result = ::select(host_nfds, &host_read, &host_write, &host_except, host_timeout_ptr);
+	const int result = SelectSockets(host_nfds, &host_read, &host_write, &host_except,
+	                                 host_timeout_ptr, stream_reads);
 	if (result < 0) {
 		return SetHostSocketError();
 	}
@@ -1727,7 +1828,12 @@ int KYTY_SYSV_ABI SocketClose(int s) {
 	}
 	RemoveSocketFromEpolls(s);
 
-	if (slot.transport.use_count() == 1 && slot.transport->Close() != 0) {
+	bool close_transport = slot.transport.use_count() == 1;
+#if defined(_WIN32)
+	// Retained receive/readiness state must not defer native TCP close cancellation.
+	close_transport |= !slot.p2p && slot.transport->type == SOCK_STREAM;
+#endif
+	if (close_transport && slot.transport->Close() != 0) {
 		return NET_ERROR_EBADF;
 	}
 
@@ -1762,7 +1868,7 @@ int KYTY_SYSV_ABI Socket(int family, int type, int protocol) {
 		return SetHostSocketError();
 	}
 
-	auto transport = std::make_shared<SocketTransport>(socket);
+	auto transport = std::make_shared<SocketTransport>(socket, p2p ? SOCK_DGRAM : type);
 	if (p2p) {
 		// Logical sockets keep their own blocking mode; the shared transport never blocks.
 #if defined(_WIN32)
@@ -1945,7 +2051,7 @@ int KYTY_SYSV_ABI Accept(int s, void* addr, uint32_t* addrlen) {
 		return SetHostSocketError();
 	}
 
-	auto      transport = std::make_shared<SocketTransport>(accepted);
+	auto      transport = std::make_shared<SocketTransport>(accepted, SOCK_STREAM);
 	const int fd        = AllocSocketFd(transport);
 	if (fd < 0) {
 		*Posix::GetErrorAddr() = Posix::POSIX_EMFILE;
@@ -1974,8 +2080,9 @@ int KYTY_SYSV_ABI Shutdown(int s, int how) {
 	     "\t how = %d\n",
 	     s, how);
 
-	NativeSocket socket = INVALID_NATIVE_SOCKET;
-	if (!GetSocketBackend(s, &socket)) {
+	NativeSocket                    socket = INVALID_NATIVE_SOCKET;
+	std::shared_ptr<SocketTransport> transport;
+	if (!GetSocketBackend(s, &socket, nullptr, &transport)) {
 		return -1;
 	}
 
@@ -1987,6 +2094,9 @@ int KYTY_SYSV_ABI Shutdown(int s, int how) {
 #if defined(_WIN32)
 	if (::shutdown(socket, how) == SOCKET_ERROR) {
 		return SetHostSocketError();
+	}
+	if (how == SD_RECEIVE || how == SD_BOTH) {
+		transport->receive_shutdown.store(true, std::memory_order_relaxed);
 	}
 
 	return 0;
@@ -2055,20 +2165,40 @@ int KYTY_SYSV_ABI Getsockopt(int s, int level, int optname, void* optval, uint32
 		return 0;
 	}
 
-	// Guest socket options: SOL_SOCKET=0xffff, SO_ERROR=0x1007.
 	const bool socket_error = (level == 0xffff && optname == 0x1007);
-#if !defined(_WIN32)
-	if (!socket_error) {
+	const bool send_timeout = (level == 0xffff && optname == 0x1105);
+	optname                = ConvertSocketOptionName(level, optname);
+	if (optname < 0) {
 		return SetGuestSocketError(Posix::POSIX_ENOPROTOOPT);
 	}
+#if defined(_WIN32)
+	DWORD timeout {};
+#else
+	timeval timeout {};
 #endif
-	if (socket_error) {
-		optname = SO_ERROR;
-	}
 	SocketLength len = static_cast<SocketLength>(*optlen);
-	if (::getsockopt(socket, ConvertSocketOptionLevel(level), optname, static_cast<char*>(optval),
+	void*        value = optval;
+	if (send_timeout) {
+		if (*optlen < sizeof(int)) {
+			return SetGuestSocketError(Posix::POSIX_EINVAL);
+		}
+		value = &timeout;
+		len   = sizeof(timeout);
+	}
+	if (::getsockopt(socket, ConvertSocketOptionLevel(level), optname, static_cast<char*>(value),
 	                 &len) != 0) {
 		return SetHostSocketError();
+	}
+	if (send_timeout) {
+#if defined(_WIN32)
+		const int64_t usec = static_cast<int64_t>(timeout) * 1000;
+#else
+		const int64_t usec = static_cast<int64_t>(timeout.tv_sec) * 1'000'000 + timeout.tv_usec;
+#endif
+		const int guest_timeout =
+		    static_cast<int>(std::min<int64_t>(usec, std::numeric_limits<int>::max()));
+		std::memcpy(optval, &guest_timeout, sizeof(guest_timeout));
+		len = sizeof(guest_timeout);
 	}
 	if (socket_error && len >= static_cast<SocketLength>(sizeof(int))) {
 		auto* error = static_cast<int*>(optval);
@@ -2121,6 +2251,18 @@ int KYTY_SYSV_ABI Setsockopt(int s, int level, int optname, const void* optval, 
 		return 0;
 	}
 
+#if defined(__linux__)
+	if (level == 0xffff && optname == 0x10000) {
+		if (optlen != sizeof(int)) {
+			return SetGuestSocketError(Posix::POSIX_EINVAL);
+		}
+		int enabled = 0;
+		std::memcpy(&enabled, optval, sizeof(enabled));
+		// Native sends preserve 255.255.255.255 without changing broadcast permission.
+		return enabled != 0 ? 0 : SetGuestSocketError(Posix::POSIX_ENOPROTOOPT);
+	}
+#endif
+
 	constexpr int ORBIS_SO_NBIO = 0x1200;
 	if (ConvertSocketOptionLevel(level) == SOL_SOCKET && optname == ORBIS_SO_NBIO &&
 	    optlen >= sizeof(int)) {
@@ -2136,14 +2278,32 @@ int KYTY_SYSV_ABI Setsockopt(int s, int level, int optname, const void* optval, 
 #endif
 		return failed ? SetHostSocketError() : 0;
 	}
-#if !defined(_WIN32)
-	// Guest TCP options: IPPROTO_TCP=6, TCP_NODELAY=1.
-	if (level != 6 || optname != 1) {
+	const bool send_timeout = (level == 0xffff && optname == 0x1105);
+	optname                = ConvertSocketOptionName(level, optname);
+	if (optname < 0) {
 		return SetGuestSocketError(Posix::POSIX_ENOPROTOOPT);
 	}
-	level   = IPPROTO_TCP;
-	optname = TCP_NODELAY;
+#if defined(_WIN32)
+	DWORD timeout {};
+#else
+	timeval timeout {};
 #endif
+	if (send_timeout) {
+		if (optlen != sizeof(int)) {
+			return SetGuestSocketError(Posix::POSIX_EINVAL);
+		}
+		int usec = 0;
+		std::memcpy(&usec, optval, sizeof(usec));
+		usec = std::max(usec, 0);
+#if defined(_WIN32)
+		timeout = static_cast<DWORD>((static_cast<int64_t>(usec) + 999) / 1000);
+#else
+		timeout.tv_sec  = usec / 1'000'000;
+		timeout.tv_usec = usec % 1'000'000;
+#endif
+		optval = &timeout;
+		optlen = sizeof(timeout);
+	}
 
 	if (::setsockopt(socket, ConvertSocketOptionLevel(level), optname,
 	                 static_cast<const char*>(optval), static_cast<SocketLength>(optlen)) != 0) {
@@ -2205,6 +2365,77 @@ int64_t KYTY_SYSV_ABI Sendto(int s, const void* buf, uint64_t len, int flags, co
 	return result;
 }
 
+#if defined(_WIN32)
+static int ReceiveStream(SocketTransport& transport, char* output, int length, int flags,
+                         bool dontwait) {
+	std::unique_lock lock(transport.receive_mutex, std::defer_lock);
+	if (dontwait) {
+		if (!lock.try_lock()) {
+			return SetGuestSocketError(Posix::POSIX_EWOULDBLOCK);
+		}
+	} else {
+		lock.lock();
+	}
+	if (transport.receive_shutdown.load(std::memory_order_relaxed)) {
+		return SetGuestSocketError(Posix::POSIX_ESHUTDOWN);
+	}
+	auto&           buffered = transport.receive_buffer;
+	const bool      peek     = (flags & MSG_PEEK) != 0;
+	const bool      waitall  = (flags & MSG_WAITALL) != 0;
+	int             copied   = static_cast<int>(std::min<size_t>(buffered.size(), length));
+	if (copied != 0) {
+		std::memcpy(output, buffered.data(), copied);
+		if (!peek) {
+			buffered.erase(buffered.begin(), buffered.begin() + copied);
+			transport.buffered_bytes.store(buffered.size(), std::memory_order_relaxed);
+		}
+	}
+	if (copied == length || (copied != 0 && !waitall)) {
+		return copied;
+	}
+
+	// Winsock rejects PEEK | WAITALL. Consume into transport-owned storage when peeking,
+	// and let ordinary recv report EOF, timeouts, or nonblocking partial progress.
+	flags &= ~(MSG_PEEK | MSG_WAITALL);
+	do {
+		if (transport.receive_shutdown.load(std::memory_order_relaxed)) {
+			return copied != 0 ? copied : SetGuestSocketError(Posix::POSIX_ESHUTDOWN);
+		}
+		const auto socket = transport.socket.load();
+		if (dontwait) {
+			fd_set readable {};
+			FD_SET(socket, &readable);
+			timeval immediate {};
+			const int ready = ::select(0, &readable, nullptr, nullptr, &immediate);
+			if (ready <= 0) {
+				return copied != 0 ? copied : (ready < 0 ? SetHostSocketError() :
+				    SetGuestSocketError(Posix::POSIX_EWOULDBLOCK));
+			}
+		}
+		const auto previous_size = buffered.size();
+		const int  requested     = peek ? std::min(length - copied, 64 * 1024) : length - copied;
+		char*      destination   = output + copied;
+		if (peek) {
+			buffered.resize(previous_size + requested);
+			destination = buffered.data() + previous_size;
+		}
+		const int received = ::recv(socket, destination, requested, flags);
+		if (peek) {
+			if (received > 0) {
+				std::memcpy(output + copied, destination, received);
+			}
+			buffered.resize(previous_size + std::max(received, 0));
+			transport.buffered_bytes.store(buffered.size(), std::memory_order_relaxed);
+		}
+		if (received <= 0) {
+			return copied != 0 || received == 0 ? copied : SetHostSocketError();
+		}
+		copied += received;
+	} while (waitall && copied < length);
+	return copied;
+}
+#endif
+
 int64_t KYTY_SYSV_ABI Recv(int s, void* buf, uint64_t len, int flags) {
 	return Recvfrom(s, buf, len, flags, nullptr, nullptr);
 }
@@ -2227,8 +2458,9 @@ int64_t KYTY_SYSV_ABI Recvfrom(int s, void* buf, uint64_t len, int flags, void* 
 		return -1;
 	}
 
-	NativeSocket socket = INVALID_NATIVE_SOCKET;
-	if (!GetSocketBackend(s, &socket)) {
+	NativeSocket                    socket = INVALID_NATIVE_SOCKET;
+	std::shared_ptr<SocketTransport> transport;
+	if (!GetSocketBackend(s, &socket, nullptr, &transport)) {
 		return -1;
 	}
 
@@ -2242,11 +2474,27 @@ int64_t KYTY_SYSV_ABI Recvfrom(int s, void* buf, uint64_t len, int flags, void* 
 	sockaddr_storage host_addr {};
 	SocketLength     host_addrlen = sizeof(host_addr);
 	int64_t          result       = 0;
-	if (addr == nullptr) {
-		result = ::recv(socket, static_cast<char*>(buf), host_len, host_flags);
-	} else {
-		result = ::recvfrom(socket, static_cast<char*>(buf), host_len, host_flags,
-		                    reinterpret_cast<sockaddr*>(&host_addr), &host_addrlen);
+#if defined(_WIN32)
+	if (transport->type == SOCK_STREAM) {
+		if (addr != nullptr &&
+		    ::getpeername(socket, reinterpret_cast<sockaddr*>(&host_addr), &host_addrlen) != 0) {
+			return SetHostSocketError();
+		}
+		result = ReceiveStream(*transport, static_cast<char*>(buf), host_len, host_flags,
+		                       (flags & 0x80) != 0);
+		if (result < 0) {
+			return result;
+		}
+	} else
+#endif
+	{
+		transport.reset();
+		if (addr == nullptr) {
+			result = ::recv(socket, static_cast<char*>(buf), host_len, host_flags);
+		} else {
+			result = ::recvfrom(socket, static_cast<char*>(buf), host_len, host_flags,
+			                    reinterpret_cast<sockaddr*>(&host_addr), &host_addrlen);
+		}
 	}
 #if defined(_WIN32)
 	if (result < 0 && WSAGetLastError() == WSAEMSGSIZE) {
@@ -2303,6 +2551,7 @@ int KYTY_SYSV_ABI Select(int nfds, void* readfds, void* writefds, void* exceptfd
 	FD_ZERO(&host_except);
 
 	std::vector<std::pair<int, NativeSocket>> descriptors;
+	std::vector<std::shared_ptr<SocketTransport>> stream_reads;
 	int host_nfds = 0;
 	for (int fd = 0; fd < nfds; fd++) {
 		const bool read = GuestFdIsSet(readfds, fd);
@@ -2311,13 +2560,14 @@ int KYTY_SYSV_ABI Select(int nfds, void* readfds, void* writefds, void* exceptfd
 		if (!read && !write && !except) {
 			continue;
 		}
-		NativeSocket socket = INVALID_NATIVE_SOCKET;
+		NativeSocket                    socket = INVALID_NATIVE_SOCKET;
+		std::shared_ptr<SocketTransport> transport;
 #if !defined(_WIN32)
 		if (fd < 3) {
 			socket = fd;
 		} else
 #endif
-		if (!GetSocketBackend(fd, &socket)) {
+		if (!GetSocketBackend(fd, &socket, nullptr, &transport)) {
 			return -1;
 		}
 #if defined(_WIN32)
@@ -2335,6 +2585,11 @@ int KYTY_SYSV_ABI Select(int nfds, void* readfds, void* writefds, void* exceptfd
 		descriptors.emplace_back(fd, socket);
 		if (read) {
 			FD_SET(socket, &host_read);
+#if defined(_WIN32)
+			if (transport->type == SOCK_STREAM) {
+				stream_reads.push_back(std::move(transport));
+			}
+#endif
 		}
 		if (write) {
 			FD_SET(socket, &host_write);
@@ -2365,9 +2620,10 @@ int KYTY_SYSV_ABI Select(int nfds, void* readfds, void* writefds, void* exceptfd
 	} else
 #endif
 	{
-		result = ::select(host_nfds, readfds != nullptr ? &host_read : nullptr,
-		                  writefds != nullptr ? &host_write : nullptr,
-		                  exceptfds != nullptr ? &host_except : nullptr, host_timeout_ptr);
+		result = SelectSockets(host_nfds, readfds != nullptr ? &host_read : nullptr,
+		                       writefds != nullptr ? &host_write : nullptr,
+		                       exceptfds != nullptr ? &host_except : nullptr, host_timeout_ptr,
+		                       stream_reads);
 		if (result < 0) {
 			return SetHostSocketError();
 		}
@@ -2376,15 +2632,19 @@ int KYTY_SYSV_ABI Select(int nfds, void* readfds, void* writefds, void* exceptfd
 	GuestFdZero(readfds, nfds);
 	GuestFdZero(writefds, nfds);
 	GuestFdZero(exceptfds, nfds);
+	result = 0;
 	for (const auto& [fd, socket]: descriptors) {
 		if (FD_ISSET(socket, &host_read)) {
 			GuestFdSet(readfds, fd);
+			result++;
 		}
 		if (FD_ISSET(socket, &host_write)) {
 			GuestFdSet(writefds, fd);
+			result++;
 		}
 		if (FD_ISSET(socket, &host_except)) {
 			GuestFdSet(exceptfds, fd);
+			result++;
 		}
 	}
 	return result;
@@ -3843,6 +4103,26 @@ int KYTY_SYSV_ABI NpGetAccountAge(int req_id, int user_id, uint8_t* age) {
 	*age = 0;
 
 	// return OK;
+	return np_error_signed_out;
+}
+
+int KYTY_SYSV_ABI NpGetAccountLanguage2(int req_id, int user_id, void* language_code) {
+	PRINT_NAME();
+
+	LOGF("\t req_id        = %d\n", req_id);
+	LOGF("\t user_id       = %d\n", user_id);
+	LOGF("\t language_code = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(language_code));
+
+	if (req_id <= 0 || language_code == nullptr) {
+		return np_error_invalid_argument;
+	}
+
+	std::lock_guard lock(g_np_request_mutex);
+
+	if (np_get_request_locked(req_id) == nullptr) {
+		return np_error_request_not_found;
+	}
+
 	return np_error_signed_out;
 }
 

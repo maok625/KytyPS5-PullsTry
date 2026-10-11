@@ -199,6 +199,11 @@ void FoldInstruction(Block& block, Block::iterator instruction,
                       std::unordered_set<Inst*>& lowered_ancillary) {
 	auto& inst = *instruction;
 	switch (inst.GetOpcode()) {
+		case ValueOpcode::StoreBufferU32: {
+			const auto data = ResolveActiveU32(Arg(inst, 4), Arg(inst, 5));
+			if (!data.IsEmpty() && data != inst.Arg(4)) inst.SetArg(4, data);
+			return;
+		}
 		case ValueOpcode::Phi: FoldPhi(inst); return;
 		case ValueOpcode::SelectU1:
 			if (!FoldSelect(inst) && IsImmediate(Arg(inst, 2), Type::U1) &&
@@ -210,6 +215,24 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 			return;
 		case ValueOpcode::SelectU32:
 		case ValueOpcode::SelectF32: FoldSelect(inst); return;
+		case ValueOpcode::FPCmpClass32: {
+			const auto mask = Arg(inst, 1);
+			if (!IsImmediate(mask, Type::U32)) {
+				return;
+			}
+			switch (mask.U32() & 0x3ffu) {
+				case 0u: Replace(inst, Value(false)); break;
+				case 0x3ffu: Replace(inst, Value(true)); break;
+				case 3u: {
+					const auto result = block.PrependNewInst(
+					    instruction, ValueOpcode::FPIsNan32, {Arg(inst, 0)});
+					Replace(inst, Value(&*result));
+					break;
+				}
+				default: break;
+			}
+			return;
+		}
 		case ValueOpcode::BitFieldInsert: {
 			const auto base   = Arg(inst, 0);
 			const auto insert = Arg(inst, 1);
@@ -342,6 +365,17 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 			if (IsImmediate(low, Type::U32) && IsImmediate(high, Type::U32)) {
 				Replace(inst, Value(static_cast<uint64_t>(low.U32()) |
 				                    (static_cast<uint64_t>(high.U32()) << 32u)));
+			} else {
+				const auto* low_extract  = low.TryInstruction();
+				const auto* high_extract = high.TryInstruction();
+				if (low_extract != nullptr && high_extract != nullptr &&
+				    low_extract->GetOpcode() == ValueOpcode::CompositeExtractU64 &&
+				    high_extract->GetOpcode() == ValueOpcode::CompositeExtractU64 &&
+				    Arg(*low_extract, 1) == Value(0u) && Arg(*high_extract, 1) == Value(1u) &&
+				    Arg(*low_extract, 0) == Arg(*high_extract, 0)) {
+					// Guest register pairs need not unpack and repack between wide operations.
+					Replace(inst, Arg(*low_extract, 0));
+				}
 			}
 			return;
 		}
@@ -500,6 +534,17 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 			} else if (auto* producer = value.TryInstruction();
 			           producer != nullptr && producer->GetOpcode() == ValueOpcode::BitwiseNot32) {
 				Replace(inst, producer->Arg(0));
+			}
+			return;
+		}
+		case ValueOpcode::BitReverse32: {
+			const auto value = Arg(inst, 0);
+			if (IsImmediate(value, Type::U32)) {
+				uint32_t source = value.U32(), reversed = 0;
+				for (uint32_t bit = 0; bit < 32u; ++bit, source >>= 1u) {
+					reversed = (reversed << 1u) | (source & 1u);
+				}
+				Replace(inst, Value(reversed));
 			}
 			return;
 		}

@@ -54,11 +54,16 @@ static void PrintUsage() {
 	         Config::DEFAULT_USER_ID);
 	::printf("  --mic <name>                        Capture from this microphone; omit for silence.\n");
 	::printf("  --controller-color <#RRGGBB>        Override the controller lightbar color.\n");
+	::printf("  --controller-volume <0-100>         DualSense speaker volume. Default: 50.\n");
+	::printf("  --controller-vibration <0-100>      DualSense vibration intensity. Default: 100.\n");
 	::printf(
 	    "  --present-mode <value>               Fifo, Mailbox, or Immediate. Default: Mailbox.\n");
 	::printf(
 	    "  --gpu <index>                        Vulkan physical device index. Default: auto.\n");
 	::printf("  --fullscreen                         Run in borderless desktop fullscreen.\n");
+	::printf(
+	    "  --hide-cursor                        Hide the cursor after 2 s idle. Default: off.\n");
+	::printf("  --no-splash                          Disable the startup splash screen.\n");
 	::printf("  --vr                                 Enable the virtual VR headset.\n");
 	::printf("  --amd-cpu                            Apply AMD CPU instruction patches.\n");
 	::printf("  --vblank-frequency <num>             Virtual vblank frequency. Default: 60.\n");
@@ -80,7 +85,14 @@ static void PrintUsage() {
 	::printf("  --spirv-debug-printf <true|false>    Enable SPIR-V debug printf.\n");
 	::printf(
 	    "  --readback-linear-images <true|false> Read back writable linear images on submit.\n");
+	::printf(
+	    "  --sync-raw-image-buffers <true|false> Synchronize raw reads of GPU images. Default: false.\n");
+	::printf(
+	    "  --trophy-notifications <true|false>   Show trophy unlock toasts and play their sound.\n");
 	::printf("  --playgo-hack                       Use the supplied PlayGo stub fallback.\n");
+	::printf(
+	    "  --skip-notice-screen <true|false>    Skip startup logos and notices in supported games.\n"
+	    "                                      Default: false.\n");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	::printf("  --redzone                            Protect the guest SysV red zone.\n");
 #endif
@@ -200,6 +212,16 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 
 		if (arg == "--fullscreen") {
 			options.config.fullscreen_enabled = true;
+			continue;
+		}
+
+		if (arg == "--hide-cursor") {
+			options.config.hide_cursor_enabled = true;
+			continue;
+		}
+
+		if (arg == "--no-splash") {
+			options.config.splash_enabled = false;
 			continue;
 		}
 
@@ -324,6 +346,18 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				return false;
 			}
 			options.config.controller_color = color;
+		} else if (arg == "--controller-volume") {
+			if (!ParseUint32(value, options.config.controller_speaker_volume) ||
+			    options.config.controller_speaker_volume > 100) {
+				::printf("invalid controller volume: %s\n", value.c_str());
+				return false;
+			}
+		} else if (arg == "--controller-vibration") {
+			if (!ParseUint32(value, options.config.controller_vibration_intensity) ||
+			    options.config.controller_vibration_intensity > 100) {
+				::printf("invalid controller vibration intensity: %s\n", value.c_str());
+				return false;
+			}
 		} else if (arg == "--present-mode") {
 			if (!ParseEnum(value, options.config.present_mode)) {
 				::printf("invalid present mode: %s\n", value.c_str());
@@ -397,6 +431,21 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			}
 		} else if (arg == "--readback-linear-images") {
 			if (!ParseBool(value, options.config.readback_linear_images)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--sync-raw-image-buffers") {
+			if (!ParseBool(value, options.config.sync_raw_image_buffers)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--trophy-notifications") {
+			if (!ParseBool(value, options.config.trophy_enabled)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--skip-notice-screen") {
+			if (!ParseBool(value, options.config.skip_notice_screen)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}

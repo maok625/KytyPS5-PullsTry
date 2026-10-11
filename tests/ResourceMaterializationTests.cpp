@@ -1,8 +1,10 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
+#include <bit>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <memory>
 
 namespace {
@@ -25,12 +27,12 @@ AddValueBlock(Libs::Graphics::ShaderRecompiler::IR::Program &program) {
   auto block = std::make_unique<Block>();
   auto *result = block.get();
   program.blocks.push_back(result);
-  program.block_info.push_back({.id = 0});
+  result->id = static_cast<uint32_t>(program.blocks.size() - 1u);
   program.block_storage.push_back(std::move(block));
   return *result;
 }
 
-Libs::Graphics::ShaderRecompiler::IR::ResourcePlan SrtPlan(uint64_t address) {
+Libs::Graphics::ShaderRecompiler::IR::Program SrtProgram(uint64_t address) {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   Program program;
   program.stage = Libs::Graphics::ShaderType::Compute;
@@ -60,7 +62,7 @@ Libs::Graphics::ShaderRecompiler::IR::ResourcePlan SrtPlan(uint64_t address) {
   source.dwords[1] = Value(0u);
   source.dword_count = 2;
   program.descriptor_sources.push_back(source);
-  return ExtractResourcePlan(program);
+  return program;
 }
 
 Libs::Graphics::ShaderRecompiler::IR::ResourcePlan UnbasedFlatPlan() {
@@ -95,29 +97,38 @@ Libs::Graphics::ShaderRecompiler::IR::ResourcePlan UserDataBufferPlan() {
   return ExtractResourcePlan(program);
 }
 
-Libs::Graphics::ShaderRecompiler::IR::ResourcePlan MixedSamplerPlan() {
+Libs::Graphics::ShaderRecompiler::IR::Program MixedSamplerProgram() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   Program program;
   program.stage = Libs::Graphics::ShaderType::Compute;
   program.srt_plan_complete = true;
   program.resource_tracking_complete = true;
-  AddValueBlock(program);
+  auto &block = AddValueBlock(program);
 
-  const auto AddSource = [&program](uint32_t dword_count, uint32_t first) {
+  const auto AddSource = [&program](uint32_t dword_count) {
     DescriptorSource source;
     source.dword_count = dword_count;
-    source.dwords[0] = Value(first);
-    for (uint32_t i = 1; i < dword_count; i++) {
+    for (uint32_t i = 0; i < dword_count; i++) {
       source.dwords[i] = Value(0u);
     }
     program.descriptor_sources.push_back(source);
     return static_cast<uint32_t>(program.descriptor_sources.size() - 1u);
   };
 
-  const auto image0 = AddSource(8, 0);
-  const auto image1 = AddSource(8, 0);
-  const auto sampler0 = AddSource(4, 0x11111111u);
-  const auto sampler1 = AddSource(4, 0x22222222u);
+  const auto image0 = AddSource(8);
+  const auto image1 = AddSource(8);
+  const auto sampler0 = AddSource(4);
+  const auto sampler1 = AddSource(4);
+  program.descriptor_sources[image1].dwords[0] = Value(1u);
+  program.descriptor_sources[image1].dwords[1] = Value(static_cast<uint32_t>(
+      Libs::Graphics::Prospero::BufferFormat::k11_11_10UInt) << 20u);
+  program.descriptor_sources[image1].dwords[3] = Value(static_cast<uint32_t>(
+      Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+  for (uint32_t index = 0; index < 2; ++index) {
+    auto &value = block.AppendNewInst(
+        ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(index))});
+    program.descriptor_sources[sampler0 + index].dwords[0] = Value(&value);
+  }
   program.info.images.push_back(
       {.source = image0,
        .resource_class = ImageResourceClass::Sampled,
@@ -129,21 +140,19 @@ Libs::Graphics::ShaderRecompiler::IR::ResourcePlan MixedSamplerPlan() {
        .resource_class = ImageResourceClass::Sampled,
        .numeric_class = Libs::Graphics::Prospero::TextureNumericClass::Float,
        .dimension =
-           Libs::Graphics::ShaderRecompiler::Decoder::ImageDimension::Dim2D,
-       .conversion_format =
-           Libs::Graphics::Prospero::BufferFormat::k8_8_8_8UNorm});
+           Libs::Graphics::ShaderRecompiler::Decoder::ImageDimension::Dim2D});
   program.info.samplers.push_back({.source = sampler0});
   program.info.samplers.push_back({.source = sampler1});
   program.info.sampled_pairs.push_back({.image = 0, .sampler = 0});
   program.info.sampled_pairs.push_back({.image = 0, .sampler = 1});
   program.info.sampled_pairs.push_back({.image = 1, .sampler = 1});
-  return ExtractResourcePlan(program);
+  return program;
 }
 
 void TestMappedSrtUsesDirectReaderByDefault() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   const uint32_t dword = 0x12345678;
-  auto plan = SrtPlan(reinterpret_cast<uint64_t>(&dword));
+  auto plan = ExtractResourcePlan(SrtProgram(reinterpret_cast<uint64_t>(&dword)));
   uint32_t specialization_reads = 0;
   const SrtRuntime runtime{.userdata = &specialization_reads,
                            .read_specialization_memory =
@@ -161,7 +170,7 @@ void TestMappedSrtUsesDirectReaderByDefault() {
 
 void TestIntegerRuntimeValueFollowsSrtReads() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
-  auto plan = SrtPlan(0x10000);
+  auto plan = SrtProgram(0x10000);
   const auto root = plan.descriptor_sources.front().dwords[0];
   Check(ValidateRuntimeValue(plan, root, RuntimeValueType::Integer),
         "integer SRT read was rejected");
@@ -208,6 +217,213 @@ void TestIntegerRuntimeValueFollowsSrtReads() {
         "cyclic SRT read-first-lane dependency was accepted");
 }
 
+void TestSrtAliasesRetainReadPolicy() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  auto program = SrtProgram(0x1000u);
+  auto &block = *program.blocks[0];
+  const auto append_read = [&](uint32_t address) {
+    auto &handle = block.AppendNewInst(ValueOpcode::GetAddressResource,
+                                       {Value(address), Value(0u)});
+    auto &read = block.AppendNewInst(ValueOpcode::LoadAddressU32,
+        {Value(&handle), Value(0u), Value(0u), Value(true)});
+    // Different reads deliberately share MemoryInfo but have different guest PCs.
+    read.SetFlags(MemoryFlags{.index = 0, .pc = address});
+    const auto slot = static_cast<uint32_t>(program.srt_reads.size());
+    program.srt_reads.push_back({Value(&read), slot});
+    auto &srt = block.AppendNewInst(ValueOpcode::GetSrtResource);
+    return Value(&block.AppendNewInst(ValueOpcode::ReadConst,
+                                      {Value(&srt), Value(slot)}));
+  };
+  const auto ordinary = append_read(0x2000u);
+  const auto pointer = append_read(0x3000u);
+  program.srt_reads[0].value.Instruction()->Arg(0).Instruction()->SetArg(0, pointer);
+  auto &mask = block.AppendNewInst(ValueOpcode::INotEqual32, {ordinary, Value(0u)});
+  auto &first = block.AppendNewInst(ValueOpcode::ReadFirstLane,
+                                    {Value(9u), Value(&mask)});
+  program.descriptor_sources.push_back({.dwords = {Value(&first), Value(0u)},
+                                       .dword_count = 2});
+  DescriptorSource indirect;
+  indirect.indirect_descriptor.emplace(DescriptorSource::IndirectDescriptor{}).sources = {0, 1};
+  program.descriptor_sources.push_back(indirect);
+  auto plan = ExtractResourcePlan(program);
+  for (const auto &inst : plan.value_storage) {
+    Check(inst.GetOpcode() != ValueOpcode::ReadConst &&
+              inst.GetOpcode() != ValueOpcode::GetSrtResource,
+          "retained plan still contains flattened-read aliases");
+  }
+  Check(plan.descriptor_sources[0].dwords[0] == plan.srt_reads[0].value &&
+            plan.srt_reads[0].value.Instruction()->Flags<SrtReadFlags>().clean == 1u &&
+            plan.srt_reads[1].value.Instruction()->Flags<SrtReadFlags>().clean == 0u &&
+            plan.srt_reads[2].value.Instruction()->Flags<SrtReadFlags>().clean == 1u,
+        "alias normalization lost read identity or retained discarded EXEC provenance");
+  struct Reads { uint32_t strict = 0; uint32_t ordinary = 0; bool dirty = false; } reads;
+  const SrtRuntime runtime{
+      .read_memory = +[](void *data, uint64_t address, std::span<uint32_t> words) {
+        ++static_cast<Reads *>(data)->ordinary;
+        if (address == 0x2000u) words[0] = 0x2222u;
+        else if (address == 0x3000u) words[0] = 0x8000u;
+        else if (address == 0x8000u) words[0] = 0xeeeeu;
+        else return false;
+        return true;
+      },
+      .userdata = &reads,
+      .read_specialization_memory = +[](void *data, uint64_t address,
+                                        std::span<uint32_t> words) {
+        auto &reads = *static_cast<Reads *>(data);
+        ++reads.strict;
+        if (reads.dirty) return false;
+        if (address == 0x3000u) words[0] = 0x1000u;
+        else if (address == 0x1000u) words[0] = 0x1111u;
+        else return false;
+        return true;
+      }};
+  std::vector<uint32_t> flat;
+  DescriptorValue descriptor;
+  {
+    SrtWalker clean(plan, CleanRuntime(runtime));
+    SrtWalker walker(plan, runtime, &clean);
+    Check(walker.RefreshFlatBuffer(flat) &&
+              flat == std::vector<uint32_t>{0x1111u, 0x2222u, 0x1000u} &&
+              walker.EvaluateDescriptor(0, descriptor) && descriptor.dwords[0] == 0x1111u &&
+              reads.strict == 2 && reads.ordinary == 1,
+          "normalized aliases changed nested strict reads or repeated a shared read");
+  }
+  Check(!SrtWalker(plan, runtime).RefreshFlatBuffer(flat),
+        "strict flat read accepted a missing clean evaluator");
+  auto no_reader = runtime;
+  no_reader.read_specialization_memory = nullptr;
+  {
+    SrtWalker clean(plan, CleanRuntime(no_reader));
+    Check(!SrtWalker(plan, no_reader, &clean).RefreshFlatBuffer(flat),
+          "strict flat read accepted a missing strict reader");
+  }
+  Check(SrtWalker(plan, runtime).EvaluateDescriptor(0, descriptor) &&
+            descriptor.dwords[0] == 0xeeeeu && reads.strict == 2 && reads.ordinary == 3,
+        "direct descriptor evaluation without a clean evaluator changed read domains");
+  reads.dirty = true;
+  {
+    SrtWalker clean(plan, CleanRuntime(runtime));
+    Check(!SrtWalker(plan, runtime, &clean).RefreshFlatBuffer(flat) &&
+              reads.strict == 3 && reads.ordinary == 3,
+          "dirty strict pointer fell back to an ordinary read");
+  }
+}
+
+void TestUniformVectorDescriptorRead() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.srt_plan_complete = program.resource_tracking_complete = true;
+  auto &block = AddValueBlock(program);
+  auto &handle = block.AppendNewInst(ValueOpcode::GetBufferResource,
+      {Value(0x1000u), Value(4u << 16u), Value(1u), Value(0x16204u)});
+  program.memory_info.push_back({.kind = ResourceKind::Buffer});
+  auto &count = block.AppendNewInst(ValueOpcode::LoadBufferU32,
+      {Value(&handle), Value(0u), Value(0u), Value(0u), Value(true)});
+  count.SetFlags(MemoryFlags{.index = 0});
+  // The captured indirect kernel shares one read across sibling scalar lane reads,
+  // enclosed by a different EXEC mask. Its resource plan must share that read too.
+  auto &lane = block.AppendNewInst(ValueOpcode::GetBuiltin,
+      {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)), Value(0u)});
+  auto &active = block.AppendNewInst(ValueOpcode::ULessThan32, {Value(&lane), Value(32u)});
+  auto &first = block.AppendNewInst(ValueOpcode::ReadFirstLane, {Value(&count), Value(true)});
+  auto &next = block.AppendNewInst(ValueOpcode::IAdd32, {Value(&count), Value(1u)});
+  auto &second = block.AppendNewInst(ValueOpcode::ReadFirstLane, {Value(&next), Value(true)});
+  auto &sum = block.AppendNewInst(ValueOpcode::IAdd32, {Value(&first), Value(&second)});
+  auto &small = block.AppendNewInst(ValueOpcode::ULessThanEqual32, {Value(&count), Value(72u)});
+  auto &selected = block.AppendNewInst(ValueOpcode::SelectU32, {Value(&small), Value(&sum), Value(&count)});
+  auto &masked = block.AppendNewInst(ValueOpcode::SelectU32, {Value(&active), Value(&selected), Value(0u)});
+  auto &records = block.AppendNewInst(ValueOpcode::ReadFirstLane, {Value(&masked), Value(&active)});
+  DescriptorSource source;
+  source.dword_count = 4;
+  source.dwords = {Value(0x2000u), Value(4u << 16u), Value(&records), Value(0x16204u)};
+  program.descriptor_sources.push_back(source);
+  program.info.buffers.push_back({.source = 0, .written = true});
+  Check(ValidateRuntimeValue(program, Value(&count)), "uniform DWORD count was rejected");
+  struct Reads { uint32_t value = 72; uint32_t strict = 0; uint32_t ordinary = 0; bool clean = true; } reads;
+  const SrtRuntime runtime{
+      .read_memory = [](void *data, uint64_t, std::span<uint32_t> words) {
+        ++static_cast<Reads *>(data)->ordinary;
+        words[0] = 999;
+        return true;
+      },
+      .userdata = &reads,
+      .read_specialization_memory = [](void *data, uint64_t address, std::span<uint32_t> words) {
+        auto &reads = *static_cast<Reads *>(data);
+        ++reads.strict;
+        if (!reads.clean || address != 0x1000u || words.size() != 1) return false;
+        words[0] = reads.value;
+        return true;
+      }};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  for (const bool written : {false, true}) {
+    program.info.buffers[0].written = written;
+    auto plan = ExtractResourcePlan(program);
+    Check(plan.control_flow.empty() && plan.requires_specialization_memory &&
+              plan.capture_specialization_reads,
+          "vector descriptor read depended on incidental control-flow capture");
+    reads = {};
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              snapshot.buffers[0].dwords[2] == 145 && reads.strict == 1 && reads.ordinary == 0 &&
+              snapshot.specialization_reads ==
+                  std::vector<std::pair<uint64_t, uint64_t>>{{0x1000u, 4u}},
+          "vector descriptor input was not read and captured exactly once");
+    reads.clean = false;
+    reads.strict = 0;
+    Check(!MaterializeResources(plan, runtime, snapshot, specialization) &&
+              reads.strict == 1 && reads.ordinary == 0,
+          "dirty vector descriptor input fell back to an ordinary memory read");
+  }
+  count.SetArg(4, Value(false));
+  auto &inactive = block.AppendNewInst(ValueOpcode::ReadFirstLane, {Value(&count), Value(false)});
+  program.descriptor_sources.push_back({.dwords = {Value(&inactive)}, .dword_count = 1});
+  reads.strict = 0;
+  uint32_t result = 99;
+  {
+    const auto plan = ExtractResourcePlan(program);
+    Check(SrtWalker(plan, runtime).Evaluate(plan.descriptor_sources.back().dwords[0], result) &&
+              result == 0 && reads.strict == 0 && reads.ordinary == 0,
+          "literal false EXEC read vector memory");
+  }
+  count.SetArg(4, Value(true));
+  handle.SetArg(3, Value(0x204u));
+  program.descriptor_sources.back().dwords[0] = Value(&count);
+  {
+    const auto plan = ExtractResourcePlan(program);
+    Check(SrtWalker(plan, runtime).Evaluate(plan.descriptor_sources.back().dwords[0], result) &&
+              result == 0 && reads.strict == 0 && reads.ordinary == 0,
+          "invalid vector buffer format read memory");
+  }
+  handle.SetArg(3, Value(0x16204u));
+  count.SetArg(1, Value(&lane));
+  Check(!ValidateRuntimeValue(program, Value(&count)),
+        "varying vector address was treated as a uniform descriptor read");
+}
+
+void TestExactReciprocalDescriptorArithmetic() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  Program program;
+  auto &block = AddValueBlock(program);
+  for (const float divisor : {64.f, 128.f, 256.f, 512.f,
+                              std::numeric_limits<float>::min(),
+                              std::bit_cast<float>(253u << 23u)}) {
+    auto &reciprocal = block.AppendNewInst(ValueOpcode::FPRecipIFlag32, {Value::F32(divisor)});
+    uint32_t result = 0;
+    Check(SrtWalker(program, {}).Evaluate(Value(&reciprocal), result) &&
+              result == std::bit_cast<uint32_t>(1.f / divisor),
+          "power-of-two reciprocal was not exact");
+  }
+  for (const float divisor : {0.f, 3.f, -64.f, std::numeric_limits<float>::infinity(),
+                              std::numeric_limits<float>::denorm_min(),
+                              std::bit_cast<float>(254u << 23u)}) {
+    auto &reciprocal = block.AppendNewInst(ValueOpcode::FPRecipIFlag32, {Value::F32(divisor)});
+    uint32_t result = 0;
+    Check(!SrtWalker(program, {}).Evaluate(Value(&reciprocal), result),
+          "unsupported reciprocal rounding or exceptional input was accepted");
+  }
+}
+
 void TestUnbasedFlatCacheHitMaterializes() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   auto plan = UnbasedFlatPlan();
@@ -219,10 +435,11 @@ void TestUnbasedFlatCacheHitMaterializes() {
         "unbased FLAT plan produced unexpected descriptors");
 }
 
-void TestWrittenDescriptorUsesStrictReaderOnce() {
+void TestWrittenDescriptorPredicateReads(bool memory_condition) {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   Program program;
   program.stage = Libs::Graphics::ShaderType::Compute;
+  program.user_data_count = 1;
   program.srt_plan_complete = true;
   program.resource_tracking_complete = true;
   auto &block = AddValueBlock(program);
@@ -239,7 +456,32 @@ void TestWrittenDescriptorUsesStrictReaderOnce() {
   source.dword_count = 4;
   program.descriptor_sources.push_back(source);
   program.info.buffers.push_back({.source = 0, .written = true});
+  // Only memory-derived host decisions need clean, disjoint descriptor reads.
+  auto &condition = block.AppendNewInst(ValueOpcode::IEqual32,
+      {memory_condition ? Value(&read) : Value(&offset),
+       Value(memory_condition ? 0x8000u : 4u)});
+  auto &store_block = AddValueBlock(program);
+  AddValueBlock(program);
+  program.blocks[0]->condition = Value(&condition);
+  program.blocks[0]->terminator.kind =
+      Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch;
+  program.blocks[0]->terminator.true_block = program.blocks[1];
+  program.blocks[0]->terminator.false_block = program.blocks[2];
+  program.blocks[1]->id = 1;
+  program.blocks[1]->terminator.kind =
+      Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::Return;
+  program.blocks[2]->id = 2;
+  program.blocks[2]->terminator.kind =
+      Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::Return;
+  program.memory_info.push_back({.kind = ResourceKind::Buffer, .resource = 0});
+  auto &output = store_block.AppendNewInst(ValueOpcode::GetBufferResource,
+      {source.dwords[0], source.dwords[1], source.dwords[2], source.dwords[3]});
+  store_block.AppendNewInst(ValueOpcode::StoreBufferU32,
+      {Value(&output), Value(0u), Value(0u), Value(0u), Value(1u), Value(true)})
+      .SetFlags(MemoryFlags{.index = 1});
   auto plan = ExtractResourcePlan(program);
+  Check(plan.capture_specialization_reads == memory_condition && !plan.control_flow.empty(),
+        "conditional writable descriptor used the wrong memory dependency policy");
   struct Reads { uint32_t ordinary = 0; uint32_t strict = 0; bool clean = false; } reads;
   const std::array<uint32_t, 1> user_data{4u};
   const SrtRuntime runtime{
@@ -259,14 +501,21 @@ void TestWrittenDescriptorUsesStrictReaderOnce() {
       }};
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
-  Check(!MaterializeResources(plan, runtime, snapshot, specialization) &&
-            reads.ordinary == 0 && reads.strict == 1,
-        "GPU-dirty dynamic writable descriptor bypassed strict provenance");
-  reads.clean = true;
-  reads.strict = 0;
-  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            reads.ordinary == 0 && reads.strict == 1 && snapshot.buffers[0].dwords[0] == 0x8000u,
-        "writable descriptor was evaluated twice or scalar EXEC suppressed its read");
+  for (const bool clean : {false, true}) {
+    reads = {.clean = clean};
+    // A failed predicate explores both edges and the writable descriptor retries its clean read.
+    const bool expected = !memory_condition || clean;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) == expected &&
+              reads.ordinary == (memory_condition ? 0u : 1u) &&
+              reads.strict == (memory_condition ? (clean ? 1u : 2u) : 0u),
+          "writable descriptor changed reader policy or bypassed a dirty memory predicate");
+    if (!expected) continue;
+    Check(snapshot.buffers[0].dwords[0] == 0x8000u &&
+              snapshot.specialization_reads == (memory_condition
+                  ? std::vector<std::pair<uint64_t, uint64_t>>{{0x1004u, 4u}}
+                  : std::vector<std::pair<uint64_t, uint64_t>>{}),
+          "writable descriptor lost its address or captured an immutable predicate");
+  }
 }
 
 void TestFailedMaterializationRejectsStage() {
@@ -309,7 +558,7 @@ void TestFiniteImageRefreshReusesScalarReads() {
   DescriptorSource root;
   root.dword_count = 8;
   root.dwords.fill(Value(0u));
-  root.indirect_image.emplace(DescriptorSource::IndirectImage{}).sources = {0, 1, 2, 1};
+  root.indirect_descriptor.emplace(DescriptorSource::IndirectDescriptor{}).sources = {0, 1, 2, 1};
   program.descriptor_sources.push_back(root);
   program.info.images.push_back({
       .source = 3,
@@ -373,18 +622,35 @@ void TestFiniteImageRefreshReusesScalarReads() {
         "finite image refresh grew reusable resource storage after warmup");
 }
 
-void TestMixedSamplerDuplicatesTheCorrectSnapshot() {
+void TestMixedSamplerVariantsShareRuntimeDescriptor() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
-  auto plan = MixedSamplerPlan();
+  auto program = MixedSamplerProgram();
+  auto plan = ExtractResourcePlan(program);
+  std::array<uint32_t, 2> user_data{0x11111111u, 0x22222222u};
+  const SrtRuntime runtime{.user_data = user_data};
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
-  Check(MaterializeResources(plan, {}, snapshot, specialization),
+  Check(MaterializeResources(plan, runtime, snapshot, specialization),
         "mixed sampler materialization failed");
-  Check(snapshot.samplers.size() == 3,
-        "mixed sampler materialization appended unrelated samplers");
-  Check(snapshot.samplers[2] == snapshot.samplers[1] &&
-            snapshot.samplers[2] != snapshot.samplers[0],
-        "point sampler variant duplicated the wrong runtime descriptor");
+  ApplyResourceSpecialization(program, specialization);
+  const auto &samplers = program.info.samplers;
+  Check(snapshot.samplers.size() == 2 && samplers.size() == 3 &&
+            samplers[0].snapshot_index == 0 && samplers[1].snapshot_index == 1 &&
+            samplers[2].snapshot_index == 1 &&
+            samplers[0].source == plan.info.samplers[0].source &&
+            samplers[1].source == plan.info.samplers[1].source &&
+            samplers[2].source == samplers[1].source &&
+            !samplers[1].force_point_filtering && samplers[2].force_point_filtering &&
+            program.info.sampled_pairs[2].sampler == 2,
+        "native sampler variants lost their source identity or binding order");
+  const auto capacity = snapshot.samplers.capacity();
+  user_data[1] = 0x33333333u;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.samplers.size() == 2 && snapshot.samplers.capacity() == capacity &&
+            snapshot.samplers[samplers[0].snapshot_index].dwords[0] == user_data[0] &&
+            snapshot.samplers[samplers[1].snapshot_index].dwords[0] == user_data[1] &&
+            snapshot.samplers[samplers[2].snapshot_index].dwords[0] == user_data[1],
+        "sampler variants retained stale or duplicated descriptors after refresh");
 }
 
 } // namespace
@@ -406,11 +672,15 @@ void DbgExit(int) { std::abort(); }
 int main() {
   TestMappedSrtUsesDirectReaderByDefault();
   TestIntegerRuntimeValueFollowsSrtReads();
+  TestSrtAliasesRetainReadPolicy();
+  TestUniformVectorDescriptorRead();
+  TestExactReciprocalDescriptorArithmetic();
   TestUnbasedFlatCacheHitMaterializes();
-  TestWrittenDescriptorUsesStrictReaderOnce();
+  for (const bool memory_condition : {false, true})
+    TestWrittenDescriptorPredicateReads(memory_condition);
   TestFailedMaterializationRejectsStage();
   TestFiniteImageRefreshReusesScalarReads();
-  TestMixedSamplerDuplicatesTheCorrectSnapshot();
+  TestMixedSamplerVariantsShareRuntimeDescriptor();
   std::puts("ResourceMaterializationTests: all cases passed");
   return 0;
 }

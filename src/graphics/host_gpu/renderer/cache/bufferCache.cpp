@@ -34,9 +34,36 @@ void BufferCache::WriteDataBuffer(Buffer& buffer, uint64_t address, const void* 
 	auto* bytes = static_cast<const uint8_t*>(source);
 	while (size != 0) {
 		const auto chunk  = std::min(size, m_staging_buffer.Size());
+		// Copy waits for ring reuse and flushes the fresh host data before submission.
 		const auto offset = m_staging_buffer.Copy(bytes, chunk, 4);
-		buffer.CopyFrom(m_scheduler.Current(), m_staging_buffer, offset, buffer.Offset(address),
-		                chunk, vk::AccessFlagBits::eHostWrite);
+		const auto destination_offset = buffer.Offset(address);
+		EXIT_IF(destination_offset > buffer.Size() || chunk > buffer.Size() - destination_offset);
+		m_scheduler.EndRendering();
+		const auto command = m_scheduler.Current().Handle();
+		vk::BufferMemoryBarrier2 before {};
+		before.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+		before.srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+		before.dstStageMask  = vk::PipelineStageFlagBits2::eTransfer;
+		before.dstAccessMask = vk::AccessFlagBits2::eTransferWrite;
+		before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		before.buffer        = buffer.Handle();
+		before.offset        = destination_offset;
+		before.size          = chunk;
+		vk::DependencyInfo dependency {};
+		dependency.dependencyFlags          = vk::DependencyFlagBits::eByRegion;
+		dependency.bufferMemoryBarrierCount = 1;
+		dependency.pBufferMemoryBarriers    = &before;
+		command.pipelineBarrier2(dependency);
+		const vk::BufferCopy copy {offset, destination_offset, chunk};
+		command.copyBuffer(m_staging_buffer.Handle(), buffer.Handle(), 1, &copy);
+		auto after          = before;
+		after.srcStageMask  = vk::PipelineStageFlagBits2::eTransfer;
+		after.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+		after.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+		after.dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+		dependency.pBufferMemoryBarriers = &after;
+		command.pipelineBarrier2(dependency);
 		bytes += chunk;
 		address += chunk;
 		size -= chunk;
@@ -258,15 +285,8 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		}
 		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
 
-		// Widen nearby CPU reads so they share one GPU drain.
-		constexpr uint64_t WindowSize   = 512 * 1024;
-		const auto         buffer_begin = buffer.CpuAddress();
-		const auto         buffer_end   = buffer_begin + buffer.Size();
-		const auto window_begin = std::max(Common::AlignDown(vaddr, WindowSize), buffer_begin);
-		const auto window_end = std::min(std::max(window_begin + WindowSize, vaddr + size), buffer_end);
-
-		if (DownloadBufferMemory<false>(buffer, window_begin, window_end - window_begin)) {
-			m_memory_tracker.UnmarkRegionAsGpuModified(window_begin, window_end - window_begin);
+		if (DownloadBufferMemory<false>(buffer, vaddr, size)) {
+			m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
 		}
 		if (is_write) {
 			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);

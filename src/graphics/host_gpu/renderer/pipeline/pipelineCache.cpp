@@ -39,6 +39,16 @@ namespace Libs::Graphics {
 
 namespace {
 
+uint8_t RemapSourceAlphaFactor(uint8_t factor) {
+	switch (static_cast<Prospero::BlendFactor>(factor)) {
+		case Prospero::BlendFactor::kSrcAlpha:
+			return static_cast<uint8_t>(Prospero::BlendFactor::kSrc1Alpha);
+		case Prospero::BlendFactor::kOneMinusSrcAlpha:
+			return static_cast<uint8_t>(Prospero::BlendFactor::kOneMinusSrc1Alpha);
+		default: return factor;
+	}
+}
+
 vk::PolygonMode ResolvePolygonMode(const HW::ModeControl& mode, bool cull_front, bool cull_back) {
 	// CxPrimitiveSetup::PolygonMode disables both per-face modes when it is zero.
 	if (mode.poly_mode == 0) {
@@ -94,8 +104,10 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 }
 
 bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) {
+	// Scalar and unformatted buffer dependencies use the same backing as native raw loads.
+	// Image synchronization belongs to formatted buffer bindings, not these reads.
 	return !values.empty() &&
-	       Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, values.data(), values.size_bytes());
+	       Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(), values.size_bytes());
 }
 
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
@@ -205,17 +217,53 @@ struct PipelineCache::ProgramCache {
 	};
 
 	struct Permutation {
+		std::vector<uint32_t>                       function_code;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		ShaderRecompiler::IR::CompiledShaderInfo     program;
 		ShaderProgram                                handle;
 	};
 
 	struct SourceEntry {
-		explicit SourceEntry(ShaderRecompiler::IR::ResourcePlan plan)
-		    : resource_plan(std::move(plan)) {
+		SourceEntry(ShaderRecompiler::IR::ResourcePlan plan,
+		            std::unique_ptr<ShaderRecompiler::ShaderSource> call_source)
+		    : call_source(std::move(call_source)), resource_plan(std::move(plan)) {
 			permutations.reserve(8);
 		}
 
+		std::span<const uint32_t> FunctionCode() const {
+			return call_source
+			    ? std::span<const uint32_t>(call_source->linked->code).subspan(call_source->code.size())
+			    : std::span<const uint32_t>{};
+		}
+
+		bool RefreshCallSource(const ShaderRecompiler::IR::SrtRuntime& runtime) {
+			const auto revision = call_source->revision;
+			ShaderRecompiler::RefreshShaderSource(*call_source, runtime);
+			resource_plan.source_reads = call_source->reads;
+			return revision != call_source->revision;
+		}
+
+		template <bool HasCalls>
+		Permutation* FindPermutation(const ShaderRecompiler::IR::SrtRuntime& runtime,
+		                             uint32_t push_data_cursor) {
+			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
+			    resource_plan, runtime, resources, specialization));
+			for (auto& candidate: permutations) {
+				const auto& layout = candidate.program.bindings;
+				if (layout.push_data_start_dword != ShaderRecompiler::IR::PushData::StartFor(
+				        push_data_cursor, layout.ShaderDataDwords()) ||
+				    candidate.specialization != specialization) {
+					continue;
+				}
+				if constexpr (HasCalls) {
+					if (!std::ranges::equal(candidate.function_code, FunctionCode())) continue;
+				}
+				return &candidate;
+			}
+			return nullptr;
+		}
+
+		std::unique_ptr<ShaderRecompiler::ShaderSource> call_source;
 		ShaderRecompiler::IR::ResourcePlan           resource_plan;
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
@@ -244,7 +292,8 @@ struct PipelineCache::ProgramCache {
 	                               const ShaderRecompiler::CompileOptions&      options,
 	                               ShaderRecompiler::TranslateResult            translated,
 	                               ShaderRecompiler::IR::ResourceSpecialization specialization,
-	                               uint32_t push_data_start_dword) {
+	                               uint32_t push_data_start_dword,
+	                               std::span<const uint32_t> function_code) {
 		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
 		                                               specialization, push_data_start_dword);
 		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv)) {
@@ -261,6 +310,7 @@ struct PipelineCache::ProgramCache {
 			     static_cast<uint64_t>(result.spirv.size()), options.wave_size);
 		}
 		return {
+		    .function_code  = {function_code.begin(), function_code.end()},
 		    .specialization = std::move(specialization),
 		    .program        = std::move(result.program).TakeCompiledInfo(),
 		    .handle         = {.id = ++next_shader_id, .module = module},
@@ -287,26 +337,26 @@ struct PipelineCache::ProgramCache {
 		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
 		BuildStageStaticKey(input_info, lookup_key.static_state);
 		auto                                         entry = programs.find(lookup_key);
-		const ShaderRecompiler::IR::SrtRuntime       runtime {
+		ShaderRecompiler::IR::SrtRuntime             runtime {
 		    .user_data                  = user_data,
 		    .shader_base                = params.Base(),
 		    .read_specialization_memory = ReadShaderGuestMemory,
 		};
+		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+			runtime.workgroup_counts = input_info.workgroup_counts;
+		}
+		bool source_changed = false;
 		if (entry != programs.end()) {
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-			    entry->second.resource_plan, runtime, entry->second.resources,
-			    entry->second.specialization));
-			if (const auto permutation = std::ranges::find_if(
-			        entry->second.permutations, [&](const Permutation& candidate) {
-				        const auto& layout = candidate.program.bindings;
-				        return layout.push_data_start_dword ==
-				                   ShaderRecompiler::IR::PushData::StartFor(
-				                       push_data_cursor, layout.ShaderDataDwords()) &&
-				               candidate.specialization == entry->second.specialization;
-			        });
-			    permutation != entry->second.permutations.end()) {
-				input_info.stage = {.program   = &permutation->program,
-				                    .resources = &entry->second.resources};
+			auto& cached = entry->second;
+			Permutation* permutation = nullptr;
+			if (cached.call_source) {
+				source_changed = cached.RefreshCallSource(runtime);
+				if (!source_changed) permutation = cached.FindPermutation<true>(runtime, push_data_cursor);
+			} else {
+				permutation = cached.FindPermutation<false>(runtime, push_data_cursor);
+			}
+			if (permutation != nullptr) {
+				input_info.stage = {.program = &permutation->program, .resources = &entry->second.resources};
 				permutation->program.bindings.AdvancePushData(push_data_cursor);
 				return permutation->handle;
 			}
@@ -353,16 +403,39 @@ struct PipelineCache::ProgramCache {
 			options.wave_size = input_info.wave_size;
 		}
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code);
-		auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
+		ShaderRecompiler::ShaderSource source;
+		if (entry == programs.end()) source = ShaderRecompiler::PrepareShaderSource(params.code, options);
+		auto* current = entry == programs.end() ? &source : entry->second.call_source.get();
+		ShaderRecompiler::TranslateResult translated;
+		if (current != nullptr) {
+			if (current->call) {
+				if (entry == programs.end()) ShaderRecompiler::RefreshShaderSource(*current, runtime);
+				translated = ShaderRecompiler::TranslateProgram(current->linked->decoded, options);
+				translated.program.source_reads = current->reads;
+			} else {
+				translated = ShaderRecompiler::TranslateProgram(current->decoded, options);
+			}
+		} else {
+			translated = ShaderRecompiler::TranslateProgram(params.code, options);
+		}
 		if (entry == programs.end()) {
+			auto retained = source.call ? std::make_unique<ShaderRecompiler::ShaderSource>(std::move(source)) : nullptr;
 			entry = programs.try_emplace(lookup_key,
-			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program)).first;
+			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program), std::move(retained)).first;
 			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
 			    entry->second.resource_plan, runtime, entry->second.resources,
 			    entry->second.specialization));
+		} else if (source_changed) {
+			entry->second.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+			if (const auto* permutation = entry->second.FindPermutation<true>(runtime, push_data_cursor)) {
+				input_info.stage = {.program = &permutation->program, .resources = &entry->second.resources};
+				permutation->program.bindings.AdvancePushData(push_data_cursor);
+				return permutation->handle;
+			}
 		}
 		entry->second.permutations.push_back(CompilePermutation(
-		    stage_name, options, std::move(translated), entry->second.specialization, push_data_cursor));
+		    stage_name, options, std::move(translated), entry->second.specialization, push_data_cursor,
+		    entry->second.FunctionCode()));
 		const auto& permutation = entry->second.permutations.back();
 		input_info.stage = {.program = &permutation.program, .resources = &entry->second.resources};
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
@@ -602,6 +675,13 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	ShaderParams pixel_params;
 	if (pixel_active) {
 		pixel_params      = PrepareProgram(pixel_regs, sh, target_export_mapping, pixel_info);
+		if (!mesh_active && !tess_active && Prospero::IsRectList(user_config.GetPrimType())) {
+			pixel_info.parameter_mode = ShaderPixelParameterMode::Rectangle;
+		} else if (context.GetModeControl().provoking_vtx_last) {
+			pixel_info.parameter_mode = ShaderPixelParameterMode::LastVertex;
+		} else {
+			pixel_info.parameter_mode = ShaderPixelParameterMode::FirstVertex;
+		}
 		const auto& blend = context.GetBlendControl(0);
 		pixel_info.dual_source_blending =
 		    blend.enable && !context.GetRenderTarget(0).info.blend_bypass &&
@@ -617,14 +697,24 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		           pixel_info.target_output_mode[0] != 0 && pixel_info.target_output_mode[0] != 7 &&
 		           std::all_of(std::begin(pixel_info.target_output_mode) + 1,
 		                       std::end(pixel_info.target_output_mode),
-		                       [](uint8_t mode) { return mode == 0; }) &&
-		           ClassifyBlendMapping(blend, pixel_info.target_export_mapping[0]) ==
-		               BlendMappingSupport::SourceAlpha) {
-			// Preserve logical alpha when the export mapping moves it.
-			pixel_info.alpha_blend_source_remap = true;
-			pixel_info.dual_source_blending     = true;
-			pixel_info.target_output_mode[1]    = pixel_info.target_output_mode[0];
-			pixel_info.target_export_mapping[1] = {};
+		                       [](uint8_t mode) { return mode == 0; })) {
+			switch (ClassifyBlendMapping(blend, pixel_info.target_export_mapping[0])) {
+				case BlendMappingSupport::SourceAlpha:
+					pixel_info.alpha_blend_source = ShaderAlphaBlendSource::SourceAlpha;
+					break;
+				case BlendMappingSupport::SourceAlphaOne:
+					pixel_info.alpha_blend_source = ShaderAlphaBlendSource::SourceAlphaOne;
+					break;
+				case BlendMappingSupport::SourceAlphaZero:
+					pixel_info.alpha_blend_source = ShaderAlphaBlendSource::SourceAlphaZero;
+					break;
+				default: break;
+			}
+			if (pixel_info.alpha_blend_source != ShaderAlphaBlendSource::None) {
+				pixel_info.dual_source_blending     = true;
+				pixel_info.target_output_mode[1]    = pixel_info.target_output_mode[0];
+				pixel_info.target_export_mapping[1] = {};
+			}
 		}
 	}
 	if (context.GetClipControl().clip_disable) {
@@ -658,19 +748,8 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
                                                ShaderComputeInputInfo&      input_info) {
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
 	const auto        params      = PrepareProgram(regs, sh, input_info);
-	// Use one effective size for the cache key, LDS declaration, and access bounds.
-	const auto max_lds_dwords =
-	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize / 4u;
-	if (input_info.lds_size_dwords > max_lds_dwords) {
-		static std::atomic_bool warned = false;
-		if (!warned.exchange(true, std::memory_order_relaxed)) {
-			PipelineCacheLog("GPU warning: game compute shader requests {} bytes of LDS, but "
-			                 "the Vulkan device limit is {} bytes. Clamping LDS; rendering may "
-			                 "be incorrect.",
-			                 input_info.lds_size_dwords * 4u, max_lds_dwords * 4u);
-		}
-	}
-	input_info.lds_size_dwords = std::min(input_info.lds_size_dwords, max_lds_dwords);
+	input_info.lds_storage = input_info.lds_size_dwords * 4u >
+	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
 	uint32_t          push_data_cursor = 0;
 	return m_program_cache->Get(params, input_info, push_data_cursor);
 }
@@ -727,10 +806,12 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 		}
 		const auto& rt                        = ctx.GetRenderTarget(colors[i].target_slot);
 		const auto& bc                        = ctx.GetBlendControl(colors[i].target_slot);
-		const bool alpha_remap =
-		    slot == 0 && ps_input_info != nullptr && ps_input_info->alpha_blend_source_remap;
+		auto alpha_source = ShaderAlphaBlendSource::None;
+		if (slot == 0 && ps_input_info != nullptr) {
+			alpha_source = ps_input_info->alpha_blend_source;
+		}
 		static_params.blend_enable[slot] = bc.enable && !rt.info.blend_bypass;
-		if (static_params.blend_enable[slot] && !alpha_remap &&
+		if (static_params.blend_enable[slot] && alpha_source == ShaderAlphaBlendSource::None &&
 		    ClassifyBlendMapping(bc, colors[i].export_mapping) != BlendMappingSupport::Direct) {
 			static_params.blend_enable[slot] = false;
 			static std::atomic_bool warned = false;
@@ -742,18 +823,32 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 				    bc.alpha_srcblend, bc.alpha_destblend, bc.separate_alpha_blend ? 1 : 0));
 			}
 		}
-		if (alpha_remap) {
-			static_params.blend_alpha_source_remap = true;
-		}
 		if (static_params.blend_enable[slot]) {
-			static_params.color_srcblend[slot]       = bc.color_srcblend;
-			static_params.color_comb_fcn[slot]       = bc.color_comb_fcn;
-			static_params.color_destblend[slot]      = bc.color_destblend;
-			static_params.separate_alpha_blend[slot] = bc.separate_alpha_blend;
-			if (bc.separate_alpha_blend) {
-				static_params.alpha_srcblend[slot]  = bc.alpha_srcblend;
-				static_params.alpha_comb_fcn[slot]  = bc.alpha_comb_fcn;
-				static_params.alpha_destblend[slot] = bc.alpha_destblend;
+			auto blend = bc;
+			switch (alpha_source) {
+				case ShaderAlphaBlendSource::SourceAlpha:
+					blend.color_srcblend  = RemapSourceAlphaFactor(blend.color_srcblend);
+					blend.color_destblend = RemapSourceAlphaFactor(blend.color_destblend);
+					blend.separate_alpha_blend = false;
+					break;
+				case ShaderAlphaBlendSource::SourceAlphaOne:
+				case ShaderAlphaBlendSource::SourceAlphaZero:
+					// The second source carries the mapped source factor; its alpha stays logical Sa.
+					blend.color_srcblend = static_cast<uint8_t>(Prospero::BlendFactor::kSrc1Color);
+					blend.color_destblend =
+					    static_cast<uint8_t>(Prospero::BlendFactor::kOneMinusSrc1Alpha);
+					blend.separate_alpha_blend = false;
+					break;
+				case ShaderAlphaBlendSource::None: break;
+			}
+			static_params.color_srcblend[slot]       = blend.color_srcblend;
+			static_params.color_comb_fcn[slot]       = blend.color_comb_fcn;
+			static_params.color_destblend[slot]      = blend.color_destblend;
+			static_params.separate_alpha_blend[slot] = blend.separate_alpha_blend;
+			if (blend.separate_alpha_blend) {
+				static_params.alpha_srcblend[slot]  = blend.alpha_srcblend;
+				static_params.alpha_comb_fcn[slot]  = blend.alpha_comb_fcn;
+				static_params.alpha_destblend[slot] = blend.alpha_destblend;
 			}
 		}
 	}
@@ -801,9 +896,6 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	if (static_params.sample_shading_enable && !m_graphics.sample_rate_shading_enabled) {
 		EXIT("Pipeline: sample-rate shading is required but unsupported by the host\n");
 	}
-	static_params.depth_bounds_test_enable = depth.depth_bounds_test_enable;
-	static_params.depth_min_bounds         = depth.depth_min_bounds;
-	static_params.depth_max_bounds         = depth.depth_max_bounds;
 	const bool rect_list = Prospero::IsRectList(command.GetUserConfig().GetPrimType());
 	static_params.cull_back  = !rect_list && mc.cull_back;
 	static_params.cull_front = !rect_list && mc.cull_front;
