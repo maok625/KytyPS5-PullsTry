@@ -3362,6 +3362,18 @@ int KYTY_SYSV_ABI KernelQueryMemoryProtection(void* addr, void** start, void** e
 
 static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size) {
 
+	constexpr uint64_t kGtaVFailedMapStart = 0x1559c00000ull;
+	constexpr uint64_t kGtaVFailedMapSize  = 0x10000ull;
+	const bool trace_gta_map = start < kGtaVFailedMapStart + kGtaVFailedMapSize &&
+	                           kGtaVFailedMapStart < start + size;
+	if (trace_gta_map) {
+		LogMemoryFailureToStderr(
+		    "[ReplaceFixedRangeWithReserved] request addr=0x%016" PRIx64
+		    " size=0x%016" PRIx64 "\n",
+		    start, size);
+	}
+
+
 	struct ReplacedChunk {
 		VirtualRanges::Range                        range {};
 		VirtualMemory::Mode                         mode     = VirtualMemory::Mode::NoAccess;
@@ -3378,6 +3390,12 @@ static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size) {
 	while (current < end) {
 		VirtualRanges::Range range {};
 		if (!g_virtual_ranges->Query(current, 1, &range)) {
+			if (trace_gta_map) {
+				LogMemoryFailureToStderr(
+				    "[ReplaceFixedRangeWithReserved] range query ended at 0x%016" PRIx64
+				    " before requested end 0x%016" PRIx64 "; chunks=%zu\n",
+				    current, end, chunks.size());
+			}
 			break;
 		}
 		if (range.start >= end) {
@@ -3399,12 +3417,28 @@ static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size) {
 			replaced.range.offset += current - range.start;
 		}
 		DecodeMemoryProtection(replaced.range.protection, &replaced.mode, &replaced.gpu_mode);
+		if (trace_gta_map) {
+			LogMemoryFailureToStderr(
+			    "[ReplaceFixedRangeWithReserved] overlap addr=0x%016" PRIx64
+			    " size=0x%016" PRIx64 " type=%s offset=0x%016" PRIx64 "\n",
+			    current, chunk, magic_enum::enum_name(range.type), replaced.range.offset);
+		}
 		if (range.type == VirtualRangeType::Direct &&
 		    !g_guest_address_space->BackingContains(current, chunk)) {
+			if (trace_gta_map) {
+				LogMemoryFailureToStderr(
+				    "[ReplaceFixedRangeWithReserved] failed: direct range is not backed at "
+				    "0x%016" PRIx64 " size=0x%016" PRIx64 "\n", current, chunk);
+			}
 			return false;
 		}
 		if (range.type == VirtualRangeType::Flexible &&
 		    !g_flexible_memory->Snapshot(current, chunk, &replaced.flexible_blocks)) {
+			if (trace_gta_map) {
+				LogMemoryFailureToStderr(
+				    "[ReplaceFixedRangeWithReserved] failed: flexible snapshot at "
+				    "0x%016" PRIx64 " size=0x%016" PRIx64 "\n", current, chunk);
+			}
 			return false;
 		}
 		if (range.type == VirtualRangeType::Pooled) {
@@ -3513,6 +3547,12 @@ static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size) {
 	}
 
 	if (!g_guest_address_space->ReserveFixed(start, size)) {
+		if (trace_gta_map) {
+			LogMemoryFailureToStderr(
+			    "[ReplaceFixedRangeWithReserved] ReserveFixed failed addr=0x%016" PRIx64
+			    " size=0x%016" PRIx64 " chunks=%zu\n",
+			    start, size, chunks.size());
+		}
 		if (!restore_chunks()) {
 			EXIT("reserve-fixed host-reservation rollback failed\n");
 		}
@@ -3530,6 +3570,11 @@ static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size) {
 		    g_virtual_ranges->Add(start, size, 0, 0, 0, VirtualRangeType::Reserved, "anon");
 	}
 	if (!range_added) {
+		if (trace_gta_map) {
+			LogMemoryFailureToStderr(
+			    "[ReplaceFixedRangeWithReserved] virtual range registration failed at "
+			    "0x%016" PRIx64 " size=0x%016" PRIx64 "\n", start, size);
+		}
 		LOGF_COLOR(Log::Color::Red,
 		           "\t reserve-fixed replace: range add failed at 0x%016" PRIx64
 		           ", size=0x%016" PRIx64 "\n",
