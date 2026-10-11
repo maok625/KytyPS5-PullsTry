@@ -107,8 +107,10 @@ struct KernelMemoryPoolBlockStats {
 static_assert(sizeof(KernelMemoryPoolBlockStats) == 16,
               "KernelMemoryPoolBlockStats struct size is incorrect");
 
-void                   RegisterCallbacks(callback_func_t alloc_func, callback_func_t free_func);
-void                   SetFlexibleMemorySize(uint64_t size);
+void RegisterCallbacks(callback_func_t alloc_func, callback_func_t free_func);
+void SetFlexibleMemorySize(uint64_t size);
+// Host system allocations at the end of direct memory are excluded from the guest budget.
+void SetSystemDirectMemoryReserve(uint64_t size);
 int AllocateDirectMemory(int64_t search_start, int64_t search_end, size_t size, size_t alignment,
                          int memory_type, int64_t* phys_addr_out, bool automatic = false);
 int MapAutomaticMemory(uint64_t vaddr, size_t size, int type, int prot);
