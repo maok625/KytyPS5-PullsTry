@@ -3420,8 +3420,8 @@ static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size) {
 		if (trace_gta_map) {
 			LogMemoryFailureToStderr(
 			    "[ReplaceFixedRangeWithReserved] overlap addr=0x%016" PRIx64
-			    " size=0x%016" PRIx64 " type=%s offset=0x%016" PRIx64 "\n",
-			    current, chunk, magic_enum::enum_name(range.type), replaced.range.offset);
+			    " size=0x%016" PRIx64 " type=%u offset=0x%016" PRIx64 "\n",
+			    current, chunk, static_cast<unsigned int>(range.type), replaced.range.offset);
 		}
 		if (range.type == VirtualRangeType::Direct &&
 		    !g_guest_address_space->BackingContains(current, chunk)) {
