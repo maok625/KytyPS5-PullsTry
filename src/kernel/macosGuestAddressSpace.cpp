@@ -3,7 +3,7 @@
 // Make the process own the guest ranges before any runtime initialization.
 asm(".zerofill SYSTEM_MANAGED,SYSTEM_MANAGED,__kyty_system_managed,0x7fffbc000");
 // Extend SYSTEM_RESERVED to USER_AREA so fixed guest mappings in the intervening range are owned.
-asm(".zerofill SYSTEM_RESERVED,SYSTEM_RESERVED,__kyty_system_reserved,0x6800040000");
+asm(".zerofill SYSTEM_RESERVED,SYSTEM_RESERVED,__kyty_system_reserved,0x6800004000");
 asm(".zerofill USER_AREA,USER_AREA,__kyty_user_area,0x8c00000000");
 
 #endif
