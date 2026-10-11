@@ -835,6 +835,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 							}
 						}
 					}
+				}
 			}
 		}
 
