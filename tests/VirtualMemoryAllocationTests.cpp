@@ -2576,18 +2576,19 @@ void TestAppleRosettaGpuCarveoutDirectMapRedirect() {
 	}
 
 	constexpr uint64_t blocked_address = 0x1559c00000ull;
-	constexpr uint64_t size            = SceKernelPageSize;
-	int64_t            physical         = -1;
+	constexpr uint64_t size            = 0x10000ull;
+	constexpr uint64_t alignment       = 0x10000ull;
+	int64_t            physical        = -1;
 	CheckOk(test,
 	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
-	            0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), size, SceKernelPageSize,
+	            0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), size, alignment,
 	            SceKernelMtypeC, &physical),
 	        "KernelAllocateDirectMemory");
 
 	void* no_overwrite = reinterpret_cast<void*>(blocked_address);
 	const int no_overwrite_result = Libs::LibKernel::Memory::KernelMapDirectMemory(
 	    &no_overwrite, size, SceKernelProtCpuRw,
-	    SceKernelMapFixed | SceKernelMapNoOverwrite, physical, SceKernelPageSize);
+	    SceKernelMapFixed | SceKernelMapNoOverwrite, physical, alignment);
 	Check(test, no_overwrite_result == Libs::LibKernel::KERNEL_ERROR_ENOMEM,
 	      "MAP_FIXED|NO_OVERWRITE unexpectedly relocated an unavailable address");
 	Check(test, reinterpret_cast<uint64_t>(no_overwrite) == blocked_address,
@@ -2604,7 +2605,7 @@ void TestAppleRosettaGpuCarveoutDirectMapRedirect() {
 	Check(test, actual_address >= 0x7000000000ull,
 	      "relocated mapping did not land beyond the Rosetta GPU carve-out");
 
-	constexpr uint64_t sentinel = 0x4b595459524f5341ull; // "KYT YROSA"
+	constexpr uint64_t sentinel = 0x4b595459524f5341ull; // "KYTYROSA"
 	*reinterpret_cast<uint64_t*>(mapped) = sentinel;
 	uint64_t value = 0;
 	Check(test,
