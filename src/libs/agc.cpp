@@ -1,5 +1,6 @@
 #include "libs/agc.h"
 
+#include "common/alignment.h"
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
@@ -4159,9 +4160,15 @@ int Initialize() {
 	if (g_driver_dmem.physical_offset >= 0) {
 		return OK;
 	}
-	int64_t physical_offset = -1;
-	auto result = LibKernel::Memory::KernelAllocateDirectMemory(
-	    0, LibKernel::Memory::KernelGetDirectMemorySize(), DriverDmemSize, DriverDmemSize,
+	int64_t    physical_offset = -1;
+	const auto reported_end    = LibKernel::Memory::KernelGetDirectMemorySize();
+	const auto end             = Common::AlignDown(reported_end, DriverDmemSize);
+	if (end < DriverDmemSize) {
+		return LibKernel::KERNEL_ERROR_EAGAIN;
+	}
+	const auto start  = end - DriverDmemSize;
+	auto       result = LibKernel::Memory::KernelAllocateDirectMemory(
+	    static_cast<int64_t>(start), static_cast<int64_t>(end), DriverDmemSize, DriverDmemSize,
 	    12, &physical_offset);
 	if (result != OK) {
 		return result;
@@ -4201,6 +4208,10 @@ int Initialize() {
 	std::memcpy(reinterpret_cast<void*>(code_address), validator.data(), sizeof(validator));
 	std::memcpy(reinterpret_cast<void*>(base), descriptor.data(), sizeof(descriptor));
 	g_driver_dmem.physical_offset = physical_offset;
+
+	// Reserve the driver allocation and any alignment tail from the guest-visible
+	// direct-memory budget, so the guest cannot claim memory that the driver needs.
+	LibKernel::Memory::SetSystemDirectMemoryReserve(reported_end - start);
 	return OK;
 }
 
@@ -4210,6 +4221,7 @@ static void ReleaseDmem() {
 		EXIT_IF(LibKernel::Memory::KernelCheckedReleaseDirectMemory(
 		            g_driver_dmem.physical_offset, DriverDmemSize) != OK);
 		g_driver_dmem.physical_offset = -1;
+		LibKernel::Memory::SetSystemDirectMemoryReserve(0);
 	}
 }
 
