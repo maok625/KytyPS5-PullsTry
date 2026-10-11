@@ -4,13 +4,10 @@
 static constexpr uint64_t HOST_SYSTEM_MANAGED_MIN  = 0x0000040000ull;
 static constexpr uint64_t HOST_SYSTEM_MANAGED_MAX  = 0x07ffffbfffull;
 #if defined(__APPLE__) && (defined(__x86_64__) || defined(_M_X64))
-// Keep the low guest reservation contiguous with USER_AREA on macOS. GTA V can request
-// fixed guest mappings in this interval; leaving it unowned makes ReserveFixed reject them
-// before the host mapping is attempted.
-static constexpr uint64_t HOST_SYSTEM_RESERVED_MAX = 0x6fffffffffull;
+// Keep SYSTEM_RESERVED at the size that macOS can load reliably. The gap up to USER_AREA
+// is claimed safely at runtime by GuestAddressSpace::ReserveGuestRegions().
+static constexpr uint64_t HOST_SYSTEM_RESERVED_MAX = 0x0fbfffffffull;
 static constexpr uint64_t HOST_USER_MIN            = 0x7000000000ull;
-static_assert(HOST_SYSTEM_RESERVED_MAX + 1u == HOST_USER_MIN,
-              "macOS guest reservation regions must be contiguous");
 #else
 static constexpr uint64_t HOST_SYSTEM_RESERVED_MAX = 0x0fffffffffull;
 static constexpr uint64_t HOST_USER_MIN            = 0x1000000000ull;
@@ -1280,6 +1277,31 @@ private:
 			m_owned.emplace_back(start, end - start);
 		}
 #endif
+#endif
+
+#if defined(__APPLE__) && defined(__x86_64__)
+		// Do not encode the entire >400-GiB gap as a Mach-O zero-fill segment. On macOS/Rosetta,
+		// that oversized segment can make otherwise valid x86_64 test executables fail to launch
+		// with posix_spawn EIO. Claim the gap after process start using a non-fixed mmap hint, so
+		// this code never replaces a host mapping it does not own.
+		const auto gap_start = HOST_SYSTEM_RESERVED_MAX + 1u;
+		const auto gap_end   = HOST_USER_MIN;
+		if (gap_end > gap_start) {
+			const auto gap_size = gap_end - gap_start;
+			void*      ptr      = mmap(reinterpret_cast<void*>(gap_start), gap_size, PROT_NONE,
+			                           MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
+			if (ptr == MAP_FAILED || reinterpret_cast<uint64_t>(ptr) != gap_start) {
+				const int error = errno;
+				if (ptr != MAP_FAILED) {
+					munmap(ptr, gap_size);
+				}
+				EXIT("failed to reserve macOS guest address gap at 0x%016" PRIx64
+				     ", size 0x%016" PRIx64 ", mmap returned %p, errno=%d\\n",
+				     gap_start, gap_size, ptr, error);
+			}
+			AddFreeUnlocked(gap_start, gap_size);
+			m_owned.emplace_back(gap_start, gap_size);
+		}
 #endif
 	}
 
