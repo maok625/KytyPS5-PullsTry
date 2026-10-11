@@ -1360,7 +1360,7 @@ private:
 					(void)mach_port_deallocate(task, object_name);
 				}
 
-				if (region_result == KERN_INVALID_ADDRESS) {
+				if (region_result == KERN_INVALID_ADDRESS || region_result == KERN_NO_SPACE) {
 					break;
 				}
 				if (region_result != KERN_SUCCESS || region_size == 0 ||
