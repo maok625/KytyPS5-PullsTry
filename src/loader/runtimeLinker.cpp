@@ -119,6 +119,41 @@ struct StubbedImportRecord {
 };
 
 static std::vector<StubbedImportRecord> g_stubbed_imports;
+
+// Capture PLT relocations in a fixed table, so the fatal/signal handler can identify a
+// RIP-relative GOT slot without taking RuntimeLinker locks or allocating memory.
+struct PltImportDiagnosticRecord {
+	std::atomic_bool ready {false};
+	uint64_t         got_slot       = 0;
+	uint64_t         resolved_value = 0;
+	uint32_t         index          = 0;
+	std::string      name;
+	std::string      dbg_name;
+	std::string      program;
+};
+
+static constexpr size_t PLT_IMPORT_DIAGNOSTIC_CAPACITY = 16384;
+static std::array<PltImportDiagnosticRecord, PLT_IMPORT_DIAGNOSTIC_CAPACITY>
+    g_plt_import_diagnostic_records {};
+static std::atomic_size_t g_plt_import_diagnostic_count {0};
+
+static void RecordPltImportDiagnostic(uint32_t index, const RelocationInfo& ri, uint64_t value,
+                                      const Program* program) {
+	const auto record_index =
+	    g_plt_import_diagnostic_count.fetch_add(1, std::memory_order_relaxed);
+	if (record_index >= g_plt_import_diagnostic_records.size()) {
+		return;
+	}
+	auto& record          = g_plt_import_diagnostic_records[record_index];
+	record.got_slot       = ri.vaddr;
+	record.resolved_value = value;
+	record.index          = index;
+	record.name           = ri.name;
+	record.dbg_name       = ri.dbg_name;
+	record.program        = Common::PathToString(program->file_name);
+	record.ready.store(true, std::memory_order_release);
+}
+
 static std::atomic_uint32_t             g_unresolved_stub_call_log_count {0};
 static std::vector<uint64_t>            g_unresolved_stub_thunk_pages;
 static uint64_t                         g_unresolved_stub_thunk_offset = 0;
@@ -764,8 +799,42 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 							            target_bytes[i]);
 						}
 						std::printf("\n");
+
+						// x86-64 PLT entries commonly start with jmp [RIP+disp32]. Resolve that
+						// indirect slot to the relocation/import recorded during program setup.
+						if (target_bytes[0] == 0xff && target_bytes[1] == 0x25) {
+							int32_t got_displacement = 0;
+							std::memcpy(&got_displacement, target_bytes + 2, sizeof(got_displacement));
+							const auto got_slot_signed =
+							    static_cast<int64_t>(call_target) + 6 + got_displacement;
+							if (got_slot_signed > 0) {
+								const auto got_slot = static_cast<uint64_t>(got_slot_signed);
+								uint64_t     got_value = 0;
+								if (IsReadableRange(got_slot, sizeof(got_value))) {
+									std::memcpy(&got_value, reinterpret_cast<const void*>(got_slot),
+									            sizeof(got_value));
+								}
+								std::printf("candidate PLT/GOT slot: slot=0x%016" PRIx64
+								            " current_target=0x%016" PRIx64 "\\n",
+								            got_slot, got_value);
+								const auto count = std::min(
+								    g_plt_import_diagnostic_count.load(std::memory_order_acquire),
+								    g_plt_import_diagnostic_records.size());
+								for (size_t n = count; n > 0; --n) {
+									const auto& record = g_plt_import_diagnostic_records[n - 1];
+									if (record.ready.load(std::memory_order_acquire) &&
+									    record.got_slot == got_slot) {
+										std::printf("candidate CALL import: PLT[%u] name=%s debug_name=%s "
+										            "module=%s resolved=0x%016" PRIx64 "\\n",
+										            record.index, record.name.c_str(),
+										            record.dbg_name.c_str(), record.program.c_str(),
+										            record.resolved_value);
+										break;
+									}
+								}
+							}
+						}
 					}
-				}
 			}
 		}
 
@@ -980,6 +1049,10 @@ static bool RelocateRecord(uint32_t index, Elf64_Rela* r, Program* program, bool
 			value   = RegisterStubbedImport(index, program, ri);
 			stubbed = true;
 		}
+	}
+
+	if (jmprela_table) {
+		RecordPltImportDiagnostic(index, ri, value, program);
 	}
 
 	const bool patched = PatchGuestMemory64(ri.vaddr, value);
