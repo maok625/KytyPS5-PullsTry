@@ -15,6 +15,8 @@
 #include <atomic>
 #include <bit>
 #include <cstddef>
+#include <cstdarg>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <magic_enum.hpp>
@@ -28,6 +30,7 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#include <intrin.h>
 #include <windows.h> // IWYU pragma: keep
 #ifndef MEM_RESERVE_PLACEHOLDER
 #define MEM_RESERVE_PLACEHOLDER 0x00040000
@@ -47,11 +50,24 @@
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#include <mach/vm_region.h>
+#endif
 #endif
 
 namespace Libs::LibKernel::Memory {
 
 namespace VirtualMemory = Common::VirtualMemory;
+
+static void LogMemoryFailureToStderr(const char* format, ...) {
+	std::va_list args;
+	va_start(args, format);
+	std::vfprintf(stderr, format, args);
+	va_end(args);
+	std::fflush(stderr);
+}
 
 LIB_NAME("libkernel", "libkernel");
 
@@ -71,6 +87,7 @@ constexpr uint64_t DEFAULT_FLEXIBLE_MEMORY_SIZE = 1ull * 1024ull * 1024ull * 102
 
 static uint64_t                      g_flexible_memory_size        = DEFAULT_FLEXIBLE_MEMORY_SIZE;
 static bool                          g_flexible_memory_size_frozen = false;
+static std::atomic_uint64_t          g_system_direct_memory_reserve {0};
 static Graphics::RenderContext*       g_gpu_resources               = nullptr;
 
 static Graphics::RenderContext& GetGpuResources() {
@@ -1009,6 +1026,7 @@ static bool SelfTestSub64SharedPlaceholderAlias() {
 static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size);
 
 void Initialize() {
+	g_system_direct_memory_reserve.store(0, std::memory_order_relaxed);
 	g_flexible_memory_size_frozen = true;
 	VirtualMemory::Init();
 	g_guest_address_space = std::make_unique<GuestAddressSpace>(PhysicalMemory::TotalSize());
@@ -2277,7 +2295,12 @@ static int MapFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags
 	if (len == 0 || (len & (PAGE_SIZE - 1)) != 0) {
 		return KERNEL_ERROR_EINVAL;
 	}
-	if (len > g_flexible_memory->Available()) {
+	const auto flexible_available = g_flexible_memory->Available();
+	if (len > flexible_available) {
+		LogMemoryFailureToStderr(
+		           "\t [MapFlexibleMemory] ENOMEM: request exceeds flexible-memory budget"
+		           " requested=0x%016" PRIx64 " available=0x%016" PRIx64 "\n",
+		           static_cast<uint64_t>(len), flexible_available);
 		return KERNEL_ERROR_ENOMEM;
 	}
 
@@ -2342,11 +2365,20 @@ static int MapFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags
 	*addr_in_out = reinterpret_cast<void*>(out_addr);
 
 	if (out_addr == 0) {
+		LogMemoryFailureToStderr(
+		           "\t [MapFlexibleMemory] ENOMEM: no suitable guest virtual range"
+		           " in_addr=0x%016" PRIx64 " length=0x%016" PRIx64
+		           " fixed=%d flags=0x%08" PRIx32 "\n",
+		           in_addr, static_cast<uint64_t>(len), (flags & GUEST_MAP_FIXED) != 0 ? 1 : 0,
+		           map_flags);
 		return KERNEL_ERROR_ENOMEM;
 	}
 
 	if (!g_flexible_memory->Map(out_addr, len, prot, mode, gpu_mode, name)) {
-		LOGF_COLOR(Log::Color::Red, "\t [Fail]\n");
+		LogMemoryFailureToStderr(
+		           "\t [MapFlexibleMemory] ENOMEM: flexible backing allocation failed"
+		           " addr=0x%016" PRIx64 " length=0x%016" PRIx64 "\n",
+		           out_addr, static_cast<uint64_t>(len));
 		return KERNEL_ERROR_ENOMEM;
 	}
 
@@ -2624,10 +2656,16 @@ int KYTY_SYSV_ABI KernelMunmap(uint64_t vaddr, size_t len) {
 	return UnmapMemory(vaddr, len);
 }
 
+void SetSystemDirectMemoryReserve(uint64_t size) {
+	EXIT_IF(size >= PhysicalMemory::Size());
+	g_system_direct_memory_reserve.store(size, std::memory_order_relaxed);
+}
+
 size_t KYTY_SYSV_ABI KernelGetDirectMemorySize() {
 	PRINT_NAME();
 
-	return PhysicalMemory::Size();
+	const auto size = PhysicalMemory::Size();
+	return size - g_system_direct_memory_reserve.load(std::memory_order_relaxed);
 }
 
 int KYTY_SYSV_ABI KernelAvailableDirectMemorySize(int64_t search_start, int64_t search_end,
@@ -2978,6 +3016,48 @@ int KYTY_SYSV_ABI KernelCheckedReleaseDirectMemory(int64_t start, size_t len) {
 	return result == KERNEL_ERROR_EACCES ? KERNEL_ERROR_ENOENT : result;
 }
 
+#if defined(__APPLE__) && defined(__x86_64__)
+// Rosetta 2 can reserve this guest-address interval for host GPU resources. Never try to
+// replace those host mappings with MAP_FIXED; relocate only fixed requests that the
+// emulator does not already own and that intersect a real host VM region.
+static constexpr uint64_t APPLE_ROSETTA_GPU_CARVEOUT_START = 0x1000000000ull;
+static constexpr uint64_t APPLE_ROSETTA_GPU_CARVEOUT_END   = 0x7000000000ull;
+
+static bool OverlapsAppleRosettaGpuCarveout(uint64_t vaddr, uint64_t size) {
+	if (size == 0 || UINT64_MAX - vaddr < size) {
+		return false;
+	}
+	return vaddr < APPLE_ROSETTA_GPU_CARVEOUT_END &&
+	       vaddr + size > APPLE_ROSETTA_GPU_CARVEOUT_START;
+}
+
+static bool IsAppleHostRangeOccupied(uint64_t vaddr, uint64_t size) {
+	if (size == 0 || UINT64_MAX - vaddr < size) {
+		return false;
+	}
+
+	mach_vm_address_t region_address = vaddr;
+	mach_vm_size_t    region_size    = 0;
+	vm_region_basic_info_data_64_t region_info {};
+	mach_msg_type_number_t info_count = VM_REGION_BASIC_INFO_COUNT_64;
+	mach_port_t object_name = MACH_PORT_NULL;
+	const auto result = mach_vm_region(
+	    mach_task_self(), &region_address, &region_size, VM_REGION_BASIC_INFO_64,
+	    reinterpret_cast<vm_region_info_t>(&region_info), &info_count, &object_name);
+	if (object_name != MACH_PORT_NULL) {
+		(void)mach_port_deallocate(mach_task_self(), object_name);
+	}
+	if (result != KERN_SUCCESS || region_size == 0 ||
+	    UINT64_MAX - region_address < region_size) {
+		return false;
+	}
+
+	const auto request_end = vaddr + size;
+	const auto region_end  = region_address + region_size;
+	return region_address < request_end && vaddr < region_end;
+}
+#endif
+
 // The ABI entry points and batch operations hold g_memory_operation_mutex.
 static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
                            int64_t direct_memory_start, size_t alignment, const char* name,
@@ -3009,6 +3089,10 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 		return KERNEL_ERROR_EINVAL;
 	}
 	if (!g_physical_memory->CanMapDirect(static_cast<uint64_t>(direct_memory_start), len)) {
+		LogMemoryFailureToStderr(
+		           "\t [MapDirectMemory] ENOMEM: physical range is not allocated/mappable"
+		           " dmem=0x%016" PRIx64 " length=0x%016" PRIx64 "\n",
+		           static_cast<uint64_t>(direct_memory_start), static_cast<uint64_t>(len));
 		return KERNEL_ERROR_ENOMEM;
 	}
 
@@ -3043,9 +3127,30 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 			return KERNEL_ERROR_EINVAL;
 		}
 		if (no_overwrite && g_virtual_ranges->HasOverlap(in_addr, len)) {
+			LogMemoryFailureToStderr(
+			           "\t [MapDirectMemory] ENOMEM: NO_OVERWRITE virtual-range collision"
+			           " addr=0x%016" PRIx64 " length=0x%016" PRIx64 "\n",
+			           in_addr, static_cast<uint64_t>(len));
 			return KERNEL_ERROR_ENOMEM;
 		}
+#if defined(__APPLE__) && defined(__x86_64__)
+		if (OverlapsAppleRosettaGpuCarveout(in_addr, len) &&
+		    !g_guest_address_space->Owns(in_addr, len) &&
+		    IsAppleHostRangeOccupied(in_addr, len)) {
+			// MAP_FIXED is an identity-address contract. Relocating this mapping can make
+			// MapDirectMemory return success while guest code continues to access in_addr,
+			// which is still unmappable under Rosetta and can crash the host process.
+			LogMemoryFailureToStderr(
+			           "\t [MapDirectMemory] ENOMEM: macOS Rosetta GPU carve-out blocks fixed guest map;"
+			           " refusing unsafe relocation addr=0x%016" PRIx64
+			           " length=0x%016" PRIx64 "\n",
+			           in_addr, static_cast<uint64_t>(len));
+			return KERNEL_ERROR_ENOMEM;
+		}
+#endif
+	}
 
+	if (fixed) {
 		std::vector<VirtualRanges::Range> reserved_ranges;
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 		if (g_virtual_ranges->QuerySpan(in_addr, len, &reserved_ranges) &&
@@ -3103,6 +3208,10 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 				reserved_target = true;
 			}
 			if (!reserved_target) {
+				LogMemoryFailureToStderr(
+				           "\t [MapDirectMemory] ENOMEM: failed to reserve fixed guest range"
+				           " addr=0x%016" PRIx64 " length=0x%016" PRIx64 "\n",
+				           in_addr, static_cast<uint64_t>(len));
 				return KERNEL_ERROR_ENOMEM;
 			}
 			if (map_shared_fixed(in_addr)) {
@@ -3159,6 +3268,14 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 	     magic_enum::enum_name(gpu_mode), shared_backing ? "yes" : "no", shared_reason);
 
 	if (out_addr == 0) {
+		LogMemoryFailureToStderr(
+		           "\t [MapDirectMemory] ENOMEM: no output address/shared backing map failed"
+		           " in_addr=0x%016" PRIx64 " dmem=0x%016" PRIx64
+		           " length=0x%016" PRIx64 " fixed=%d no_overwrite=%d reserved=%d"
+		           " backing_reason=%s\n",
+		           in_addr, static_cast<uint64_t>(direct_memory_start), static_cast<uint64_t>(len),
+		           fixed ? 1 : 0, no_overwrite ? 1 : 0, reserved_target ? 1 : 0,
+		           GuestBackingStore::GetFailureReasonName(shared_failure));
 		return KERNEL_ERROR_ENOMEM;
 	}
 
@@ -3305,6 +3422,18 @@ int KYTY_SYSV_ABI KernelQueryMemoryProtection(void* addr, void** start, void** e
 
 static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size) {
 
+	constexpr uint64_t kGtaVFailedMapStart = 0x1559c00000ull;
+	constexpr uint64_t kGtaVFailedMapSize  = 0x10000ull;
+	const bool trace_gta_map = start < kGtaVFailedMapStart + kGtaVFailedMapSize &&
+	                           kGtaVFailedMapStart < start + size;
+	if (trace_gta_map) {
+		LogMemoryFailureToStderr(
+		    "[ReplaceFixedRangeWithReserved] request addr=0x%016" PRIx64
+		    " size=0x%016" PRIx64 "\n",
+		    start, size);
+	}
+
+
 	struct ReplacedChunk {
 		VirtualRanges::Range                        range {};
 		VirtualMemory::Mode                         mode     = VirtualMemory::Mode::NoAccess;
@@ -3321,6 +3450,12 @@ static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size) {
 	while (current < end) {
 		VirtualRanges::Range range {};
 		if (!g_virtual_ranges->Query(current, 1, &range)) {
+			if (trace_gta_map) {
+				LogMemoryFailureToStderr(
+				    "[ReplaceFixedRangeWithReserved] range query ended at 0x%016" PRIx64
+				    " before requested end 0x%016" PRIx64 "; chunks=%zu\n",
+				    current, end, chunks.size());
+			}
 			break;
 		}
 		if (range.start >= end) {
@@ -3342,12 +3477,28 @@ static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size) {
 			replaced.range.offset += current - range.start;
 		}
 		DecodeMemoryProtection(replaced.range.protection, &replaced.mode, &replaced.gpu_mode);
+		if (trace_gta_map) {
+			LogMemoryFailureToStderr(
+			    "[ReplaceFixedRangeWithReserved] overlap addr=0x%016" PRIx64
+			    " size=0x%016" PRIx64 " type=%u offset=0x%016" PRIx64 "\n",
+			    current, chunk, static_cast<unsigned int>(range.type), replaced.range.offset);
+		}
 		if (range.type == VirtualRangeType::Direct &&
 		    !g_guest_address_space->BackingContains(current, chunk)) {
+			if (trace_gta_map) {
+				LogMemoryFailureToStderr(
+				    "[ReplaceFixedRangeWithReserved] failed: direct range is not backed at "
+				    "0x%016" PRIx64 " size=0x%016" PRIx64 "\n", current, chunk);
+			}
 			return false;
 		}
 		if (range.type == VirtualRangeType::Flexible &&
 		    !g_flexible_memory->Snapshot(current, chunk, &replaced.flexible_blocks)) {
+			if (trace_gta_map) {
+				LogMemoryFailureToStderr(
+				    "[ReplaceFixedRangeWithReserved] failed: flexible snapshot at "
+				    "0x%016" PRIx64 " size=0x%016" PRIx64 "\n", current, chunk);
+			}
 			return false;
 		}
 		if (range.type == VirtualRangeType::Pooled) {
@@ -3456,6 +3607,12 @@ static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size) {
 	}
 
 	if (!g_guest_address_space->ReserveFixed(start, size)) {
+		if (trace_gta_map) {
+			LogMemoryFailureToStderr(
+			    "[ReplaceFixedRangeWithReserved] ReserveFixed failed addr=0x%016" PRIx64
+			    " size=0x%016" PRIx64 " chunks=%zu\n",
+			    start, size, chunks.size());
+		}
 		if (!restore_chunks()) {
 			EXIT("reserve-fixed host-reservation rollback failed\n");
 		}
@@ -3473,6 +3630,11 @@ static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size) {
 		    g_virtual_ranges->Add(start, size, 0, 0, 0, VirtualRangeType::Reserved, "anon");
 	}
 	if (!range_added) {
+		if (trace_gta_map) {
+			LogMemoryFailureToStderr(
+			    "[ReplaceFixedRangeWithReserved] virtual range registration failed at "
+			    "0x%016" PRIx64 " size=0x%016" PRIx64 "\n", start, size);
+		}
 		LOGF_COLOR(Log::Color::Red,
 		           "\t reserve-fixed replace: range add failed at 0x%016" PRIx64
 		           ", size=0x%016" PRIx64 "\n",
@@ -4030,6 +4192,24 @@ int KYTY_SYSV_ABI KernelBatchMap2(KernelBatchMapEntry* entries, int num_entries,
 		}
 
 		if (result != OK) {
+			const char* operation_name = "unknown";
+			switch (entry->operation) {
+				case MAP_OP_MAP_DIRECT: operation_name = "MAP_DIRECT"; break;
+				case MAP_OP_UNMAP: operation_name = "UNMAP"; break;
+				case MAP_OP_PROTECT: operation_name = "PROTECT"; break;
+				case MAP_OP_MAP_FLEXIBLE: operation_name = "MAP_FLEXIBLE"; break;
+				case MAP_OP_TYPE_PROTECT: operation_name = "TYPE_PROTECT"; break;
+				default: break;
+			}
+			LogMemoryFailureToStderr(
+			           "\t [KernelBatchMap] FAILED entry %d/%d op=%s(%d) start=0x%016" PRIx64
+			           " offset=0x%016" PRIx64 " length=0x%016" PRIx64
+			           " prot=0x%08" PRIx32 " type=0x%08" PRIx32
+			           " flags=0x%08" PRIx32 " result=0x%08" PRIx32 "\n",
+			           i, num_entries, operation_name, entry->operation,
+			           reinterpret_cast<uint64_t>(entry->start), entry->offset, entry->length,
+			           static_cast<uint32_t>(entry->protection), static_cast<uint32_t>(entry->type),
+			           static_cast<uint32_t>(flags), static_cast<uint32_t>(result));
 			if (num_entries_out != nullptr) {
 				*num_entries_out = processed;
 			}
@@ -4047,7 +4227,21 @@ int KYTY_SYSV_ABI KernelBatchMap2(KernelBatchMapEntry* entries, int num_entries,
 int KYTY_SYSV_ABI KernelBatchMap(KernelBatchMapEntry* entries, int num_entries,
                                  int* num_entries_out) {
 	constexpr int GUEST_MAP_FIXED = 0x10;
-	return KernelBatchMap2(entries, num_entries, num_entries_out, GUEST_MAP_FIXED);
+#if defined(_MSC_VER)
+	const auto guest_caller = reinterpret_cast<uint64_t>(_ReturnAddress());
+#elif defined(__GNUC__) || defined(__clang__)
+	const auto guest_caller = reinterpret_cast<uint64_t>(__builtin_return_address(0));
+#else
+	const uint64_t guest_caller = 0;
+#endif
+	const int result = KernelBatchMap2(entries, num_entries, num_entries_out, GUEST_MAP_FIXED);
+	if (result != OK) {
+		LogMemoryFailureToStderr(
+		    "\t [KernelBatchMap] guest_caller_return=0x%016" PRIx64
+		    " result=0x%08" PRIx32 "\n",
+		    guest_caller, static_cast<uint32_t>(result));
+	}
+	return result;
 }
 
 static bool IsAligned(uint64_t value, uint64_t alignment) {

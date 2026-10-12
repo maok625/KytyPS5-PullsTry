@@ -21,10 +21,12 @@
 #include "loader/guestInstructionPatcher.h"
 #include "loader/jit.h"
 #include "loader/symbolDatabase.h"
+#include "loader/systemContent.h"
 #include "loader/x64InstructionEmulator.h"
 
 #include <algorithm>
 #include <atomic>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -42,6 +44,7 @@
 #if defined(__APPLE__)
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
+#include <sys/sysctl.h>
 #elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 #include <sys/uio.h>
 #include <unistd.h>
@@ -88,16 +91,6 @@ ThreadLocalStorage::~ThreadLocalStorage() {
 	}
 }
 
-#pragma pack(1)
-
-struct EntryParams {
-	int         argc;
-	uint32_t    pad;
-	const char* argv[3];
-};
-
-#pragma pack()
-
 using atexit_func_t = KYTY_SYSV_ABI void (*)();
 using entry_func_t  = KYTY_SYSV_ABI void (*)(EntryParams* params, atexit_func_t atexit_func);
 using module_ini_fini_func_t = KYTY_SYSV_ABI int (*)(size_t args, const void* argp,
@@ -128,6 +121,41 @@ struct StubbedImportRecord {
 };
 
 static std::vector<StubbedImportRecord> g_stubbed_imports;
+
+// Capture PLT relocations in a fixed table, so the fatal/signal handler can identify a
+// RIP-relative GOT slot without taking RuntimeLinker locks or allocating memory.
+struct PltImportDiagnosticRecord {
+	std::atomic_bool ready {false};
+	uint64_t         got_slot       = 0;
+	uint64_t         resolved_value = 0;
+	uint32_t         index          = 0;
+	std::string      name;
+	std::string      dbg_name;
+	std::string      program;
+};
+
+static constexpr size_t PLT_IMPORT_DIAGNOSTIC_CAPACITY = 16384;
+static std::array<PltImportDiagnosticRecord, PLT_IMPORT_DIAGNOSTIC_CAPACITY>
+    g_plt_import_diagnostic_records {};
+static std::atomic_size_t g_plt_import_diagnostic_count {0};
+
+static void RecordPltImportDiagnostic(uint32_t index, const RelocationInfo& ri, uint64_t value,
+                                      const Program* program) {
+	const auto record_index =
+	    g_plt_import_diagnostic_count.fetch_add(1, std::memory_order_relaxed);
+	if (record_index >= g_plt_import_diagnostic_records.size()) {
+		return;
+	}
+	auto& record          = g_plt_import_diagnostic_records[record_index];
+	record.got_slot       = ri.vaddr;
+	record.resolved_value = value;
+	record.index          = index;
+	record.name           = ri.name;
+	record.dbg_name       = ri.dbg_name;
+	record.program        = Common::PathToString(program->file_name);
+	record.ready.store(true, std::memory_order_release);
+}
+
 static std::atomic_uint32_t             g_unresolved_stub_call_log_count {0};
 static std::vector<uint64_t>            g_unresolved_stub_thunk_pages;
 static uint64_t                         g_unresolved_stub_thunk_offset = 0;
@@ -696,7 +724,8 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		            info->rax, info->rbx, info->rcx, info->rdx, info->rsi, info->rdi, info->rbp,
 		            info->rsp, info->r8, info->r9, info->r10, info->r11, info->r12, info->r13,
 		            info->r14, info->r15);
-		if (IsReadableRange(info->exception_address - 48, 96)) {
+		if (info->exception_address >= 48 &&
+		    IsReadableRange(info->exception_address - 48, 96)) {
 			const auto* code = reinterpret_cast<const uint8_t*>(info->exception_address - 48);
 			std::printf("code (pc-48 .. pc+48, fault at byte 48):");
 			for (int i = 0; i < 96; i++) {
@@ -704,6 +733,137 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			}
 			std::printf("\n");
 		}
+
+		// On macOS/Rosetta, an x86 software interrupt can arrive here as a SIGSEGV
+		// with si_addr == 0. That is not evidence that the guest dereferenced NULL.
+		// Label INT imm8 explicitly so the guest trap is not mistaken for a data fault.
+		bool     is_software_interrupt = false;
+		uint64_t interrupt_opcode_addr = 0;
+		uint8_t  interrupt_vector = 0;
+
+		// Depending on how the host reports the x86 trap, the saved PC can point
+		// either at INT's 0xCD opcode or at its immediate byte (e.g. the 0x41 in
+		// `CD 41`). Check both positions so the diagnostics handle either form.
+		if (IsReadableRange(info->exception_address, 2)) {
+			uint8_t instruction[2] {};
+			std::memcpy(instruction, reinterpret_cast<const void*>(info->exception_address),
+			            sizeof(instruction));
+			if (instruction[0] == 0xCD) {
+				interrupt_opcode_addr = info->exception_address;
+				interrupt_vector = instruction[1];
+			}
+		}
+		if (interrupt_opcode_addr == 0 && info->exception_address > 0 &&
+		    IsReadableRange(info->exception_address - 1, 2)) {
+			uint8_t instruction[2] {};
+			std::memcpy(instruction,
+			            reinterpret_cast<const void*>(info->exception_address - 1),
+			            sizeof(instruction));
+			if (instruction[0] == 0xCD) {
+				interrupt_opcode_addr = info->exception_address - 1;
+				interrupt_vector = instruction[1];
+			}
+		}
+
+		if (interrupt_opcode_addr != 0) {
+			is_software_interrupt = true;
+			std::printf("faulting instruction: INT 0x%02x (opcode at 0x%016" PRIx64
+			            "); reported access address may be incidental\n",
+			            interrupt_vector, interrupt_opcode_addr);
+
+			// In the GTA V report, the INT is preceded by a direct CALL at
+			// opcode_addr - 15, followed by a status check. Derive the callsite from
+			// the decoded opcode address, not the host-reported PC, which may point
+			// at INT's immediate byte instead.
+			if (interrupt_opcode_addr >= 15 &&
+			    IsReadableRange(interrupt_opcode_addr - 15, 5)) {
+				uint8_t call_instruction[5] {};
+				std::memcpy(call_instruction,
+				            reinterpret_cast<const void*>(interrupt_opcode_addr - 15),
+				            sizeof(call_instruction));
+				if (call_instruction[0] == 0xE8) {
+					int32_t relative_target = 0;
+					std::memcpy(&relative_target, call_instruction + 1, sizeof(relative_target));
+					const auto return_address = static_cast<int64_t>(interrupt_opcode_addr) - 10;
+					const auto call_target = return_address + relative_target;
+					std::printf("candidate preceding CALL: callsite=0x%016" PRIx64
+					            " return=0x%016" PRIx64 " target=0x%016" PRIx64 "\n",
+					            interrupt_opcode_addr - 15,
+					            static_cast<uint64_t>(return_address),
+					            static_cast<uint64_t>(call_target));
+					if (call_target > 0 &&
+					    IsReadableRange(static_cast<uint64_t>(call_target), 32)) {
+						const auto* target_bytes =
+						    reinterpret_cast<const uint8_t*>(static_cast<uint64_t>(call_target));
+						std::printf("candidate CALL target bytes:");
+						for (int i = 0; i < 32; i++) {
+							std::printf("%s%02x", (i % 16 == 0) ? "\n " : " ",
+							            target_bytes[i]);
+						}
+						std::printf("\n");
+
+						// x86-64 PLT entries commonly start with jmp [RIP+disp32]. Resolve that
+						// indirect slot to the relocation/import recorded during program setup.
+						if (target_bytes[0] == 0xff && target_bytes[1] == 0x25) {
+							int32_t got_displacement = 0;
+							std::memcpy(&got_displacement, target_bytes + 2, sizeof(got_displacement));
+							const auto got_slot_signed =
+							    static_cast<int64_t>(call_target) + 6 + got_displacement;
+							if (got_slot_signed > 0) {
+								const auto got_slot = static_cast<uint64_t>(got_slot_signed);
+								uint64_t     got_value = 0;
+								if (IsReadableRange(got_slot, sizeof(got_value))) {
+									std::memcpy(&got_value, reinterpret_cast<const void*>(got_slot),
+									            sizeof(got_value));
+								}
+								std::printf("candidate PLT/GOT slot: slot=0x%016" PRIx64
+								            " current_target=0x%016" PRIx64 "\n",
+								            got_slot, got_value);
+								const auto count = std::min(
+								    g_plt_import_diagnostic_count.load(std::memory_order_acquire),
+								    g_plt_import_diagnostic_records.size());
+								for (size_t n = count; n > 0; --n) {
+									const auto& record = g_plt_import_diagnostic_records[n - 1];
+									if (record.ready.load(std::memory_order_acquire) &&
+									    record.got_slot == got_slot) {
+										std::printf("candidate CALL import: PLT[%u] name=%s debug_name=%s "
+										            "module=%s resolved=0x%016" PRIx64 "\n",
+										            record.index, record.name.c_str(),
+										            record.dbg_name.c_str(), record.program.c_str(),
+										            record.resolved_value);
+										break;
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+
+		// 0x8002000C is SCE_KERNEL_ERROR_ENOMEM in the PS5 kernel errno range.
+		// Print it explicitly when it is preserved in RAX at a guest INT trap.
+		if (is_software_interrupt && static_cast<uint32_t>(info->rax) == 0x8002000Cu) {
+			std::printf("RAX status: SCE_KERNEL_ERROR_ENOMEM (0x8002000C); "
+			            "trace the preceding allocation/resource operation\n");
+		}
+
+		// The raw stack dump below is useful for memory inspection but is hard to read.
+		// Walk only the guest frame-pointer chain here; do not call RuntimeLinker methods
+		// that take locks from the host exception/signal path.
+		void* guest_frames[20] {};
+		const int guest_frame_count =
+		    WalkGuestStack(info->rbp, info->rsp, guest_frames,
+		                   static_cast<int>(std::size(guest_frames)));
+		if (guest_frame_count > 0) {
+			std::printf("guest return-address frames (top to bottom):");
+			for (int i = 0; i < guest_frame_count; i++) {
+				std::printf("%s%016" PRIx64, (i % 2 == 0) ? "\n " : " ",
+				            reinterpret_cast<uint64_t>(guest_frames[i]));
+			}
+			std::printf("\n");
+		}
+
 		if (IsReadableRange(info->rsp, 32 * sizeof(uint64_t))) {
 			const auto* stack = reinterpret_cast<const uint64_t*>(info->rsp);
 			std::printf("stack:");
@@ -892,6 +1052,10 @@ static bool RelocateRecord(uint32_t index, Elf64_Rela* r, Program* program, bool
 			value   = RegisterStubbedImport(index, program, ri);
 			stubbed = true;
 		}
+	}
+
+	if (jmprela_table) {
+		RecordPltImportDiagnostic(index, ri, value, program);
 	}
 
 	const bool patched = PatchGuestMemory64(ri.vaddr, value);
@@ -1247,6 +1411,73 @@ void RuntimeLinker::SaveProgram(Program* program, const std::filesystem::path& e
 	}
 }
 
+#if defined(__APPLE__) && defined(__x86_64__)
+static bool IsRunningUnderRosetta2() {
+	int    translated = 0;
+	size_t translated_size = sizeof(translated);
+	return sysctlbyname("sysctl.proc_translated", &translated, &translated_size, nullptr, 0) == 0 &&
+	       translated == 1;
+}
+
+// GTA V PS5 (PPSA04263) initializes the memory-pool base to 0x1000000000, inside
+// Rosetta 2's reserved GPU address range. Move that base above the carve-out, but only
+// when running translated x86-64 on Apple Silicon and when the exact eboot code signature
+// matches. The byte-level guard intentionally fails closed on different game updates.
+static void ApplyGtaVRosettaMemoryWorkaround(Program* main_program) {
+	if (main_program == nullptr || !IsRunningUnderRosetta2() ||
+	    !Common::EqualNoCase(main_program->file_name.filename().string(), "eboot.bin")) {
+		return;
+	}
+
+	std::string title_id;
+	if (!SystemContentParamSfoGetString("TITLE_ID", &title_id) || title_id != "PPSA04263") {
+		return;
+	}
+
+	constexpr uint64_t kInstructionOffset = 0x4b6beb;
+	constexpr uint8_t  kExpected[] = {
+	    0x48, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00,
+	    0x48, 0x8d, 0x3d, 0x1c, 0x17, 0xa9, 0x03,
+	    0xbe, 0xc0, 0xc3, 0x00, 0x00,
+	    0x48, 0x89, 0xda,
+	    0x48, 0x89, 0x05, 0x6d, 0x22, 0xa9, 0x03,
+	    0xe8, 0x20, 0x35, 0x6f, 0x02,
+	};
+	static_assert(sizeof(kExpected) == 37);
+
+	if (main_program->base_vaddr == 0 ||
+	    main_program->mapped_size < kInstructionOffset + sizeof(kExpected)) {
+		LOGF_COLOR(Log::Color::Red,
+		           "GTA V Rosetta workaround skipped: eboot mapping is too small or invalid\n");
+		return;
+	}
+
+	auto* instruction = reinterpret_cast<uint8_t*>(main_program->base_vaddr + kInstructionOffset);
+	if (std::memcmp(instruction, kExpected, sizeof(kExpected)) != 0) {
+		LOGF_COLOR(Log::Color::Yellow,
+		           "GTA V Rosetta workaround skipped: PPSA04263 eboot signature did not match\n");
+		return;
+	}
+
+	// Immediate 0x1000000000 -> 0x8000000000. This changes only the high byte of the
+	// initializer's 64-bit address constant (instruction offset + 6).
+	instruction[6] = 0x80;
+	if (!Common::VirtualMemory::FlushInstructionCache(main_program->base_vaddr + kInstructionOffset,
+	                                                  sizeof(kExpected))) {
+		instruction[6] = kExpected[6];
+		(void)Common::VirtualMemory::FlushInstructionCache(
+		    main_program->base_vaddr + kInstructionOffset, sizeof(kExpected));
+		LOGF_COLOR(Log::Color::Red,
+		           "GTA V Rosetta workaround failed: instruction cache flush failed\n");
+		return;
+	}
+
+	LOGF_COLOR(Log::Color::BrightGreen,
+	           "GTA V Rosetta workaround applied: memory-pool base 0x1000000000 -> "
+	           "0x8000000000 (PPSA04263, Rosetta 2)\n");
+}
+#endif
+
 void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	KYTY_PROFILER_THREAD("Thread_Main");
 
@@ -1270,6 +1501,10 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	auto* libc = Common::File::IsFileExisting(libc_path) ? LoadProgram(libc_path) : nullptr;
 	RelocateAll();
 
+#if defined(__APPLE__) && defined(__x86_64__)
+	ApplyGtaVRosettaMemoryWorkaround(m_programs.empty() ? nullptr : m_programs.front());
+#endif
+
 	if (!game_patch.empty()) {
 		if (!GamePatch::Apply(game_patch, m_programs.empty() ? nullptr : m_programs.front(),
 		                      m_programs)) {
@@ -1283,11 +1518,16 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	LOGF_COLOR(Log::Color::BrightYellow, "---\n--- Execute: %s\n---\n", "Main");
 
 	if (auto entry = GetEntry(); entry != 0) {
+		const auto& arguments = Config::GetGuestArguments();
+		const auto params_size = offsetof(EntryParams, argv) +
+		                         (arguments.size() + 2) * sizeof(const char*);
 		auto* params = reinterpret_cast<EntryParams*>(
-		    (reinterpret_cast<uintptr_t>(main_stack_top) - 0x100u) & ~static_cast<uintptr_t>(0x0f));
-		std::memset(params, 0, sizeof(EntryParams));
-		params->argc    = 1;
-		params->argv[0] = "KytyEmu";
+		    (reinterpret_cast<uintptr_t>(main_stack_top) - params_size - 0x100u) &
+		    ~static_cast<uintptr_t>(0x0f));
+		std::memset(params, 0, params_size);
+		for (const auto& argument: arguments) {
+			params->argv[params->argc++] = argument.c_str();
+		}
 
 		LOGF("stack_addr = %" PRIx64 "\n", reinterpret_cast<uint64_t>(params));
 

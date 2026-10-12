@@ -547,6 +547,39 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		LOGF("PipelineTrace: vkCreateGraphicsPipelines done result=%s pipeline=%p\n",
 		     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
 	}
+	if (result != vk::Result::eSuccess) {
+		LOGF_COLOR(Log::Color::Red,
+		           "Graphics pipeline creation failed: result=%s topology=%u tessellation=%u "
+		           "mesh=%u vertex_stages=%zu pixel_active=%u\n",
+		           vk::to_string(result).c_str(), static_cast<uint32_t>(static_params.topology),
+		           tessellation ? 1u : 0u, mesh ? 1u : 0u, vertex_info.size(),
+		           ps_active ? 1u : 0u);
+		for (size_t i = 0; i < vertex_info.size(); i++) {
+			const auto* shader = vertex_info[i].stage.program;
+			if (shader == nullptr) {
+				LOGF("\t vertex[%zu] program_id=%" PRIu64 " shader metadata unavailable\n", i,
+				     programs.vertex[i].id);
+				continue;
+			}
+			const auto& info = shader->info;
+			LOGF("\t vertex[%zu] program_id=%" PRIu64 " shader_hash=0x%016" PRIx64
+			     " stage=%u wave_size=%" PRIu32
+			     " subgroup_local_id=%u ballot=%u shuffle=%u barrier=%u\n",
+			     i, programs.vertex[i].id, shader->shader_hash,
+			     static_cast<unsigned>(shader->stage), shader->wave_size,
+			     info.subgroup_local_invocation_id ? 1u : 0u, info.subgroup_ballot ? 1u : 0u,
+			     info.subgroup_shuffle ? 1u : 0u, info.subgroup_barrier ? 1u : 0u);
+		}
+		if (ps_active && ps_input_info != nullptr && ps_input_info->stage.program != nullptr) {
+			const auto* shader = ps_input_info->stage.program;
+			const auto& info   = shader->info;
+			LOGF("\t pixel shader_hash=0x%016" PRIx64 " stage=%u wave_size=%" PRIu32
+			     " subgroup_local_id=%u ballot=%u shuffle=%u barrier=%u\n",
+			     shader->shader_hash, static_cast<unsigned>(shader->stage), shader->wave_size,
+			     info.subgroup_local_invocation_id ? 1u : 0u, info.subgroup_ballot ? 1u : 0u,
+			     info.subgroup_shuffle ? 1u : 0u, info.subgroup_barrier ? 1u : 0u);
+		}
+	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);

@@ -4,6 +4,8 @@
 static constexpr uint64_t HOST_SYSTEM_MANAGED_MIN  = 0x0000040000ull;
 static constexpr uint64_t HOST_SYSTEM_MANAGED_MAX  = 0x07ffffbfffull;
 #if defined(__APPLE__) && (defined(__x86_64__) || defined(_M_X64))
+// Keep SYSTEM_RESERVED at the size that macOS can load reliably. The gap up to USER_AREA
+// is claimed safely at runtime by GuestAddressSpace::ReserveGuestRegions().
 static constexpr uint64_t HOST_SYSTEM_RESERVED_MAX = 0x0fbfffffffull;
 static constexpr uint64_t HOST_USER_MIN            = 0x7000000000ull;
 #else
@@ -888,7 +890,79 @@ public:
 			return false;
 		}
 		std::lock_guard lock(m_mutex);
-		return FindContaining(vaddr, size) != m_free.end();
+		if (FindContaining(vaddr, size) != m_free.end()) {
+			return true;
+		}
+
+#if defined(__APPLE__) && defined(__x86_64__)
+		// If the broad startup scan skipped a hole, try to reserve this exact fixed guest
+		// mapping on demand. VM_FLAGS_FIXED without VM_FLAGS_OVERWRITE cannot replace a host
+		// mapping, so this is safe even when the original reason for the missed hole is unknown.
+		const auto gap_start = HOST_SYSTEM_RESERVED_MAX + 1u;
+		const auto gap_end   = HOST_USER_MIN;
+		const bool in_guest_gap =
+		    vaddr >= gap_start && vaddr < gap_end && size <= gap_end - vaddr;
+		const bool overlaps_owned = std::any_of(m_owned.begin(), m_owned.end(),
+		                                        [vaddr, size](const auto& range) {
+		                                        return VirtualRangesOverlap(
+		                                            vaddr, size, range.first, range.second);
+		                                        });
+		if (in_guest_gap && !overlaps_owned) {
+			mach_vm_address_t address = vaddr;
+			auto result = mach_vm_allocate(mach_task_self(), &address, size, VM_FLAGS_FIXED);
+			if (result == KERN_SUCCESS && address == vaddr) {
+				result = mach_vm_protect(mach_task_self(), address, size, FALSE, VM_PROT_NONE);
+				if (result == KERN_SUCCESS) {
+					AddFreeUnlocked(vaddr, size);
+					m_owned.emplace_back(vaddr, size);
+					std::sort(m_owned.begin(), m_owned.end());
+					std::vector<std::pair<uint64_t, uint64_t>> merged_owned;
+					merged_owned.reserve(m_owned.size());
+					for (const auto& range: m_owned) {
+						if (!merged_owned.empty() &&
+						    range.first <= merged_owned.back().first + merged_owned.back().second) {
+							const auto merged_end = std::max(
+							    merged_owned.back().first + merged_owned.back().second,
+							    range.first + range.second);
+							merged_owned.back().second = merged_end - merged_owned.back().first;
+						} else {
+							merged_owned.push_back(range);
+						}
+					}
+					m_owned.swap(merged_owned);
+					LogMemoryFailureToStderr(
+					    "[GuestAddressSpace] lazily reserved fixed GTA guest range "
+					    "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+					    vaddr, size);
+					return FindContaining(vaddr, size) != m_free.end();
+				}
+				(void)mach_vm_deallocate(mach_task_self(), address, size);
+			} else if (result == KERN_SUCCESS) {
+				(void)mach_vm_deallocate(mach_task_self(), address, size);
+			}
+			if (vaddr == 0x1559c00000ull) {
+				LogMemoryFailureToStderr(
+				    "[GuestAddressSpace] lazy fixed reservation failed addr=0x%016" PRIx64
+				    " size=0x%016" PRIx64 " result=0x%08x returned=0x%016" PRIx64 "\n",
+				    vaddr, size, static_cast<unsigned int>(result),
+				    static_cast<uint64_t>(address));
+			}
+		}
+#endif
+
+		if (vaddr == 0x1559c00000ull) {
+			const bool is_owned = std::any_of(m_owned.begin(), m_owned.end(),
+			                                  [vaddr, size](const auto& range) {
+				                                  return vaddr >= range.first &&
+				                                         vaddr + size <= range.first + range.second;
+			                                  });
+			const bool is_free = FindContaining(vaddr, size) != m_free.end();
+			LogMemoryFailureToStderr(
+			    "[GuestAddressSpace] ReserveFixed diagnostic addr=0x%016" PRIx64
+			    " size=0x%016" PRIx64 " owned=%d free=%d\n",
+			    vaddr, size, is_owned ? 1 : 0, is_free ? 1 : 0);
+		}
+		return false;
 	}
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
@@ -1275,6 +1349,163 @@ private:
 			m_owned.emplace_back(start, end - start);
 		}
 #endif
+#endif
+
+#if defined(__APPLE__) && defined(__x86_64__)
+		// macOS/Rosetta cannot reliably reserve the complete >400-GiB guest gap as one VM
+		// allocation. Enumerate the process's current VM regions and reserve only the holes,
+		// in bounded chunks. VM_FLAGS_FIXED is intentionally used without VM_FLAGS_OVERWRITE:
+		// a host mapping must never be replaced by a guest placeholder.
+		const auto gap_start = HOST_SYSTEM_RESERVED_MAX + 1u;
+		const auto gap_end   = HOST_USER_MIN;
+		if (gap_end > gap_start) {
+			const auto task = mach_task_self();
+			uint64_t skipped_bytes = 0;
+			uint64_t first_skipped = 0;
+
+			auto reserve_piece = [this, task, &skipped_bytes, &first_skipped](
+			                         auto&& self, uint64_t start, uint64_t end) -> void {
+				start = AlignUp(start, PageSize());
+				end   = AlignDown(end, PageSize());
+				if (end <= start) {
+					return;
+				}
+
+				const auto size = end - start;
+				mach_vm_address_t address = start;
+				auto result = mach_vm_allocate(task, &address, size, VM_FLAGS_FIXED);
+				if (result == KERN_SUCCESS && address == start) {
+					result = mach_vm_protect(task, address, size, FALSE, VM_PROT_NONE);
+					if (result == KERN_SUCCESS) {
+						constexpr uint64_t kGtaVFailedMapStart = 0x1559c00000ull;
+						constexpr uint64_t kGtaVFailedMapSize  = 0x10000ull;
+						if (start <= kGtaVFailedMapStart &&
+						    kGtaVFailedMapStart + kGtaVFailedMapSize <= start + size) {
+							LogMemoryFailureToStderr(
+							    "[GuestAddressSpace] reserved GTA V map in gap chunk "
+							    "[0x%016" PRIx64 ",0x%016" PRIx64 ")\n",
+							    start, start + size);
+						}
+						AddFreeUnlocked(start, size);
+						m_owned.emplace_back(start, size);
+						return;
+					}
+					(void)mach_vm_deallocate(task, address, size);
+				} else if (result == KERN_SUCCESS) {
+					(void)mach_vm_deallocate(task, address, size);
+				}
+
+				// A VM hole can still be too large for one request or race with a new host
+				// mapping. Bisect failed requests rather than failing process startup or
+				// clobbering the mapping. Only omit a small span if it cannot be reserved.
+				constexpr uint64_t MinimumReservation = 0x01000000; // 16 MiB
+				if (size <= MinimumReservation) {
+					if (first_skipped == 0) {
+						first_skipped = start;
+					}
+					skipped_bytes += size;
+					return;
+				}
+				const auto midpoint = AlignDown(start + size / 2u, PageSize());
+				if (midpoint <= start || midpoint >= end) {
+					if (first_skipped == 0) {
+						first_skipped = start;
+					}
+					skipped_bytes += size;
+					return;
+				}
+				self(self, start, midpoint);
+				self(self, midpoint, end);
+			};
+
+			auto reserve_hole = [&reserve_piece](uint64_t start, uint64_t end) {
+				constexpr uint64_t PreferredChunk = 0x40000000; // 1 GiB
+				while (start < end) {
+					const auto chunk_end = start + std::min<uint64_t>(PreferredChunk, end - start);
+					reserve_piece(reserve_piece, start, chunk_end);
+					start = chunk_end;
+				}
+			};
+
+			uint64_t scan = gap_start;
+			while (scan < gap_end) {
+				mach_vm_address_t region_address = scan;
+				mach_vm_size_t    region_size    = 0;
+				vm_region_basic_info_data_64_t region_info {};
+				mach_msg_type_number_t info_count = VM_REGION_BASIC_INFO_COUNT_64;
+				mach_port_t object_name = MACH_PORT_NULL;
+				const auto region_result = mach_vm_region(
+				    task, &region_address, &region_size, VM_REGION_BASIC_INFO_64,
+				    reinterpret_cast<vm_region_info_t>(&region_info), &info_count, &object_name);
+				if (object_name != MACH_PORT_NULL) {
+					(void)mach_port_deallocate(task, object_name);
+				}
+
+				if (region_result == KERN_INVALID_ADDRESS || region_result == KERN_NO_SPACE) {
+					break;
+				}
+				if (region_result != KERN_SUCCESS || region_size == 0 ||
+				    UINT64_MAX - region_address < region_size) {
+					EXIT("failed to inspect macOS guest address gap at 0x%016" PRIx64
+					     ", mach_vm_region result=0x%08x, region=0x%016" PRIx64
+					     ", size=0x%016" PRIx64 "\n",
+					     scan, static_cast<unsigned int>(region_result),
+					     static_cast<uint64_t>(region_address),
+					     static_cast<uint64_t>(region_size));
+				}
+
+				const auto region_end = region_address + region_size;
+				constexpr uint64_t kGtaVFailedMapStart = 0x1559c00000ull;
+				constexpr uint64_t kGtaVFailedMapSize  = 0x10000ull;
+				if (region_address < kGtaVFailedMapStart + kGtaVFailedMapSize &&
+				    kGtaVFailedMapStart < region_end) {
+					LogMemoryFailureToStderr(
+					    "[GuestAddressSpace] pre-existing macOS VM region overlaps GTA V map: "
+					    "region=[0x%016" PRIx64 ",0x%016" PRIx64
+					    ") protection=0x%x max_protection=0x%x reserved=%d shared=%d\n",
+					    static_cast<uint64_t>(region_address), static_cast<uint64_t>(region_end),
+					    static_cast<unsigned int>(region_info.protection),
+					    static_cast<unsigned int>(region_info.max_protection),
+					    region_info.reserved ? 1 : 0, region_info.shared ? 1 : 0);
+				}
+				if (region_address > scan) {
+					reserve_hole(scan, std::min(region_address, gap_end));
+				}
+				if (region_end <= scan) {
+					EXIT("macOS VM-region scan did not advance at 0x%016" PRIx64 "\n", scan);
+				}
+				scan = std::max(scan, region_end);
+			}
+			if (scan < gap_end) {
+				reserve_hole(scan, gap_end);
+			}
+
+			if (skipped_bytes != 0) {
+				LogMemoryFailureToStderr(
+				    "[GuestAddressSpace] warning: could not reserve 0x%016" PRIx64
+				    " bytes in macOS guest gap (first skipped range at 0x%016" PRIx64
+				    "); guest allocations there may fail\n",
+				    skipped_bytes, first_skipped);
+			}
+
+			// The runtime gap reservation directly touches the low guest reservation. Merge
+			// adjacent owned spans so large ownership checks remain valid across chunk edges.
+			std::sort(m_owned.begin(), m_owned.end());
+			std::vector<std::pair<uint64_t, uint64_t>> merged_owned;
+			merged_owned.reserve(m_owned.size());
+			for (const auto& range: m_owned) {
+				if (!merged_owned.empty() &&
+				    range.first <= merged_owned.back().first + merged_owned.back().second) {
+					const auto merged_end =
+					    std::max(merged_owned.back().first + merged_owned.back().second,
+					             range.first + range.second);
+					merged_owned.back().second = merged_end - merged_owned.back().first;
+				} else {
+					merged_owned.push_back(range);
+				}
+			}
+			m_owned.swap(merged_owned);
+		}
 #endif
 	}
 

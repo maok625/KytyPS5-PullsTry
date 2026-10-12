@@ -1,5 +1,6 @@
 #include "libs/agc.h"
 
+#include "common/alignment.h"
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
@@ -4159,9 +4160,17 @@ int Initialize() {
 	if (g_driver_dmem.physical_offset >= 0) {
 		return OK;
 	}
-	int64_t physical_offset = -1;
-	auto result = LibKernel::Memory::KernelAllocateDirectMemory(
-	    0, LibKernel::Memory::KernelGetDirectMemorySize(), DriverDmemSize, DriverDmemSize,
+	// Place this system-owned block at the top of the pool so the guest-visible
+	// direct-memory budget can be clamped below the block and any alignment tail.
+	int64_t    physical_offset = -1;
+	const auto reported_end    = LibKernel::Memory::KernelGetDirectMemorySize();
+	const auto end             = Common::AlignDown(reported_end, DriverDmemSize);
+	if (end < DriverDmemSize) {
+		return LibKernel::KERNEL_ERROR_EAGAIN;
+	}
+	const auto start  = end - DriverDmemSize;
+	auto       result = LibKernel::Memory::KernelAllocateDirectMemory(
+	    static_cast<int64_t>(start), static_cast<int64_t>(end), DriverDmemSize, DriverDmemSize,
 	    12, &physical_offset);
 	if (result != OK) {
 		return result;
@@ -4173,7 +4182,13 @@ int Initialize() {
 		EXIT_IF(LibKernel::Memory::KernelCheckedReleaseDirectMemory(physical_offset, DriverDmemSize) != OK);
 		return result;
 	}
-	EXIT_IF(reinterpret_cast<uint64_t>(address) != DriverDmemBase);
+	const auto mapped_base = reinterpret_cast<uint64_t>(address);
+	EXIT_IF(mapped_base == 0);
+	if (mapped_base != DriverDmemBase) {
+		LOGF("AGC driver DMEM preferred address 0x%016" PRIx64
+		     " is unavailable; using mapped address 0x%016" PRIx64 " instead.\n",
+		     DriverDmemBase, mapped_base);
+	}
 	std::memset(address, 0, DriverDmemSize);
 	struct FunctionShaderBindings {
 		uint64_t code;
@@ -4187,7 +4202,9 @@ int Initialize() {
 	    0xbf800000, 0x85ea807e, 0x88ea106a, 0xbf870003,
 	    0xbefc03ff, 0x8a6ca000, 0xbf920009, 0xbefd210e,
 	};
-	const auto base = DriverDmemBase + AgcDmemOffset;
+	// The direct-memory mapping API treats the incoming address as a hint unless
+	// GUEST_MAP_FIXED is requested. Build every driver pointer from the address it returned.
+	const auto base = mapped_base + AgcDmemOffset;
 	const auto function_table = base + 0x60;
 	const auto code_address = base + 0x100; // Shader code requires 256-byte alignment.
 	std::array<FunctionShaderBindings, 8> functions {};
@@ -4201,6 +4218,10 @@ int Initialize() {
 	std::memcpy(reinterpret_cast<void*>(code_address), validator.data(), sizeof(validator));
 	std::memcpy(reinterpret_cast<void*>(base), descriptor.data(), sizeof(descriptor));
 	g_driver_dmem.physical_offset = physical_offset;
+
+	// Reserve the driver allocation and any alignment tail from the guest-visible
+	// direct-memory budget, so the guest cannot claim memory that the driver needs.
+	LibKernel::Memory::SetSystemDirectMemoryReserve(reported_end - start);
 	return OK;
 }
 
@@ -4210,6 +4231,7 @@ static void ReleaseDmem() {
 		EXIT_IF(LibKernel::Memory::KernelCheckedReleaseDirectMemory(
 		            g_driver_dmem.physical_offset, DriverDmemSize) != OK);
 		g_driver_dmem.physical_offset = -1;
+		LibKernel::Memory::SetSystemDirectMemoryReserve(0);
 	}
 }
 
