@@ -30,6 +30,7 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#include <intrin.h>
 #include <windows.h> // IWYU pragma: keep
 #ifndef MEM_RESERVE_PLACEHOLDER
 #define MEM_RESERVE_PLACEHOLDER 0x00040000
@@ -4226,7 +4227,21 @@ int KYTY_SYSV_ABI KernelBatchMap2(KernelBatchMapEntry* entries, int num_entries,
 int KYTY_SYSV_ABI KernelBatchMap(KernelBatchMapEntry* entries, int num_entries,
                                  int* num_entries_out) {
 	constexpr int GUEST_MAP_FIXED = 0x10;
-	return KernelBatchMap2(entries, num_entries, num_entries_out, GUEST_MAP_FIXED);
+#if defined(_MSC_VER)
+	const auto guest_caller = reinterpret_cast<uint64_t>(_ReturnAddress());
+#elif defined(__GNUC__) || defined(__clang__)
+	const auto guest_caller = reinterpret_cast<uint64_t>(__builtin_return_address(0));
+#else
+	const uint64_t guest_caller = 0;
+#endif
+	const int result = KernelBatchMap2(entries, num_entries, num_entries_out, GUEST_MAP_FIXED);
+	if (result != OK) {
+		LogMemoryFailureToStderr(
+		    "\t [KernelBatchMap] guest_caller_return=0x%016" PRIx64
+		    " result=0x%08" PRIx32 "\n",
+		    guest_caller, static_cast<uint32_t>(result));
+	}
+	return result;
 }
 
 static bool IsAligned(uint64_t value, uint64_t alignment) {
