@@ -21,6 +21,7 @@
 #include "loader/guestInstructionPatcher.h"
 #include "loader/jit.h"
 #include "loader/symbolDatabase.h"
+#include "loader/systemContent.h"
 #include "loader/x64InstructionEmulator.h"
 
 #include <algorithm>
@@ -43,6 +44,7 @@
 #if defined(__APPLE__)
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
+#include <sys/sysctl.h>
 #elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 #include <sys/uio.h>
 #include <unistd.h>
@@ -1409,6 +1411,73 @@ void RuntimeLinker::SaveProgram(Program* program, const std::filesystem::path& e
 	}
 }
 
+#if defined(__APPLE__) && defined(__x86_64__)
+static bool IsRunningUnderRosetta2() {
+	int    translated = 0;
+	size_t translated_size = sizeof(translated);
+	return sysctlbyname("sysctl.proc_translated", &translated, &translated_size, nullptr, 0) == 0 &&
+	       translated == 1;
+}
+
+// GTA V PS5 (PPSA04263) initializes the memory-pool base to 0x1000000000, inside
+// Rosetta 2's reserved GPU address range. Move that base above the carve-out, but only
+// when running translated x86-64 on Apple Silicon and when the exact eboot code signature
+// matches. The byte-level guard intentionally fails closed on different game updates.
+static void ApplyGtaVRosettaMemoryWorkaround(Program* main_program) {
+	if (main_program == nullptr || !IsRunningUnderRosetta2() ||
+	    !Common::EqualNoCase(main_program->file_name.filename().string(), "eboot.bin")) {
+		return;
+	}
+
+	std::string title_id;
+	if (!SystemContentParamSfoGetString("TITLE_ID", &title_id) || title_id != "PPSA04263") {
+		return;
+	}
+
+	constexpr uint64_t kInstructionOffset = 0x4b6beb;
+	constexpr uint8_t  kExpected[] = {
+	    0x48, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00,
+	    0x48, 0x8d, 0x3d, 0x1c, 0x17, 0xa9, 0x03,
+	    0xbe, 0xc0, 0xc3, 0x00, 0x00,
+	    0x48, 0x89, 0xda,
+	    0x48, 0x89, 0x05, 0x6d, 0x22, 0xa9, 0x03,
+	    0xe8, 0x20, 0x35, 0x6f, 0x02,
+	};
+	static_assert(sizeof(kExpected) == 37);
+
+	if (main_program->base_vaddr == 0 ||
+	    main_program->mapped_size < kInstructionOffset + sizeof(kExpected)) {
+		LOGF_COLOR(Log::Color::Red,
+		           "GTA V Rosetta workaround skipped: eboot mapping is too small or invalid\n");
+		return;
+	}
+
+	auto* instruction = reinterpret_cast<uint8_t*>(main_program->base_vaddr + kInstructionOffset);
+	if (std::memcmp(instruction, kExpected, sizeof(kExpected)) != 0) {
+		LOGF_COLOR(Log::Color::Yellow,
+		           "GTA V Rosetta workaround skipped: PPSA04263 eboot signature did not match\n");
+		return;
+	}
+
+	// Immediate 0x1000000000 -> 0x8000000000. This changes only the high byte of the
+	// initializer's 64-bit address constant (instruction offset + 6).
+	instruction[6] = 0x80;
+	if (!Common::VirtualMemory::FlushInstructionCache(main_program->base_vaddr + kInstructionOffset,
+	                                                  sizeof(kExpected))) {
+		instruction[6] = kExpected[6];
+		(void)Common::VirtualMemory::FlushInstructionCache(
+		    main_program->base_vaddr + kInstructionOffset, sizeof(kExpected));
+		LOGF_COLOR(Log::Color::Red,
+		           "GTA V Rosetta workaround failed: instruction cache flush failed\n");
+		return;
+	}
+
+	LOGF_COLOR(Log::Color::BrightGreen,
+	           "GTA V Rosetta workaround applied: memory-pool base 0x1000000000 -> "
+	           "0x8000000000 (PPSA04263, Rosetta 2)\n");
+}
+#endif
+
 void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	KYTY_PROFILER_THREAD("Thread_Main");
 
@@ -1431,6 +1500,10 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	const auto libc_path = Libs::LibKernel::FileSystem::GetRealFilename("/app0/sce_module/libc.prx");
 	auto* libc = Common::File::IsFileExisting(libc_path) ? LoadProgram(libc_path) : nullptr;
 	RelocateAll();
+
+#if defined(__APPLE__) && defined(__x86_64__)
+	ApplyGtaVRosettaMemoryWorkaround(m_programs.empty() ? nullptr : m_programs.front());
+#endif
 
 	if (!game_patch.empty()) {
 		if (!GamePatch::Apply(game_patch, m_programs.empty() ? nullptr : m_programs.front(),
