@@ -270,7 +270,7 @@ MakeIndirectImageFixture(bool malformed, uint32_t table_stride = 32, uint32_t ta
   sample.kind = ResourceKind::Image;
   sample.image_dimension = Decoder::ImageDimension::Dim2D;
   const auto sampled = fixture->Emit(ValueOpcode::ImageSampleRaw,
-                                     {image, sampler, fixture->ImageAddress()},
+                                     {image, sampler, fixture->ImageAddress(), Value(true)},
                                      fixture->AddMemory(sample, 0x10f0));
   const auto sampled_x =
       fixture->Emit(ValueOpcode::CompositeExtractU32x4, {sampled, Value(0u)});
@@ -438,6 +438,43 @@ void TestBoundedImageViewEligibility() {
         "explicitly selected incompatible descriptor was silently normalized to null");
 }
 
+// A V# image table indexed by the workgroup. An image store keeps one descriptor per dispatch:
+// only a sample can read through a native array root.
+void TestWorkgroupImageTableStore() {
+  Fixture fixture;
+  std::array<Value, 4> heap_words;
+  for (uint32_t dword = 0; dword < 4; dword++) heap_words[dword] = fixture.UserData(dword);
+  const auto heap = fixture.Buffer(heap_words, 0x10d8);
+  const auto group = fixture.Emit(
+      ValueOpcode::GetBuiltin,
+      {Value(static_cast<uint32_t>(StageInputKind::WorkgroupId)), Value(2u)});
+  const auto heap_offset = fixture.Emit(ValueOpcode::IMul32, {group, Value(32u)});
+  std::array<Value, 8> image_words;
+  for (uint32_t dword = 0; dword < image_words.size(); dword++) {
+    MemoryInfo component;
+    component.kind = ResourceKind::ScalarBuffer;
+    component.offset = dword * sizeof(uint32_t);
+    image_words[dword] = fixture.Emit(ValueOpcode::ReadConstBuffer, {heap, heap_offset},
+                                      fixture.AddMemory(component, 0x10d8));
+  }
+  const auto image = fixture.Image(image_words, 0x10f0);
+  MemoryInfo access;
+  access.kind = ResourceKind::Image;
+  access.image_dimension = Decoder::ImageDimension::Dim2D;
+  access.image_address_components = 2u;
+  const auto data = fixture.Emit(ValueOpcode::CompositeConstructU32x4,
+                                 {Value(1u), Value(2u), Value(3u), Value(4u)});
+  fixture.Emit(ValueOpcode::ImageWrite, {image, fixture.ImageAddress(), data, Value(true)},
+               fixture.AddMemory(access, 0x10f0));
+  fixture.PlanAndTrack();
+  const auto plan = ExtractResourcePlan(fixture.program);
+  Check(plan.info.images.size() == 1u &&
+            plan.descriptor_sources[plan.info.images[0].source].indirect_descriptor.has_value(),
+        "the workgroup image table was not tracked");
+  Check(plan.descriptor_sources[plan.info.images[0].source].indirect_descriptor->workgroup_axis == 2u,
+        "an image store through a V# table became a native array root");
+}
+
 void TestWaterfallImageTable() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
   const auto make = [](bool equality, bool scalar) {
@@ -486,7 +523,8 @@ void TestWaterfallImageTable() {
       memory.kind = ResourceKind::Image;
       memory.image_dimension = Decoder::ImageDimension::Dim2D;
       const auto value = fixture->Emit(ValueOpcode::ImageSampleRaw,
-          {image, sampler, fixture->ImageAddress()}, fixture->AddMemory(memory, 0x92cu), block);
+          {image, sampler, fixture->ImageAddress(), block == entry ? active : guard},
+          fixture->AddMemory(memory, 0x92cu), block);
       fixture->Emit(ValueOpcode::ReferenceU32,
           {fixture->Emit(ValueOpcode::CompositeExtractU32x4, {value, Value(0u)}, 0, block)}, 0, block);
     };
@@ -641,7 +679,7 @@ void TestGuardedDirectImageTable() {
     MemoryInfo memory;
     memory.kind = ResourceKind::Image;
     memory.image_dimension = Decoder::ImageDimension::Dim2D;
-    fixture.Emit(ValueOpcode::ImageSampleRaw, {image, sampler, fixture.ImageAddress()},
+    fixture.Emit(ValueOpcode::ImageSampleRaw, {image, sampler, fixture.ImageAddress(), Value(true)},
                  fixture.AddMemory(memory, 0x128));
     fixture.PlanAndTrack();
     const auto source = fixture.program.info.images[0].source;
@@ -989,7 +1027,7 @@ void TestBoundedComputeImageLoop() {
     sample.kind = ResourceKind::Image;
     sample.image_dimension = Decoder::ImageDimension::Dim2D;
     fixture.Emit(ValueOpcode::ImageSampleRaw,
-                 {image, sampler, fixture.ImageAddress()},
+                 {image, sampler, fixture.ImageAddress(), Value(true)},
                  fixture.AddMemory(sample, 0x29c));
     fixture.PlanAndTrack();
     const auto source = fixture.program.info.images[0].source;
@@ -1325,7 +1363,9 @@ void TestUniformizedMaterialImageKeys() {
     MemoryInfo image_memory;
     image_memory.kind = ResourceKind::Image;
     image_memory.image_dimension = Decoder::ImageDimension::Dim2D;
-    const auto sampled = fixture.Emit(ValueOpcode::ImageSampleRaw, {image, sampler, address},
+    const auto sampled = fixture.Emit(ValueOpcode::ImageSampleRaw,
+        {image, sampler, address,
+         variant == Variant::EmptyFirstEntry ? material_guard : sample_guard},
         fixture.AddMemory(image_memory, 0x1aecu), sample);
     if (first_lane) {
       const auto component = fixture.Emit(
@@ -1477,7 +1517,7 @@ void TestImageDescriptorFields() {
     memory.kind = ResourceKind::Image;
     memory.image_dimension = Decoder::ImageDimension::Dim2D;
     memory.image_r128 = r128;
-    fixture.Emit(ValueOpcode::ImageSampleRaw, {image, sampler, fixture.ImageAddress()},
+    fixture.Emit(ValueOpcode::ImageSampleRaw, {image, sampler, fixture.ImageAddress(), Value(true)},
                  fixture.AddMemory(memory, 0x80));
     fixture.PlanAndTrack();
     auto plan = ExtractResourcePlan(fixture.program);
@@ -1571,7 +1611,7 @@ void TestUniformScalarBufferImage() {
   sample.kind = ResourceKind::Image;
   sample.image_dimension = Decoder::ImageDimension::Dim2D;
   fixture.Emit(ValueOpcode::ImageSampleRaw,
-                {image, sampler, fixture.ImageAddress()}, fixture.AddMemory(sample, 0x228));
+                {image, sampler, fixture.ImageAddress(), Value(true)}, fixture.AddMemory(sample, 0x228));
   fixture.PlanAndTrack();
   const auto plan = ExtractResourcePlan(fixture.program);
 
@@ -1866,7 +1906,7 @@ void TestImagesSamplersAndAliases() {
     memory.kind = ResourceKind::Image;
     memory.image_dimension = Decoder::ImageDimension::Dim2D;
     memory.image_sample_flags = sample_flags;
-    fixture.Emit(ValueOpcode::ImageSampleRaw, {image, sampler, image_address},
+    fixture.Emit(ValueOpcode::ImageSampleRaw, {image, sampler, image_address, Value(true)},
                  fixture.AddMemory(memory, pc));
     return std::pair{image, sampler};
   };
@@ -1938,14 +1978,14 @@ void TestSampleAdjustSamplerScratch() {
   memory.image_dimension = Decoder::ImageDimension::Dim2D;
   memory.image_sample_flags = Decoder::ImageSampleFlagAdjust;
   fixture.Emit(ValueOpcode::ImageSampleRaw,
-               {image, sampler, fixture.ImageAddress()},
+               {image, sampler, fixture.ImageAddress(), Value(true)},
                fixture.AddMemory(memory, 0x1ec));
   // PPSA24156's zero border payload leaves the reserved scratch shift as
   // the entire DWORD after the frontend folds its OR with zero.
   const auto shift_sampler = fixture.Sampler(
       {Value(0x36u), Value(0xfff000u), Value(0x02500000u), scratch}, 0x200);
   fixture.Emit(ValueOpcode::ImageSampleRaw,
-               {image, shift_sampler, fixture.ImageAddress()},
+               {image, shift_sampler, fixture.ImageAddress(), Value(true)},
                fixture.AddMemory(memory, 0x200));
   fixture.PlanAndTrack();
   auto plan = ExtractResourcePlan(fixture.program);
@@ -1994,7 +2034,7 @@ void TestSampleAdjustSamplerScratch() {
     rejected_memory.image_dimension = Decoder::ImageDimension::Dim2D;
     rejected_memory.image_sample_flags = flags;
     rejected.Emit(ValueOpcode::ImageSampleRaw,
-                  {rejected_image, rejected_sampler, rejected.ImageAddress()},
+                  {rejected_image, rejected_sampler, rejected.ImageAddress(), Value(true)},
                   rejected.AddMemory(rejected_memory, 0x200));
 
     CheckFatal([&] { rejected.PlanAndTrack(); },
@@ -2112,7 +2152,7 @@ void TestGatherLodSamplerValidation() {
         fixture.Emit(ValueOpcode::ImageGatherRaw,
                      {fixture.Image(image_words), fixture.Sampler(sampler_words),
                       fixture.ImageAddress(), image_words[1], image_words[3],
-                      sampler_words[1], sampler_words[2]},
+                      sampler_words[1], sampler_words[2], Value(true)},
                      fixture.AddMemory(memory, i * 4));
       }
       fixture.PlanAndTrack();
@@ -2514,7 +2554,7 @@ ResourcePlan ConditionalSamplerPlan(bool diamond, bool reverse, bool reverse_phi
     sample.kind = ResourceKind::Image;
     sample.image_dimension = Decoder::ImageDimension::Dim2D;
     const auto result =
-        fixture.Emit(ValueOpcode::ImageSampleRaw, {image, sampler, address},
+        fixture.Emit(ValueOpcode::ImageSampleRaw, {image, sampler, address, Value(true)},
                      fixture.AddMemory(sample, 0x4d4));
     fixture.Emit(ValueOpcode::ReferenceU32,
                  {fixture.Emit(ValueOpcode::CompositeExtractU32x4,
@@ -2619,7 +2659,7 @@ void TestFiniteImagePhiCycle() {
   MemoryInfo memory;
   memory.kind = ResourceKind::Image;
   memory.image_dimension = Decoder::ImageDimension::Dim2D;
-  fixture.Emit(ValueOpcode::ImageSampleRaw, {image, sampler, fixture.ImageAddress()},
+  fixture.Emit(ValueOpcode::ImageSampleRaw, {image, sampler, fixture.ImageAddress(), Value(true)},
                fixture.AddMemory(memory, 4));
   fixture.PlanAndTrack();
   auto plan = ExtractResourcePlan(fixture.program);
@@ -2685,12 +2725,12 @@ void TestFiniteInlineSampler() {
     memory.kind = ResourceKind::Image;
     memory.image_dimension = Decoder::ImageDimension::Dim2D;
     if (format == F::k32Float)
-      fixture.Emit(ValueOpcode::ImageSampleRaw, {image, previous, fixture.ImageAddress()},
+      fixture.Emit(ValueOpcode::ImageSampleRaw, {image, previous, fixture.ImageAddress(), Value(true)},
                    fixture.AddMemory(memory, 0x440u));
-    fixture.Emit(ValueOpcode::ImageSampleRaw, {image, sampler, fixture.ImageAddress()},
+    fixture.Emit(ValueOpcode::ImageSampleRaw, {image, sampler, fixture.ImageAddress(), Value(true)},
                  fixture.AddMemory(memory, 0x1dd0u));
     if (format == F::k32Float)
-      fixture.Emit(ValueOpcode::ImageSampleRaw, {image, direct, fixture.ImageAddress()},
+      fixture.Emit(ValueOpcode::ImageSampleRaw, {image, direct, fixture.ImageAddress(), Value(true)},
                    fixture.AddMemory(memory, 0x1dd8u));
   }
   fixture.PlanAndTrack();
@@ -2764,7 +2804,7 @@ void TestFiniteInlineSampler() {
     memory.kind = ResourceKind::Image;
     memory.image_dimension = Decoder::ImageDimension::Dim2D;
     memory.image_sample_flags = flags;
-    adjusted.Emit(ValueOpcode::ImageSampleRaw, {image, shared, adjusted.ImageAddress()},
+    adjusted.Emit(ValueOpcode::ImageSampleRaw, {image, shared, adjusted.ImageAddress(), Value(true)},
                   adjusted.AddMemory(memory, 0x1dd0u));
   }
   CheckFatal([&] { adjusted.PlanAndTrack(); }, "not a valid runtime value",
@@ -2817,7 +2857,7 @@ void TestFiniteImageBitScanSentinel() {
     MemoryInfo memory;
     memory.kind = ResourceKind::Image;
     memory.image_dimension = Decoder::ImageDimension::Dim2D;
-    fixture.Emit(ValueOpcode::ImageSampleRaw, {image, sampler, fixture.ImageAddress()},
+    fixture.Emit(ValueOpcode::ImageSampleRaw, {image, sampler, fixture.ImageAddress(), Value(true)},
                  fixture.AddMemory(memory, 4));
     if (!nonzero) {
       CheckFatal([&] { fixture.PlanAndTrack(); }, "not a valid runtime value",
@@ -3720,6 +3760,7 @@ int main() {
     Run("dynamic storage mips", TestDynamicStorageMipTracking);
     Run("invariant indirect images", TestInvariantIndirectImageMaterialization);
     Run("bounded image view eligibility", TestBoundedImageViewEligibility);
+    Run("workgroup image table store", TestWorkgroupImageTableStore);
     Run("waterfall image table", TestWaterfallImageTable);
     Run("guarded direct image table", TestGuardedDirectImageTable);
     Run("bounded compute image loop", TestBoundedComputeImageLoop);

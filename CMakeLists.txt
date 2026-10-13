@@ -40,6 +40,11 @@ if (NOT (WIN32 OR LINUX OR APPLE))
     message(FATAL_ERROR "only Windows, Linux, and macOS builds are supported")
 endif()
 
+if(WIN32)
+	# Prevent Windows headers from defining min/max macros in all targets.
+	add_compile_definitions(NOMINMAX)
+endif()
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -298,28 +303,27 @@ list(APPEND kyty_emulator_src "${fault_buffer_shader_header}")
 list(APPEND kyty_emulator_src ${gpu_tiler_shader_headers})
 
 set(gpu_blit_generated_dir "${PROJECT_BINARY_DIR}/gpu_blit_shaders")
-set(gpu_blit_shader_sources
-	"${gpu_tiler_shader_dir}/gpu_blit_fs_triangle.vert"
-	"${gpu_tiler_shader_dir}/gpu_blit_color_to_ms_depth.frag"
-	"${gpu_tiler_shader_dir}/gpu_video_out_overlay.frag"
-)
-foreach(shader_source IN LISTS gpu_blit_shader_sources)
-	get_filename_component(shader_name "${shader_source}" NAME_WE)
+function(add_gpu_blit_shader shader_name shader_file)
+	set(shader_source "${gpu_tiler_shader_dir}/${shader_file}")
 	set(shader_spv "${gpu_blit_generated_dir}/${shader_name}.spv")
 	set(shader_header "${gpu_blit_generated_dir}/${shader_name}_spv.h")
 	string(TOUPPER "${shader_name}_SPV" shader_symbol)
 	add_custom_command(
 		OUTPUT "${shader_header}"
 		COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_blit_generated_dir}"
-		COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+		COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os ${ARGN}
 		        "-I${gpu_tiler_shader_dir}" -o "${shader_spv}" "${shader_source}"
 		COMMAND ${CMAKE_COMMAND} -DINPUT=${shader_spv} -DOUTPUT=${shader_header}
 		        -DSYMBOL=${shader_symbol} -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
 		DEPENDS "${shader_source}"
 		VERBATIM
 	)
-	list(APPEND gpu_blit_shader_headers "${shader_header}")
-endforeach()
+	set(gpu_blit_shader_headers ${gpu_blit_shader_headers} "${shader_header}" PARENT_SCOPE)
+endfunction()
+add_gpu_blit_shader(gpu_blit_fs_triangle gpu_blit_fs_triangle.vert)
+add_gpu_blit_shader(gpu_blit_color_to_ms_depth gpu_blit_color_to_ms_depth.frag)
+add_gpu_blit_shader(gpu_video_out_overlay gpu_video_out_overlay.frag)
+add_gpu_blit_shader(gpu_imgui_hdr gpu_video_out_overlay.frag -DIMGUI_HDR=1)
 list(APPEND kyty_emulator_src ${gpu_blit_shader_headers})
 
 list(APPEND kyty_emulator_src
@@ -399,8 +403,98 @@ add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
 )
-target_link_libraries(scalar_provenance_tests fmt::fmt)
+target_link_libraries(scalar_provenance_tests fmt::fmt xbyak::xbyak)
 target_include_directories(scalar_provenance_tests PRIVATE ${inc_headers})
+
+add_executable(device_suitability_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/DeviceSuitabilityTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/window/deviceSuitability.cpp"
+)
+target_include_directories(device_suitability_tests PRIVATE ${inc_headers})
+
+add_executable(write_heat_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/WriteHeatTests.cpp"
+)
+target_include_directories(write_heat_tests PRIVATE ${inc_headers})
+
+add_executable(guest_write_log_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/GuestWriteLogTests.cpp"
+)
+target_include_directories(guest_write_log_tests PRIVATE ${inc_headers})
+
+add_executable(copy_workers_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/CopyWorkersTests.cpp"
+)
+target_include_directories(copy_workers_tests PRIVATE ${inc_headers})
+if(LINUX)
+	target_link_libraries(copy_workers_tests Threads::Threads)
+endif()
+
+add_executable(perf_counters_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/PerfCountersTests.cpp"
+)
+target_include_directories(perf_counters_tests PRIVATE ${inc_headers})
+
+add_executable(readback_plan_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ReadbackPlanTests.cpp"
+)
+target_include_directories(readback_plan_tests PRIVATE ${inc_headers})
+
+add_executable(pipeline_use_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/PipelineUseTests.cpp"
+)
+target_include_directories(pipeline_use_tests PRIVATE ${inc_headers})
+
+add_executable(submit_plan_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/SubmitPlanTests.cpp"
+)
+target_include_directories(submit_plan_tests PRIVATE ${inc_headers})
+
+add_executable(cache_collection_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/CacheCollectionTests.cpp"
+)
+target_include_directories(cache_collection_tests PRIVATE ${inc_headers})
+
+add_executable(buffer_chunk_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/BufferChunkTests.cpp"
+)
+target_include_directories(buffer_chunk_tests PRIVATE ${inc_headers})
+
+add_executable(depth_snapshot_plan_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/DepthSnapshotPlanTests.cpp"
+)
+target_include_directories(depth_snapshot_plan_tests PRIVATE ${inc_headers})
+
+add_executable(video_out_resolution_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/VideoOutResolutionTests.cpp"
+)
+target_include_directories(video_out_resolution_tests PRIVATE ${inc_headers})
+
+add_executable(bench_script_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/BenchScriptTests.cpp"
+)
+target_include_directories(bench_script_tests PRIVATE ${inc_headers})
+
+add_executable(queue_commits_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/QueueCommitsTests.cpp"
+)
+target_include_directories(queue_commits_tests PRIVATE ${inc_headers})
+
+add_executable(cache_folder_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/CacheFolderTests.cpp"
+)
+target_include_directories(cache_folder_tests PRIVATE ${inc_headers})
+
+add_executable(file_lock_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/FileLockTests.cpp"
+)
+target_include_directories(file_lock_tests PRIVATE ${inc_headers})
+target_link_libraries(file_lock_tests common)
+
+add_executable(host_lowering_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/HostLoweringTests.cpp"
+)
+target_include_directories(host_lowering_tests PRIVATE ${inc_headers})
 
 add_executable(page_manager_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/PageManagerTests.cpp"
@@ -438,6 +532,17 @@ add_executable(lru_cache_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(lru_cache_tests PRIVATE ${inc_headers})
 
+add_executable(soft_float64_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/SoftFloat64Tests.cpp"
+)
+target_include_directories(soft_float64_tests PRIVATE ${inc_headers})
+
+add_executable(program_list_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ProgramListTests.cpp"
+)
+target_link_libraries(program_list_tests fmt::fmt)
+target_include_directories(program_list_tests PRIVATE ${inc_headers})
+
 add_executable(ime_dialog_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ImeDialogTests.cpp"
 	"${KYTY_SOURCE_DIR}/libs/imeCommon.cpp"
@@ -467,7 +572,7 @@ add_executable(resource_materialization_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
 )
-target_link_libraries(resource_materialization_tests fmt::fmt)
+target_link_libraries(resource_materialization_tests fmt::fmt xbyak::xbyak)
 target_include_directories(resource_materialization_tests PRIVATE ${inc_headers})
 
 add_executable(resource_tracking_tests EXCLUDE_FROM_ALL
@@ -480,7 +585,7 @@ add_executable(resource_tracking_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ShaderInfoCollection.cpp"
 )
-target_link_libraries(resource_tracking_tests fmt::fmt)
+target_link_libraries(resource_tracking_tests fmt::fmt xbyak::xbyak)
 target_include_directories(resource_tracking_tests PRIVATE ${inc_headers})
 
 add_executable(audio_out2_port_tests EXCLUDE_FROM_ALL
@@ -508,8 +613,40 @@ add_executable(pad_haptics_tests EXCLUDE_FROM_ALL
 target_link_libraries(pad_haptics_tests common fmt::fmt SDL3::SDL3-static opus)
 target_include_directories(pad_haptics_tests PRIVATE ${inc_headers})
 
+add_executable(image_readback_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ImageReadbackTests.cpp"
+)
+target_include_directories(image_readback_tests PRIVATE ${inc_headers})
+
+add_executable(const_ram_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ConstRamTests.cpp"
+)
+target_include_directories(const_ram_tests PRIVATE ${inc_headers})
+
+add_executable(overlay_queue_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/OverlayQueueTests.cpp"
+)
+target_include_directories(overlay_queue_tests PRIVATE ${inc_headers})
+
+add_executable(pad_input_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/PadInputTests.cpp"
+	"${KYTY_SOURCE_DIR}/libs/padInput.cpp"
+)
+target_include_directories(pad_input_tests PRIVATE ${inc_headers})
+
+add_executable(gamepad_quit_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/GamepadQuitTests.cpp"
+)
+target_include_directories(gamepad_quit_tests PRIVATE ${inc_headers})
+
+add_executable(player_seats_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/PlayerSeatsTests.cpp"
+)
+target_include_directories(player_seats_tests PRIVATE ${inc_headers})
+
 add_executable(controller_settings_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ControllerSettingsTests.cpp"
+	"${KYTY_SOURCE_DIR}/libs/padInput.cpp"
 )
 target_link_libraries(controller_settings_tests common fmt::fmt SDL3::SDL3-static)
 target_include_directories(controller_settings_tests PRIVATE ${inc_headers})
@@ -563,6 +700,15 @@ add_executable(image_page_table_tests EXCLUDE_FROM_ALL
 target_link_libraries(image_page_table_tests common fmt::fmt)
 target_include_directories(image_page_table_tests PRIVATE ${inc_headers})
 
+add_executable(metadata_fill_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/MetadataFillTests.cpp"
+)
+target_include_directories(metadata_fill_tests PRIVATE ${inc_headers})
+add_executable(fence_retirement_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/FenceRetirementTests.cpp"
+)
+target_include_directories(fence_retirement_tests PRIVATE ${inc_headers})
+
 add_kyty_full_emulator_test(shader_recompiler_compute_tests "${KYTY_TESTS_DIR}/ShaderRecompilerComputeTests.cpp")
 
 set(gpu_test_generated_dir "${PROJECT_BINARY_DIR}/gpu_test_shaders")
@@ -609,10 +755,34 @@ if(BUILD_TESTING)
 	add_test(NAME emulator_present_mode_invalid
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --present-mode Invalid)
 	set_tests_properties(emulator_present_mode_invalid PROPERTIES WILL_FAIL TRUE)
+	add_test(NAME emulator_video_out_resolution_cli
+	         COMMAND $<TARGET_FILE:kyty_emulator> --help --video-out-resolution Uhd)
+	add_test(NAME emulator_video_out_resolution_invalid
+	         COMMAND $<TARGET_FILE:kyty_emulator> --help --video-out-resolution Invalid)
+	set_tests_properties(emulator_video_out_resolution_invalid PROPERTIES WILL_FAIL TRUE)
 	add_test(NAME ime_dialog COMMAND $<TARGET_FILE:ime_dialog_tests>)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
+	add_test(NAME device_suitability COMMAND $<TARGET_FILE:device_suitability_tests>)
+	add_test(NAME host_lowering COMMAND $<TARGET_FILE:host_lowering_tests>)
+	add_test(NAME write_heat COMMAND $<TARGET_FILE:write_heat_tests>)
+	add_test(NAME perf_counters COMMAND $<TARGET_FILE:perf_counters_tests>)
+	add_test(NAME guest_write_log COMMAND $<TARGET_FILE:guest_write_log_tests>)
+	add_test(NAME copy_workers COMMAND $<TARGET_FILE:copy_workers_tests>)
+	add_test(NAME readback_plan COMMAND $<TARGET_FILE:readback_plan_tests>)
+	add_test(NAME pipeline_use COMMAND $<TARGET_FILE:pipeline_use_tests>)
+	add_test(NAME submit_plan COMMAND $<TARGET_FILE:submit_plan_tests>)
+	add_test(NAME cache_collection COMMAND $<TARGET_FILE:cache_collection_tests>)
+	add_test(NAME buffer_chunk COMMAND $<TARGET_FILE:buffer_chunk_tests>)
+	add_test(NAME depth_snapshot_plan COMMAND $<TARGET_FILE:depth_snapshot_plan_tests>)
+	add_test(NAME video_out_resolution COMMAND $<TARGET_FILE:video_out_resolution_tests>)
+	add_test(NAME queue_commits COMMAND $<TARGET_FILE:queue_commits_tests>)
+	add_test(NAME bench_script COMMAND $<TARGET_FILE:bench_script_tests>)
+	add_test(NAME cache_folder COMMAND $<TARGET_FILE:cache_folder_tests>)
+	add_test(NAME file_lock COMMAND $<TARGET_FILE:file_lock_tests>)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
+	add_test(NAME metadata_fill COMMAND $<TARGET_FILE:metadata_fill_tests>)
+	add_test(NAME fence_retirement COMMAND $<TARGET_FILE:fence_retirement_tests>)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
 	add_test(NAME archive_file COMMAND $<TARGET_FILE:archive_file_tests>)
@@ -620,6 +790,8 @@ if(BUILD_TESTING)
 	add_test(NAME avplayer_file COMMAND $<TARGET_FILE:avplayer_file_tests>)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
 	add_test(NAME lru_cache COMMAND $<TARGET_FILE:lru_cache_tests>)
+	add_test(NAME program_list COMMAND $<TARGET_FILE:program_list_tests>)
+	add_test(NAME soft_float64 COMMAND $<TARGET_FILE:soft_float64_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
@@ -631,6 +803,12 @@ if(BUILD_TESTING)
 	add_test(NAME ngs2_sampler COMMAND $<TARGET_FILE:ngs2_sampler_tests>)
 	add_test(NAME pad_haptics COMMAND $<TARGET_FILE:pad_haptics_tests>)
 	add_test(NAME controller_settings COMMAND $<TARGET_FILE:controller_settings_tests>)
+	add_test(NAME pad_input COMMAND $<TARGET_FILE:pad_input_tests>)
+	add_test(NAME player_seats COMMAND $<TARGET_FILE:player_seats_tests>)
+	add_test(NAME gamepad_quit COMMAND $<TARGET_FILE:gamepad_quit_tests>)
+	add_test(NAME image_readback COMMAND $<TARGET_FILE:image_readback_tests>)
+	add_test(NAME overlay_queue COMMAND $<TARGET_FILE:overlay_queue_tests>)
+	add_test(NAME const_ram COMMAND $<TARGET_FILE:const_ram_tests>)
 	add_test(NAME save_data_memory COMMAND $<TARGET_FILE:save_data_memory_tests>)
 	add_test(NAME png_enc COMMAND $<TARGET_FILE:png_enc_tests>)
 	add_test(NAME ces COMMAND $<TARGET_FILE:ces_tests>)
@@ -688,7 +866,26 @@ if(BUILD_TESTING)
 		ime_dialog_tests
 		shader_cfg_tests
 		scalar_provenance_tests
+		device_suitability_tests
+		host_lowering_tests
+		write_heat_tests
+		perf_counters_tests
+		guest_write_log_tests
+		copy_workers_tests
+		readback_plan_tests
+		pipeline_use_tests
+		submit_plan_tests
+		cache_collection_tests
+		buffer_chunk_tests
+		depth_snapshot_plan_tests
+		video_out_resolution_tests
+		queue_commits_tests
+		bench_script_tests
+		cache_folder_tests
+		file_lock_tests
 		image_page_table_tests
+		metadata_fill_tests
+		fence_retirement_tests
 		memory_tracker_tests
 		page_manager_tests
 		archive_file_tests
@@ -696,6 +893,8 @@ if(BUILD_TESTING)
 		avplayer_file_tests
 		bit_array_tests
 		lru_cache_tests
+		program_list_tests
+		soft_float64_tests
 		shader_vertex_metadata_tests
 		resource_materialization_tests
 		resource_tracking_tests
@@ -709,6 +908,12 @@ if(BUILD_TESTING)
 		ngs2_sampler_tests
 		pad_haptics_tests
 		controller_settings_tests
+		pad_input_tests
+		player_seats_tests
+		gamepad_quit_tests
+		image_readback_tests
+		overlay_queue_tests
+		const_ram_tests
 		save_data_memory_tests
 		png_enc_tests
 		ces_tests

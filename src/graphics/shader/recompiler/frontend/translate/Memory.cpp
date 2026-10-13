@@ -687,7 +687,8 @@ void Translator::IMAGE_SAMPLE(const Decoder::Instruction& inst) {
 	const auto resource = GetImageResource(memory);
 	const auto sampler  = GetSamplerResource(memory);
 	const auto address  = MakeImageAddress(inst, MemorySourceAt(inst, 0));
-	const auto result   = ir.Emit(IR::ValueOpcode::ImageSampleRaw, {resource, sampler, address},
+	const auto result   = ir.Emit(IR::ValueOpcode::ImageSampleRaw,
+	                              {resource, sampler, address, ir.GetExec()},
 	                              AddMemoryInfo(memory, inst.pc));
 	const bool dref     = (memory.image_sample_flags & Decoder::ImageSampleFlagCompare) != 0u;
 	if (dref && memory.data_bits != 16u) {
@@ -714,7 +715,7 @@ void Translator::IMAGE_GATHER(const Decoder::Instruction& inst) {
 	     has_lod ? resource.Instruction()->Arg(1) : IR::Value(0u),
 	     has_lod ? resource.Instruction()->Arg(3) : IR::Value(0u),
 	     has_lod ? sampler.Instruction()->Arg(1) : IR::Value(0u),
-	     has_lod ? sampler.Instruction()->Arg(2) : IR::Value(0u)},
+	     has_lod ? sampler.Instruction()->Arg(2) : IR::Value(0u), ir.GetExec()},
 	    AddMemoryInfo(memory, inst.pc));
 	for (uint32_t index = 0; index < memory.data_dwords; index++) {
 		WriteOperand(OffsetOperand(inst.dst, index),
@@ -887,6 +888,7 @@ void Translator::DS_SWIZZLE_B32(const Decoder::Instruction& inst) {
 void Translator::DS_ORDERED_COUNT(const Decoder::Instruction& inst) {
 	// Approximate ordered counting with one GDS atomic per wave. Wave-launch ordering and
 	// release/done synchronization are not emulated.
+	program.uses_ordered_count = true;
 	const auto memory = MemoryInfoFromDecoded(inst);
 	const auto m0 = ir.GetM0();
 	auto address = ir.BitwiseAnd(ir.ShiftRightLogical(m0, IR::U32(IR::Value(16u))),
