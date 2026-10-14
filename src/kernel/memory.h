@@ -5,6 +5,10 @@
 #include "common/common.h"
 #include "common/virtualMemory.h"
 
+#include <cstdint>
+#include <utility>
+#include <vector>
+
 namespace Libs::Graphics {
 class RenderContext;
 enum class PageFaultAccess;
@@ -116,11 +120,41 @@ int UnmapAmmMemory(uint64_t vaddr, size_t size);
 bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
+// Where the backing store keeps [vaddr, vaddr + size) when one mapping holds it, else null. The
+// pointer stays readable for the emulator's lifetime and reads what TryReadBacking() reads.
+[[nodiscard]] const void* FindBackingPointer(uint64_t vaddr, uint64_t size);
+bool                   TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size);
+// GPU threads: whether a direct load of the range may fault because the GPU owns its pages.
+bool                   MayFaultOnGpuRead(uint64_t vaddr, uint64_t size);
+// Any thread, lock-free: whether a tracking region the range touches may hold bytes the GPU
+// wrote that the backing store does not have yet.
+bool                   MayBeGpuWritten(uint64_t vaddr, uint64_t size);
+// GPU threads: reads [vaddr, vaddr + size) from the backing store when its pages are GPU-owned
+// but the GPU wrote none of its bytes, where a direct load would fault and read back everything
+// the GPU has queued. False when the caller should load the bytes directly.
+bool                   TryReadAroundGpuWrites(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   CopySparseMemory(uint64_t vaddr, void* data, uint64_t size);
+// Whether TryReadBacking or TryReadSparseBacking can read the whole range.
+bool                   IsBackingReadable(uint64_t vaddr, uint64_t size);
+// Changes whenever backing is mapped or unmapped, or a PRT aperture changes: an unchanged value
+// means IsBackingReadable still answers as before.
+[[nodiscard]] uint64_t BackingEpoch() noexcept;
+// Appends the range (start, size) of every change after BackingEpoch() was `epoch`, oldest
+// first: IsBackingReadable answers as before for ranges none of them overlaps. False when the
+// history no longer reaches back that far.
+[[nodiscard]] bool BackingChangesSince(uint64_t epoch,
+                                       std::vector<std::pair<uint64_t, uint64_t>>& changes);
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
-void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
+// Not noexcept: under a Common::SoftExitScope its failure throws to the scope's owner.
+void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
+// For a fault in a guest range briefly unmapped while the emulator replaced its mapping (MAP_FIXED
+// over a mapping, or a Windows file view split by a partial unmap): waits until it is mapped again
+// and returns the range's id. 0 for any other fault.
+[[nodiscard]] uint64_t WaitForTransientUnmap(uint64_t fault_vaddr) noexcept;
+// Whether such a fault can be retried (false once the same page keeps faulting).
+[[nodiscard]] bool RetryTransientUnmapFault(uint64_t fault_vaddr, uint64_t window) noexcept;
 void                   InstallGpuResources(Graphics::RenderContext* renderer) noexcept;
 [[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 

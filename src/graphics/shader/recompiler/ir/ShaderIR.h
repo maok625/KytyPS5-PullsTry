@@ -91,6 +91,15 @@ struct MemoryInfo {
 		                        opcode == ValueOpcode::LoadBufferU32x3 ||
 		                        opcode == ValueOpcode::LoadBufferU32x4);
 	}
+	// Raw DWORD stores through a V# selected at runtime from a descriptor table.
+	[[nodiscard]] bool SupportsIndirectBufferStore(ValueOpcode opcode) const {
+		return !formatted && !typed && data_bits == 32u &&
+		       (opcode == ValueOpcode::StoreBufferU32 || opcode == ValueOpcode::StoreBufferU32x2 ||
+		        opcode == ValueOpcode::StoreBufferU32x3 || opcode == ValueOpcode::StoreBufferU32x4);
+	}
+	[[nodiscard]] bool SupportsIndirectBufferAccess(ValueOpcode opcode) const {
+		return SupportsIndirectBufferLoad(opcode) || SupportsIndirectBufferStore(opcode);
+	}
 
 	bool operator==(const MemoryInfo& other) const = default;
 };
@@ -130,6 +139,10 @@ struct BufferResource {
 	uint32_t               indirect_mapping_offset    = 0;
 	uint32_t               indirect_search_iterations = 0;
 	std::vector<uint32_t>  indirect_resources;
+	// This buffer is a table of V#s (16-byte entries starting at indirect_table_offset) that
+	// selects the targets of IndirectBuffer stores; the host caches every entry it names.
+	bool                   indirect_write_table  = false;
+	uint32_t               indirect_table_offset = 0;
 
 	bool operator==(const BufferResource& other) const = default;
 };
@@ -140,6 +153,7 @@ constexpr uint32_t ShaderImageIdentitySwizzle = 0x00000facu;
 
 struct ImageResource {
 	static constexpr uint32_t NoIndirectImage = UINT32_MAX;
+	static constexpr uint32_t NoImageTable    = UINT32_MAX;
 
 	uint32_t                      source            = 0;
 	uint32_t                      descriptor_index  = UINT32_MAX;
@@ -162,6 +176,17 @@ struct ImageResource {
 	uint32_t                      indirect_mapping_offset   = 0;
 	uint32_t                      indirect_search_iterations = 0;
 	std::vector<uint32_t>         indirect_resources;
+	// A root sampling a GPU-indexed T# table (bindless): the key selects table entry
+	// key & table_entry_mask, flattened_srt[table_mapping_offset] holds the entry count and
+	// then one slot per entry, and the slot indexes table_capacity descriptors of this image's
+	// binding that the host fills from the table (slot 0 is a null image).
+	uint32_t                      table                = NoImageTable;
+	uint32_t                      table_capacity       = 0;
+	uint32_t                      table_mapping_offset = 0;
+	uint32_t                      table_entry_mask     = 0;
+	// First element of the table's descriptors in this image's binding, after the binding's
+	// resources; roots of one table and binding share them.
+	uint32_t                      table_descriptor_base = UINT32_MAX;
 
 	bool operator==(const ImageResource& other) const = default;
 };
@@ -194,7 +219,8 @@ enum class TessellationAttribute {
 	ControlOutput,
 	EvaluationInput,
 	PatchOutput,
-	Factor
+	Factor,
+	PatchInput
 };
 
 enum class StageInputKind {
@@ -437,6 +463,38 @@ DescriptorBindingForImage(const ImageResource& image) {
 	return static_cast<DescriptorBindingKind>(base + dimension);
 }
 
+// The first table descriptor of each image (UINT32_MAX without a bindless table): the
+// descriptors of a table follow the resources of its roots' binding, whose count grows by the
+// table capacity; roots of one table and binding share them.
+[[nodiscard]] inline std::vector<uint32_t> AllocateImageTableDescriptors(
+    const std::vector<ImageResource>& images,
+    std::array<uint32_t, static_cast<size_t>(DescriptorBindingKind::Count)>& counts) {
+	std::vector<uint32_t> bases(images.size(), UINT32_MAX);
+	for (size_t i = 0; i < images.size(); i++) {
+		const auto& image = images[i];
+		if (image.table_capacity == 0u) {
+			continue;
+		}
+		const auto kind = *DescriptorBindingForImage(image);
+		for (size_t j = 0; j < i && bases[i] == UINT32_MAX; j++) {
+			if (bases[j] != UINT32_MAX && images[j].table == image.table &&
+			    DescriptorBindingForImage(images[j]) == kind) {
+				if (images[j].table_capacity != image.table_capacity) {
+					EXIT("shader binding layout failed: image table %u has two capacities",
+					     image.table);
+				}
+				bases[i] = bases[j];
+			}
+		}
+		if (bases[i] == UINT32_MAX) {
+			auto& count = counts[static_cast<size_t>(kind)];
+			bases[i]    = count;
+			count += image.table_capacity;
+		}
+	}
+	return bases;
+}
+
 struct Bindings {
 	std::array<uint32_t, static_cast<size_t>(DescriptorBindingKind::Count)> descriptor_counts {};
 	uint64_t descriptor_mask = 0;
@@ -474,11 +532,37 @@ struct ShaderInfo {
 	std::vector<StageOutput>         outputs;
 	std::vector<uint32_t>            user_data_registers;
 	uint64_t                        live_buffers = 0;
+	// User-data registers holding the low dword of a 64-bit base address that DMA (FLAT/global)
+	// accesses offset from; the next register holds the high dword.
+	std::vector<uint32_t>            dma_base_registers;
+	// The guest memory DMA reads, when every DMA access is a read whose address is a user-data
+	// base pair plus an offset with known possible bits (see DmaFootprint).
+	struct DmaWindow {
+		// Bytes [base + first, base + last) from the base in registers base_register and +1.
+		uint32_t base_register = 0;
+		int64_t  first         = 0;
+		uint64_t last          = 0;
+
+		bool operator==(const DmaWindow& other) const = default;
+	};
+	// V#s read from base + immediate + offset, for every offset whose set bits lie within
+	// offset_bits; the shader reads buffer memory through them.
+	struct DmaDescriptorTable {
+		uint32_t base_register = 0;
+		int64_t  immediate     = 0;
+		uint32_t offset_bits   = 0;
+
+		bool operator==(const DmaDescriptorTable& other) const = default;
+	};
+	std::vector<DmaWindow>           dma_windows;
+	std::vector<DmaDescriptorTable>  dma_tables;
 	std::array<uint8_t, 32>          vertex_fetch_components {};
 	int32_t                          vertex_offset_sgpr = -1;
 	int32_t                          instance_offset_sgpr = -1;
 	bool                            has_bitwise_xor               = false;
 	bool                            uses_dma                      = false;
+	// dma_windows and dma_tables hold everything DMA can read (only with uses_dma).
+	bool                            dma_bounded                   = false;
 	bool                            uses_swizzle                  = false;
 	bool                            uses_lds                      = false;
 	bool                            uses_gds                      = false;
@@ -537,6 +621,10 @@ struct DescriptorSource {
 		bool     indexed_store = false;
 		bool     signed_count = false;
 		uint32_t workgroup_axis  = UINT32_MAX;
+		// The table entry is at ((key * table_stride) & table_mask) + table_offset.
+		uint32_t table_mask      = UINT32_MAX;
+		// A bindless T# table: every table entry is a candidate.
+		bool     table_array     = false;
 		Value    key_count;
 		// First selector index, or first descriptor key for a direct or bitmap range.
 		Value                 selector_first;
@@ -580,12 +668,28 @@ struct CompiledShaderInfo {
 	bool                          has_address_writes  = false;
 	ShaderInfo                    info;
 	Bindings                      bindings;
+	// For each flat SRT slot, the written info.buffers that a store or atomic of the shader
+	// may update before a read of that slot in program order.
+	std::vector<std::vector<uint32_t>> srt_reads_after_buffer_writes;
+	// The same for each scalar load the shader issues itself, by memory-info index.
+	std::vector<std::vector<uint32_t>> raw_reads_after_buffer_writes;
 };
+
+// Whether a write of the shader to a buffer (an info.buffers index) can be visible to one of
+// its specialization reads. A read that a flattened scalar load made before any write to that
+// buffer in program order is not: the shader consumes the value from the flattened SRT, and
+// each wave performs that load before its own writes, so the dispatch-time snapshot is a value
+// the load observes on hardware.
+bool SpecializationReadFollowsBufferWrite(const CompiledShaderInfo& program,
+                                          const ResourceSnapshot& resources, size_t read,
+                                          uint32_t buffer);
 
 struct UniformFillPlan {
 	UniformFill          fill;
 	std::array<Value, 4> values;
 };
+
+struct CompiledSrtPlan;
 
 // Resource analysis retained by the shader cache. It owns immutable descriptor/SRT,
 // condition and fill values without translated blocks, plus reusable evaluation scratch.
@@ -626,6 +730,11 @@ struct ResourcePlan {
 	bool                                capture_specialization_reads = false;
 	bool                                srt_plan_complete          = false;
 	bool                                resource_tracking_complete = false;
+	// Flattened evaluation program, built on the first refresh (null: SrtWalker evaluates).
+	// The plan's values must not change after that refresh. Kept next to the flags that
+	// every refresh reads.
+	mutable bool                                   compiled_srt_built = false;
+	mutable std::shared_ptr<const CompiledSrtPlan> compiled_srt;
 	ShaderInfo                          info;
 	UniformFillPlan                     uniform_fill;
 	std::unique_ptr<Xbyak::CodeGenerator> srt_code;
@@ -671,6 +780,9 @@ uint32_t StorageBufferElementBits(const Program& program, const MemoryInfo& memo
 
 std::string ProgramToString(const Program& program);
 bool        HasShaderMemoryWrites(const Program& program);
+// raw (optional) receives the same per memory-info index of the shader's own scalar loads.
+std::vector<std::vector<uint32_t>> SrtReadsAfterBufferWrites(
+    const Program& program, std::vector<std::vector<uint32_t>>* raw = nullptr);
 
 void  ValidateProgram(const Program& program, bool require_ssa);
 void  ResolveControlFlowIdentities(Program& program);

@@ -8,17 +8,27 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cstdio>
 #include <fmt/format.h>
 #include <functional>
 #include <numeric>
+#include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
 
 constexpr uint64_t AddressMask            = 0x0000ffffffffffffull;
+// Keys an indirect descriptor mapping reserves room for at least (see MaterializeIndirectDescriptor()).
+constexpr size_t MinIndirectMappingCapacity = 8u;
+// See SetComputeIndirectFloors().
+std::atomic<size_t> g_compute_indirect_keys {MinIndirectMappingCapacity};
+std::atomic<size_t> g_compute_indirect_images {1u};
+// Set by SetComputeIndirectFloors(): without it mappings and images keep their exact counts.
+std::atomic<bool> g_stable_indirect_layouts {false};
 
 bool SpecializationFail(std::string_view message) {
 	std::fprintf(stderr, "shader resource specialization failed: %.*s\n",
@@ -251,11 +261,11 @@ bool IsBoundedDescriptorTable(const ResourcePlan& program,
 	       indirect.workgroup_axis == UINT32_MAX && table != nullptr && table->dword_count == 4u;
 }
 
-template <typename Specialization, typename Normalize>
+template <typename Specialization, typename Normalize, typename Walker>
 bool MaterializeIndirectDescriptor(const ResourcePlan&                         program,
                                    const DescriptorSource::IndirectDescriptor& indirect,
                                    uint32_t resource_index, uint32_t dword_count,
-                                   const SrtRuntime& runtime, SrtWalker& clean,
+                                   const SrtRuntime& runtime, Walker& clean,
                                    ResourceSnapshot&             snapshot,
                                    std::vector<DescriptorValue>& descriptors,
                                    std::vector<Specialization>&  specializations,
@@ -556,7 +566,19 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 
 	const auto mapping_offset = snapshot.flattened_srt.size();
 	const auto key_count = sources.empty() ? keys.size() : sources.size();
-	snapshot.flattened_srt.resize(mapping_offset + 1u + key_count * 2u);
+	// The mapping's layout is part of the shader permutation (its offset in the flattened SRT
+	// and the number of search steps), while the number of keys follows guest data from dispatch
+	// to dispatch (GTA V's ray tracing shader saw dozens of permutations, each a multi-second
+	// pipeline compile). Reserve room for a power-of-two number of keys instead: the shader
+	// searches the runtime count, and later mappings keep their offsets until a count crosses a
+	// power of two.
+	// Compute shaders can keep one layout for more keys (see SetComputeIndirectFloors()).
+	const bool stable_layout = g_stable_indirect_layouts.load(std::memory_order_relaxed);
+	const auto key_capacity  = !stable_layout ? key_count : std::max<size_t>(
+	    program.stage == ShaderType::Compute ? g_compute_indirect_keys.load(std::memory_order_relaxed)
+	                                         : MinIndirectMappingCapacity,
+	    std::bit_ceil(key_count));
+	snapshot.flattened_srt.resize(mapping_offset + 1u + key_capacity * 2u);
 	snapshot.flattened_srt[mapping_offset] = static_cast<uint32_t>(key_count);
 	for (uint32_t entry = 0; entry < key_count; ++entry) {
 		const auto key = sources.empty() ? keys[entry] : entry;
@@ -586,15 +608,173 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 	if (descriptors.size() == children_begin) {
 		snapshot.flattened_srt.resize(mapping_offset);
 	} else {
+		if (std::is_same_v<Specialization, ResourceSpecialization::Image> && stable_layout) {
+			// The same for the distinct T#s: pad them with copies of the last one, which no key
+			// selects, so that with the root they are a power of two (at least 8 for compute).
+			const auto children = descriptors.size() - children_begin;
+			const auto total    = std::max<size_t>(
+                program.stage == ShaderType::Compute
+                    ? g_compute_indirect_images.load(std::memory_order_relaxed)
+                    : 1u,
+                std::bit_ceil(children + 1u));
+			for (auto padded = children;
+			     padded + 1u < total && descriptors.size() < maximum_resources; ++padded) {
+				descriptors.push_back(descriptors.back());
+				specializations.push_back(specializations.back());
+			}
+		}
 		auto& root                      = specializations[resource_index];
 		root.indirect_root              = resource_index;
 		root.indirect_mapping_offset = static_cast<uint32_t>(mapping_offset);
-		root.indirect_search_iterations = std::bit_width(key_count);
+		root.indirect_search_iterations = std::bit_width(key_capacity);
+	}
+	return true;
+}
+
+// Exemplar that specializes a table root: a T# with the root's dimension and a native format,
+// preferring the float textures that sampled material tables mostly hold.
+bool TableExemplar(const ImageResource& root, const DescriptorValue& descriptor, bool float_only) {
+	if (NullImageDescriptor(descriptor) || DescriptorIsCube(descriptor) != root.cube) {
+		return false;
+	}
+	const auto format = static_cast<Prospero::BufferFormat>((descriptor.dwords[1] >> 20u) & 0x1ffu);
+	const auto numeric_class = Prospero::SampledTextureNumericClass(format);
+	return DescriptorDimension(descriptor, root.dimension) == root.dimension &&
+	       numeric_class != Prospero::TextureNumericClass::Unsupported &&
+	       (!float_only || numeric_class == Prospero::TextureNumericClass::Float) &&
+	       ImageConversionFormat(format) == Prospero::BufferFormat::kInvalid &&
+	       !Prospero::IsFmaskTextureFormat(format);
+}
+
+uint32_t ImageTableCapacity(size_t slots) {
+	return std::bit_ceil(std::max<uint32_t>(static_cast<uint32_t>(slots), 256u));
+}
+
+// A bindless table: the key the shader computes from GPU data selects entry key & entry_mask,
+// so every entry the table holds is a candidate. Distinct valid T#s become descriptor slots and
+// the per-entry slot mapping is appended to the flattened SRT.
+bool MaterializeImageTable(const ResourcePlan& program,
+                           const DescriptorSource::IndirectDescriptor& indirect,
+                           const DescriptorValue& table_value, uint32_t image_index,
+                           const SrtRuntime& runtime, ResourceSnapshot& snapshot,
+                           ResourceSpecialization& specialization,
+                           std::vector<ImageTableSnapshot>& previous,
+                           std::vector<uint32_t>& mapping_offsets) {
+	ShaderBufferResource table;
+	if (table_value.dword_count != 4u || !DecodeBufferDescriptor(table_value, table) ||
+	    (indirect.table_offset & 31u) != 0u) {
+		return false;
+	}
+	const auto base       = table.Base48();
+	const auto size       = table.GetSize();
+	const auto entry_mask = indirect.table_mask >> 5u;
+	const auto entries    = std::min<uint64_t>(
+	    {size > indirect.table_offset ? (size - indirect.table_offset) / 32u : 0u,
+	     uint64_t {entry_mask} + 1u, MaxIndirectDescriptorProbes});
+	const auto& root = program.info.images[image_index];
+	const auto same_table = [&](const ImageTableSnapshot& candidate) {
+		return candidate.base == base && candidate.size == size &&
+		       candidate.offset == indirect.table_offset && candidate.entry_mask == entry_mask;
+	};
+	auto found = std::ranges::find_if(snapshot.image_tables, same_table);
+	if (found == snapshot.image_tables.end()) {
+		ImageTableSnapshot next {.base = base, .size = size, .offset = indirect.table_offset,
+		                         .entry_mask = entry_mask};
+		// Tables span megabytes and rarely change: read into a reused buffer and keep the
+		// previous snapshot's words when they are equal.
+		static thread_local std::vector<uint32_t> words;
+		words.resize(static_cast<size_t>(entries) * 8u);
+		if (!words.empty() && !ReadScalarTable(base, size, indirect.table_offset, runtime, words)) {
+			return false;
+		}
+		const auto reusable = std::ranges::find_if(previous, [&](const ImageTableSnapshot& old) {
+			return same_table(old) && old.raw == words && !old.slots.empty();
+		});
+		// The tables this thread built last, by any program: resolutions ahead of execution
+		// materialize into a ring of snapshots, so `previous` rarely holds the table.
+		static thread_local std::array<ImageTableSnapshot, 4> built;
+		static thread_local uint32_t                          built_next = 0;
+		const auto cached = reusable != previous.end()
+		                        ? built.end()
+		                        : std::ranges::find_if(built, [&](const ImageTableSnapshot& old) {
+			                          return same_table(old) && !old.slots.empty() &&
+			                                 old.raw == words;
+		                          });
+		if (reusable != previous.end()) {
+			next.raw     = std::move(reusable->raw);
+			next.slots   = std::move(reusable->slots);
+			next.mapping = std::move(reusable->mapping);
+		} else if (cached != built.end()) {
+			next.raw.swap(words);
+			next.slots   = cached->slots;
+			next.mapping = cached->mapping;
+		} else {
+			next.raw.swap(words);
+			next.slots.push_back(DescriptorValue {.dword_count = 8u});
+			next.mapping.assign(static_cast<size_t>(entries) + 1u, 0u);
+			next.mapping[0] = static_cast<uint32_t>(entries);
+			std::unordered_map<std::string_view, uint32_t> slot_of;
+			for (uint32_t entry = 0; entry < entries; entry++) {
+				DescriptorValue candidate {.dword_count = 8u};
+				std::copy_n(next.raw.begin() + entry * 8u, 8u, candidate.dwords.begin());
+				if (NullImageDescriptor(candidate) || !ValidImageDescriptor(candidate, root.r128)) {
+					continue;
+				}
+				const std::string_view key(
+				    reinterpret_cast<const char*>(next.raw.data() + entry * 8u),
+				    8u * sizeof(uint32_t));
+				const auto [slot, inserted] =
+				    slot_of.try_emplace(key, static_cast<uint32_t>(next.slots.size()));
+				if (inserted) {
+					next.slots.push_back(candidate);
+				}
+				next.mapping[entry + 1u] = slot->second;
+			}
+			built[built_next++ % built.size()] = next;
+		}
+		snapshot.image_tables.push_back(std::move(next));
+		mapping_offsets.push_back(static_cast<uint32_t>(snapshot.flattened_srt.size()));
+		const auto& mapping = snapshot.image_tables.back().mapping;
+		snapshot.flattened_srt.insert(snapshot.flattened_srt.end(), mapping.begin(), mapping.end());
+		found = snapshot.image_tables.end() - 1;
+	}
+	const auto table_index     = static_cast<uint32_t>(found - snapshot.image_tables.begin());
+	auto&      image           = specialization.images[image_index];
+	image.table                = table_index;
+	image.table_capacity       = ImageTableCapacity(found->slots.size());
+	image.table_mapping_offset = mapping_offsets[table_index];
+	image.table_entry_mask     = entry_mask;
+	snapshot.images[image_index] = {.dword_count = 8u};
+	for (const bool float_only: {true, false}) {
+		const auto exemplar = std::ranges::find_if(found->slots, [&](const DescriptorValue& slot) {
+			return TableExemplar(root, slot, float_only);
+		});
+		if (exemplar != found->slots.end()) {
+			snapshot.images[image_index] = *exemplar;
+			break;
+		}
 	}
 	return true;
 }
 
 } // namespace
+
+bool ImageTableSlotCompatible(const ImageResource& root, const DescriptorValue& descriptor) {
+	if (NullImageDescriptor(descriptor) || !ValidImageDescriptor(descriptor, root.r128) ||
+	    DescriptorIsCube(descriptor) != root.cube) {
+		return false;
+	}
+	const auto format = static_cast<Prospero::BufferFormat>((descriptor.dwords[1] >> 20u) & 0x1ffu);
+	const auto dimension = DescriptorDimension(descriptor, root.dimension);
+	const auto is_2d     = [](Decoder::ImageDimension value) {
+		return value == Decoder::ImageDimension::Dim2D ||
+		       value == Decoder::ImageDimension::Dim2DArray;
+	};
+	return (dimension == root.dimension || (is_2d(dimension) && is_2d(root.dimension))) &&
+	       Prospero::SampledTextureNumericClass(format) == root.numeric_class &&
+	       ImageConversionFormat(format) == root.conversion_format &&
+	       !Prospero::IsFmaskTextureFormat(format);
+}
 
 struct SamplerPlan {
 	struct Binding {
@@ -1247,8 +1427,9 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	return plan;
 }
 
-bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
-                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+template <typename Walker>
+static bool MaterializeWith(const ResourcePlan& program, const SrtRuntime& runtime,
+                            ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
 	if (!program.resource_tracking_complete ||
 	    ((program.requires_specialization_memory || !program.source_reads.empty()) &&
 	     runtime.read_specialization_memory == nullptr)) {
@@ -1257,10 +1438,11 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	const bool capture_reads = program.capture_specialization_reads || !program.source_reads.empty();
 	auto& reads = snapshot.specialization_reads;
 	reads = program.source_reads;
-	SrtReadCapture capture {runtime, reads};
+	snapshot.specialization_read_slots.assign(reads.size(), NoSrtSlot);
+	SrtReadCapture capture {runtime, reads, &snapshot.specialization_read_slots};
 	const auto observed = capture_reads ? capture.ObservedRuntime() : runtime;
-	SrtWalker clean(program, CleanRuntime(observed));
-	SrtWalker walker(program, observed,
+	Walker clean(program, CleanRuntime(observed));
+	Walker walker(program, observed,
 	                 capture_reads || program.requires_specialization_memory ? &clean : nullptr);
 	if (!walker.RefreshFlatBuffer(snapshot.flattened_srt)) {
 		return false;
@@ -1341,6 +1523,9 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	}
 	snapshot.images.resize(program.info.images.size());
 	specialization.images.resize(program.info.images.size());
+	auto previous_tables = std::move(snapshot.image_tables);
+	snapshot.image_tables.clear();
+	std::vector<uint32_t> table_mappings;
 	for (uint32_t i = 0; i < program.info.images.size(); ++i) {
 		const auto& image = program.info.images[i];
 		specialization.images[i] = {
@@ -1352,6 +1537,10 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		    .indirect_root = image.indirect_root,
 		    .indirect_mapping_offset = image.indirect_mapping_offset,
 		    .indirect_search_iterations = image.indirect_search_iterations,
+		    .table = image.table,
+		    .table_capacity = image.table_capacity,
+		    .table_mapping_offset = image.table_mapping_offset,
+		    .table_entry_mask = image.table_entry_mask,
 		    .cube = image.cube,
 		};
 		const auto* source = Source(program, image.source);
@@ -1364,6 +1553,15 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 				continue;
 			}
 			const auto& indirect = *source->indirect_descriptor;
+			if (indirect.table_array) {
+				DescriptorValue table;
+				if (!clean.EvaluateDescriptor(indirect.table_source, table) ||
+				    !MaterializeImageTable(program, indirect, table, i, observed, snapshot,
+				                           specialization, previous_tables, table_mappings)) {
+					return false;
+				}
+				continue;
+			}
 			const bool bounded_table = IsBoundedDescriptorTable(program, indirect);
 			if (!MaterializeIndirectDescriptor(
 			        program, indirect, i, 8u, observed, clean, snapshot, snapshot.images,
@@ -1410,6 +1608,28 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	}
 	snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
 	return BuildResourceSpecialization(program, snapshot, specialization);
+}
+
+void SetComputeIndirectFloors(size_t keys, size_t images) {
+	g_compute_indirect_keys.store(std::max(std::bit_ceil(keys), MinIndirectMappingCapacity),
+	                              std::memory_order_relaxed);
+	g_compute_indirect_images.store(std::max<size_t>(std::bit_ceil(images), 1u),
+	                                std::memory_order_relaxed);
+	g_stable_indirect_layouts.store(true, std::memory_order_relaxed);
+}
+
+bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
+                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+	if (CompileSrtPlan(program) != nullptr) {
+		return MaterializeWith<CompiledSrtWalker>(program, runtime, snapshot, specialization);
+	}
+	return MaterializeWith<SrtWalker>(program, runtime, snapshot, specialization);
+}
+
+bool MaterializeResourcesReference(const ResourcePlan& program, const SrtRuntime& runtime,
+                                   ResourceSnapshot& snapshot,
+                                   ResourceSpecialization& specialization) {
+	return MaterializeWith<SrtWalker>(program, runtime, snapshot, specialization);
 }
 
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization) {
@@ -1460,6 +1680,10 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		image.indirect_root              = source.indirect_root;
 		image.indirect_mapping_offset    = source.indirect_mapping_offset;
 		image.indirect_search_iterations = source.indirect_search_iterations;
+		image.table                      = source.table;
+		image.table_capacity             = source.table_capacity;
+		image.table_mapping_offset       = source.table_mapping_offset;
+		image.table_entry_mask           = source.table_entry_mask;
 		image.cube                       = source.cube;
 		image.indirect_resources.clear();
 	}
@@ -1600,6 +1824,8 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 			        inst.GetOpcode() != ValueOpcode::ImageSampleRaw &&
 			        inst.GetOpcode() != ValueOpcode::ImageGatherRaw &&
 			        inst.GetOpcode() != ValueOpcode::ImageRead);
+			EXIT_IF(image.table_capacity != 0u && inst.GetOpcode() != ValueOpcode::ImageSampleRaw &&
+			        inst.GetOpcode() != ValueOpcode::ImageQueryDimensions);
 		}
 	}
 	for (auto& memory: memory_info) {

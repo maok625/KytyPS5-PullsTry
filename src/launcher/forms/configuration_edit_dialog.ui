@@ -170,8 +170,8 @@
             </item>
             <item row="6" column="1">
              <widget class="QCheckBox" name="checkBox_tessellation">
-              <property name="toolTip"><string>Draw tessellated geometry. Disabled by default; unsupported tessellation may cause crashes.</string></property>
-              <property name="text"><string>Enable tessellation support (experimental)</string></property>
+              <property name="toolTip"><string>Draw tessellated geometry, such as GTA V's nearby tree trunks. Unsupported tessellation shaders may cause crashes.</string></property>
+              <property name="text"><string>Enable tessellation support</string></property>
              </widget>
             </item>
             <item row="7" column="1">
@@ -184,6 +184,12 @@
              <widget class="QCheckBox" name="checkBox_hdr">
               <property name="toolTip"><string>Enable HDR10 output for supported games. Requires HDR enabled on the host display.</string></property>
               <property name="text"><string>Enable HDR display support</string></property>
+             </widget>
+            </item>
+            <item row="9" column="1">
+             <widget class="QCheckBox" name="checkBox_async_pipelines">
+              <property name="toolTip"><string>Compile new pipelines in the background and skip the draws that need them meanwhile: an object may appear a moment late the first time it is seen, instead of the game stuttering.</string></property>
+              <property name="text"><string>Compile new pipelines in the background</string></property>
              </widget>
             </item>
            </layout>

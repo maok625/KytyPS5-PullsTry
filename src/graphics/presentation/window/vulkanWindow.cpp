@@ -19,6 +19,7 @@
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
 #include "graphics/presentation/window/windowInternal.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "kernel/memory.h"
 #include "libs/controller.h"
 #include "loader/systemContent.h"
@@ -417,11 +418,29 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	EXIT_IF(physical_device == nullptr);
 	EXIT_IF(queue_family == static_cast<uint32_t>(-1));
 
-	const float               queue_priority = 1.0f;
-	vk::DeviceQueueCreateInfo queue_create_info {};
+	const float queue_priority = 1.0f;
+	std::array<vk::DeviceQueueCreateInfo, 2> queue_create_infos {};
+	auto& queue_create_info            = queue_create_infos[0];
 	queue_create_info.queueFamilyIndex = queue_family;
 	queue_create_info.queueCount       = 1;
 	queue_create_info.pQueuePriorities = &queue_priority;
+	// A transfer-only family serves buffer readbacks (GraphicContext::readback_queue).
+	uint32_t   queue_create_count = 1;
+	const auto families           = physical_device.getQueueFamilyProperties();
+	graphics.readback_family      = static_cast<uint32_t>(-1);
+	for (uint32_t family = 0; family < families.size(); family++) {
+		const auto flags = families[family].queueFlags;
+		if (family != queue_family && families[family].queueCount != 0 &&
+		    (flags & vk::QueueFlagBits::eTransfer) &&
+		    !(flags & (vk::QueueFlagBits::eGraphics | vk::QueueFlagBits::eCompute))) {
+			graphics.readback_family = family;
+			auto& readback           = queue_create_infos[queue_create_count++];
+			readback.queueFamilyIndex = family;
+			readback.queueCount       = 1;
+			readback.pQueuePriorities = &queue_priority;
+			break;
+		}
+	}
 
 	vk::PhysicalDeviceColorWriteEnableFeaturesEXT color_write_ext {};
 	color_write_ext.colorWriteEnable = VK_TRUE;
@@ -518,6 +537,14 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		    workgroup_layout.workgroupMemoryExplicitLayout != VK_FALSE));
 	}
 	graphics.mesh_shader_enabled = mesh_extension && supported_mesh.meshShader;
+	// Bindless image tables index sampled image arrays per lane.
+	features12.shaderSampledImageArrayNonUniformIndexing =
+	    supported_features12.shaderSampledImageArrayNonUniformIndexing;
+	if (supported_features12.shaderSampledImageArrayNonUniformIndexing != VK_TRUE ||
+	    supported_features2.features.shaderSampledImageArrayDynamicIndexing != VK_TRUE) {
+		LOGF("WARNING: non-uniform sampled image indexing is not supported; bindless image "
+		     "tables will not work\n");
+	}
 
 	vk::PhysicalDeviceSubgroupSizeControlProperties subgroup_size_control {};
 
@@ -579,6 +606,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	device_features.depthClamp  = VK_TRUE;
 #endif
 	device_features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
+	device_features.shaderSampledImageArrayDynamicIndexing =
+	    supported_features2.features.shaderSampledImageArrayDynamicIndexing;
 	device_features.shaderImageGatherExtended            = VK_TRUE;
 	device_features.independentBlend                     = VK_TRUE;
 	device_features.dualSrcBlend                         = VK_TRUE;
@@ -592,6 +621,18 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	device_features.fillModeNonSolid                      = VK_TRUE;
 	device_features.vertexPipelineStoresAndAtomics       = VK_TRUE;
 	graphics.sample_rate_shading_enabled                 = true;
+	// Host occlusion queries back the guest's ZPASS_DONE counters: exact sample counts, and slots
+	// reset from the host once their results were read.
+	device_features.occlusionQueryPrecise = supported_features2.features.occlusionQueryPrecise;
+	features12.hostQueryReset             = supported_features12.hostQueryReset;
+	graphics.occlusion_query_precise      = device_features.occlusionQueryPrecise == VK_TRUE;
+	graphics.host_query_reset_enabled     = features12.hostQueryReset == VK_TRUE;
+	device_features.multiDrawIndirect         = supported_features2.features.multiDrawIndirect;
+	device_features.drawIndirectFirstInstance = supported_features2.features.drawIndirectFirstInstance;
+	features12.drawIndirectCount              = supported_features12.drawIndirectCount;
+	graphics.indirect_draws_enabled = device_features.multiDrawIndirect == VK_TRUE &&
+	                                  device_features.drawIndirectFirstInstance == VK_TRUE &&
+	                                  features12.drawIndirectCount == VK_TRUE;
 	device_features.shaderInt64 = VK_TRUE;
 	device_features.shaderFloat64 =
 	    supported_features2.features.shaderFloat64 &&
@@ -656,8 +697,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		maintenance8.pNext = const_cast<void*>(create_info.pNext);
 		create_info.pNext = &maintenance8;
 	}
-	create_info.pQueueCreateInfos       = &queue_create_info;
-	create_info.queueCreateInfoCount    = 1;
+	create_info.pQueueCreateInfos       = queue_create_infos.data();
+	create_info.queueCreateInfoCount    = queue_create_count;
 	create_info.enabledExtensionCount   = static_cast<uint32_t>(device_extensions.size());
 	create_info.ppEnabledExtensionNames = device_extensions.data();
 	create_info.pEnabledFeatures        = &device_features;
@@ -1049,11 +1090,17 @@ void WindowContext::CreateVulkan() {
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.device);
 	graphic_ctx.device.getQueue(graphic_ctx.queue_family, 0, &graphic_ctx.queue);
 	EXIT_IF(graphic_ctx.queue == nullptr);
+	if (graphic_ctx.readback_family != static_cast<uint32_t>(-1)) {
+		graphic_ctx.device.getQueue(graphic_ctx.readback_family, 0, &graphic_ctx.readback_queue);
+	}
 
 	if (!graphic_ctx.CreateAllocator()) {
 		EXIT("Could not create Vulkan memory allocator");
 	}
 
+	// GTA V's ray tracing shader selects up to ~200 T#s by key from guest data that changes every
+	// frame; each new layout is a pipeline compile of several seconds.
+	ShaderRecompiler::IR::SetComputeIndirectFloors(256, 8);
 	render_context = std::make_unique<RenderContext>(graphic_ctx);
 	LibKernel::Memory::InstallGpuResources(render_context.get());
 	presenter = std::make_unique<Presenter>(*this);

@@ -49,6 +49,11 @@ namespace ShaderRecompiler::IR {
 struct CompiledShaderInfo;
 } // namespace ShaderRecompiler::IR
 
+// Names what the fields of the stage input structures below mean for the files that keep them
+// across sessions and builds (the shader program and pipeline stores). Change it whenever a field
+// is added, removed or reinterpreted, even when no structure changes size.
+inline constexpr std::string_view ShaderInputLayoutTag = "3";
+
 struct ShaderStageRuntime {
 	const ShaderRecompiler::IR::CompiledShaderInfo* program = nullptr;
 	const ShaderRecompiler::IR::ResourceSnapshot*   resources = nullptr;
@@ -121,6 +126,9 @@ struct ShaderTessellationInputInfo {
 	uint32_t domain                = 0;
 	uint32_t partitioning          = 0;
 	uint32_t output_topology       = 0;
+	// Per-patch HS outputs (offchip ring), shared by the HS writes and the TES reads.
+	uint32_t patch_base            = 0;
+	uint32_t patch_size            = 0;
 };
 
 struct ShaderVertexInputInfo {
@@ -153,6 +161,9 @@ struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
 	bool               group_id[3]                = {false, false, false};
 	bool               dispatch_thread_dimensions = false;
 	bool               lds_storage                = false;
+	// An indirect thread-dimension dispatch: the thread limit is written by the GPU, so the
+	// shader data lives in a storage buffer instead of push constants.
+	bool               dispatch_indirect_threads  = false;
 	int                thread_ids_num             = 0;
 	int                workgroup_register         = 0;
 	bool               tg_size_en                 = false;

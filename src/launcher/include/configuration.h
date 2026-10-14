@@ -119,9 +119,10 @@ public:
 	bool                   fullscreen_enabled          = false;
 	bool                   hdr_enabled                 = false;
 	bool                   hide_cursor_enabled         = false;
-	bool                   readback_linear_images      = false;
+	bool                   readback_linear_images      = true;
 	bool                   sync_raw_image_buffers      = false;
-	bool                   tessellation_enabled        = false;
+	bool                   tessellation_enabled        = true;
+	bool                   async_pipelines_enabled     = true;
 	bool                   trophy_enabled              = true;
 	bool                   skip_notice_screen          = false;
 	bool                   network_connected           = false;
@@ -140,7 +141,7 @@ public:
 	bool                   renderdoc_enabled           = false;
 	bool                   amd_cpu_enabled             = false;
 #if defined(_WIN32)
-	bool red_zone_protection_enabled = false;
+	bool red_zone_protection_enabled = true;
 #endif
 	QStringList host_input_mapping;
 
@@ -159,6 +160,7 @@ public:
 		readback_linear_images      = other.readback_linear_images;
 		sync_raw_image_buffers      = other.sync_raw_image_buffers;
 		tessellation_enabled        = other.tessellation_enabled;
+		async_pipelines_enabled     = other.async_pipelines_enabled;
 		trophy_enabled              = other.trophy_enabled;
 		skip_notice_screen          = other.skip_notice_screen;
 		network_connected           = other.network_connected;

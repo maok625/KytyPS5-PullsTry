@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 
 #include <array>
+#include <bit>
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
@@ -158,6 +159,39 @@ void Translator::V_FREXP_MANT_F32(const Decoder::Instruction& inst) {
 	                                 ir.Select(zero, bits, subnormal));
 	const auto result    = ir.Select(ir.IEqual(exponent, IR::U32(IR::Value(0xffu))), bits, finite);
 	WriteOperand(DestinationOperand(inst), ir.BitCastF32(result));
+}
+
+void Translator::V_FRACT(const Decoder::Instruction& inst, bool half) {
+	// DX fract returns [0, 1): x - floor(x) rounds to 1.0 for tiny negative x, and the
+	// hardware clamps that to the largest value below one (LLVM matches
+	// minnum(x - floor(x), nextafter(1.0, 0.0)) to V_FRACT for the same reason).
+	const auto source = half ? ReadF16AsF32(inst.src0) : IR::F32(ReadOperand(inst.src0, IR::Type::F32));
+	auto       result = IR::F32(ir.Emit(IR::ValueOpcode::FPFract32, {source}));
+	// Clamp in the destination precision: an F16 result above 0x3bff would round to 1.0.
+	const auto below_one =
+	    IR::F32(IR::Value::F32(std::bit_cast<float>(half ? 0x3f7fe000u : 0x3f7fffffu)));
+	const auto above = IR::U1(ir.Emit(IR::ValueOpcode::FPOrdGreaterThan32, {result, below_one}));
+	result           = SelectF32(above, below_one, result);
+	if (half) {
+		WriteF16(DestinationOperand(inst), result);
+	} else {
+		WriteOperand(DestinationOperand(inst), result);
+	}
+}
+
+void Translator::V_FRACT_F64(const Decoder::Instruction& inst) {
+	// As V_FRACT: x - floor(x) rounds to 1.0 for tiny negative x, and the result is clamped to the
+	// largest double below one. The ordered compare is false for NaN, which passes through.
+	const auto constant = [&](uint64_t bits) {
+		return ir.Emit(IR::ValueOpcode::BitCastF64U64, {IR::Value(bits)});
+	};
+	const auto source    = ReadOperand(inst.src0, IR::Type::F64);
+	auto       result    = ir.Emit(IR::ValueOpcode::FPFract64, {source});
+	const auto one       = constant(0x3ff0000000000000ull);
+	const auto below_one = constant(0x3fefffffffffffffull);
+	const auto reached   = IR::U1(ir.Emit(IR::ValueOpcode::FPOrdGreaterThanEqual64, {result, one}));
+	result               = ir.Emit(IR::ValueOpcode::SelectF64, {reached, below_one, result});
+	WriteOperand(DestinationOperand(inst), result);
 }
 
 void Translator::V_DOT2C_F32_F16(const Decoder::Instruction& inst) {

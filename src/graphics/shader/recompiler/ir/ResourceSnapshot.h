@@ -29,13 +29,36 @@ struct UniformFill {
 	bool operator==(const UniformFill&) const = default;
 };
 
+// The distinct T#s of a bindless image table; slot 0 is null.
+struct ImageTableSnapshot {
+	uint64_t                     base         = 0;
+	uint64_t                     size         = 0;
+	uint32_t                     offset       = 0;
+	uint32_t                     entry_mask   = 0;
+	std::vector<uint32_t>        raw;     // The table words the slots were built from.
+	std::vector<DescriptorValue> slots;
+	std::vector<uint32_t>        mapping; // Entry count, then the slot of each entry.
+};
+
+inline constexpr uint32_t NoSrtSlot = UINT32_MAX;
+// A specialization read made by a scalar load the shader also issues itself (not flattened):
+// RawReadSlotBit | the load's memory-info index.
+inline constexpr uint32_t RawReadSlotBit = 0x80000000u;
+[[nodiscard]] constexpr uint32_t RawReadSlot(uint32_t memory_index) {
+	return memory_index < RawReadSlotBit ? (RawReadSlotBit | memory_index) : NoSrtSlot;
+}
+
 struct ResourceSnapshot {
 	std::vector<DescriptorValue> buffers;
 	std::vector<DescriptorValue> images;
 	std::vector<DescriptorValue> samplers;
 	std::vector<uint32_t>        flattened_srt;
+	std::vector<ImageTableSnapshot> image_tables;
 	std::vector<uint32_t>        user_data;
 	std::vector<std::pair<uint64_t, uint64_t>> specialization_reads;
+	// For each specialization read, the flat SRT slot whose scalar load made it, the RawReadSlot()
+	// of a scalar load the shader issues itself, or NoSrtSlot.
+	std::vector<uint32_t>        specialization_read_slots;
 	UniformFill                 uniform_fill;
 };
 

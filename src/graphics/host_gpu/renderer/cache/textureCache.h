@@ -12,7 +12,9 @@
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
+#include <array>
 #include <map>
+#include <memory>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
@@ -51,12 +53,24 @@ public:
 	KYTY_CLASS_NO_COPY(TextureCache);
 
 	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false);
+	// Lookup for bindings the shader may never read (bindless table candidates). It resolves
+	// like FindImage but returns an empty id instead of converting a depth image to color or
+	// back: those conversions replace the image other passes use, which then convert it again.
+	[[nodiscard]] ImageId FindImageSpeculative(ImageDesc& desc, bool exact_format = false);
 	void                        UpdateImage(ImageId id);
 	[[nodiscard]] ImageId       FindImageFromRange(uint64_t address, uint64_t size,
 	                                               bool ensure_valid = true);
 	[[nodiscard]] vk::ImageView FindTexture(ImageId id, const ImageDesc& desc);
+	// Hosts without attachment feedback loops cannot sample a depth/stencil target that the draw
+	// writes. Copies `range` (the `aspects` given) of depth image `depth_id` into an image of its
+	// own, outside any render pass, for the draw to sample instead: the draw reads the values from
+	// before it ran. The copy lives until the depth image is deleted.
+	[[nodiscard]] ImageId CopyDepthForFeedback(ImageId depth_id, const ImageSubresourceRange& range,
+	                                           vk::ImageAspectFlags aspects);
 	[[nodiscard]] vk::ImageView FindRenderTarget(ImageId id, const ImageDesc& desc);
-	[[nodiscard]] vk::ImageView FindDepthTarget(ImageId id, const ImageDesc& desc);
+	// stencil (optional) receives the stencil association the target refreshed, if any.
+	[[nodiscard]] vk::ImageView FindDepthTarget(ImageId id, const ImageDesc& desc,
+	                                            ImageId* stencil = nullptr);
 	[[nodiscard]] Image&        GetImage(ImageId id) {
 		auto& image = m_slot_images[id];
 		TouchImage(image);
@@ -69,6 +83,8 @@ public:
 	void               InvalidateMemory(uint64_t address, uint64_t size);
 	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size);
 	[[nodiscard]] bool IsRegionRegistered(uint64_t address, uint64_t size);
+	[[nodiscard]] bool IsRegionGpuModified(uint64_t address, uint64_t size);
+	[[nodiscard]] bool HasImagesInRegion(uint64_t address, uint64_t size);
 
 	[[nodiscard]] bool IsMeta(uint64_t address);
 	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice);
@@ -77,6 +93,32 @@ public:
 
 	void UnmapMemory(uint64_t address, uint64_t size);
 	void ProcessDownloadImages();
+	// Advances whenever an image is registered or unregistered.
+	[[nodiscard]] uint64_t ImageSetEpoch() const { return m_image_set_epoch; }
+	// The ImageSetEpoch of the last registration or unregistration of an image overlapping the
+	// range's pages: while it is unchanged, a lookup in the range finds the same images.
+	[[nodiscard]] uint64_t ImageEpochInRegion(uint64_t address, uint64_t size);
+	// The granularity of ImageEpochInRegion(): log2 of its page size.
+	static constexpr uint32_t ImagePageBits = 20;
+	// Calls `function(address, size)` for the image range of every registration and
+	// unregistration after ImageSetEpoch() was `epoch`, oldest first. False when the history no
+	// longer reaches back that far.
+	template <typename Function>
+	[[nodiscard]] bool ForEachImageSetChangeSince(uint64_t epoch, Function&& function) {
+		std::scoped_lock lock {m_lock};
+		if (m_image_set_epoch - epoch > ImageSetChangeHistory) {
+			return false;
+		}
+		for (auto change = epoch + 1; change <= m_image_set_epoch; ++change) {
+			const auto& range = m_image_set_changes[change % ImageSetChangeHistory];
+			function(range.first, range.second);
+		}
+		return true;
+	}
+	// A pinned image is used without its bindings looking it up or touching it: the garbage
+	// collector keeps it and overlapping lookups do not delete it as unused. Pins nest.
+	void PinImage(ImageId id);
+	void UnpinImage(ImageId id);
 	void RunGarbageCollector();
 
 private:
@@ -91,10 +133,13 @@ private:
 		ImageId image;
 		int32_t mip   = -1;
 		int32_t layer = -1;
+		// Speculative lookups only: resolving the overlap would replace an owned image.
+		bool rejected = false;
 	};
 
 	using ImageIds       = InlinePageOwnerList<ImageId, 16>;
 	using ImagePageTable = MultiLevelPageTable<ImageIds, 20, 44, 14>;
+	static_assert(ImagePageTable::kPageBits == ImagePageBits);
 
 	// Callers have validated the nonempty 44-bit range with TryGetPageRange.
 	template <typename Func>
@@ -118,6 +163,8 @@ private:
 	void                      RegisterImage(ImageId id);
 	void                      UnregisterImage(ImageId id);
 	void                      DeleteImage(ImageId id);
+	// Releases the depth feedback copy of a depth image, if it has one.
+	void                      ReleaseDepthFeedbackCopy(ImageId depth_id);
 	void                      FreeImage(ImageId id);
 	void                      TouchImage(Image& image);
 	void                      TrackImage(ImageId id);
@@ -136,7 +183,11 @@ private:
 	[[nodiscard]] ImageIds      FindImagesInRegion(uint64_t address, uint64_t size,
 	                                               bool page_overlap) const;
 	[[nodiscard]] OverlapResult ResolveOverlap(const ImageInfo& requested, BindingType binding,
-	                                           ImageId cached, ImageId merged);
+	                                           ImageId cached, ImageId merged,
+	                                           bool speculative = false);
+	[[nodiscard]] ImageId       FindImageImpl(ImageDesc& desc, bool exact_format, bool speculative);
+	[[nodiscard]] static bool   DepthOverlapNeedsRecreate(const ImageInfo& requested,
+	                                                      BindingType binding, const Image& cached);
 	[[nodiscard]] ImageId       ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
 	                                                ImageId cached);
 	[[nodiscard]] ImageId       ExpandImage(const ImageInfo& info, ImageId source);
@@ -159,7 +210,9 @@ private:
 	void               CopyImage(ImageId destination, ImageId source);
 	[[nodiscard]] ImageId AssociateStencil(ImageId depth, GuestRange stencil);
 	void CopyImageMip(ImageId destination, ImageId source, uint32_t mip, uint32_t layer);
-	void ValidateImageDesc(const ImageDesc& desc) const;
+	// Validates the view and binding of a description; ImageOps::Validate() checks its image
+	// information.
+	void ValidateImageViewDesc(const ImageDesc& desc) const;
 
 	void               InvalidateCpuAliases(uint64_t address, uint64_t size);
 	[[nodiscard]] bool DownloadImageMemory(ImageId id);
@@ -173,9 +226,14 @@ private:
 	BufferCache&                                      m_buffer_cache;
 	Common::SlotVector<Image>                         m_slot_images;
 	ImagePageTable                                    m_image_page_table;
+	MultiLevelPageTable<uint64_t, ImagePageTable::kPageBits, ImagePageTable::kAddressSpaceBits,
+	                    ImagePageTable::kFirstLevelBits>
+	    m_image_page_epochs;
 	std::unordered_map<vk::Format, ImageId>           m_null_images;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
+	// Depth image -> its depth feedback copy (see CopyDepthForFeedback).
+	std::unordered_map<ImageId, ImageId>              m_depth_feedback_copies;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t                                          m_trigger_gc_memory  = 0;
@@ -183,7 +241,26 @@ private:
 	uint64_t         m_critical_gc_memory     = 3ull * 1024 * 1024 * 1024;
 	uint64_t         m_gc_tick                = 0;
 	mutable uint32_t m_image_query_epoch      = 0;
+	uint64_t         m_image_set_epoch        = 0;
+	// The image range of the last registrations and unregistrations, by ImageSetEpoch.
+	static constexpr uint64_t ImageSetChangeHistory = 1024;
+	std::array<std::pair<uint64_t, uint64_t>, ImageSetChangeHistory> m_image_set_changes {};
 	bool             m_readback_linear_images = false;
+	// Lookups that found an existing image with the same backing, by description: while no image
+	// on the pages of the range was registered or unregistered since, the same lookup finds the
+	// same image.
+	struct ExactLookup {
+		ImageInfo info;
+		ImageId   id;
+		uint64_t  epoch        = 0;
+		bool      exact_format = false;
+		bool      valid        = false;
+	};
+	static constexpr size_t                                   ExactLookupWays = 1024;
+	std::unique_ptr<std::array<ExactLookup, ExactLookupWays>> m_exact_lookups =
+	    std::make_unique<std::array<ExactLookup, ExactLookupWays>>();
+	[[nodiscard]] static size_t ExactLookupSlot(const ImageInfo& info) noexcept;
+	[[nodiscard]] uint64_t      ImageEpochInRegionUnlocked(uint64_t address, uint64_t size) const;
 
 	friend struct TextureCacheTestAccess;
 	friend class BufferCache;

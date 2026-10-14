@@ -74,7 +74,10 @@ static void PrintUsage() {
 	::printf("  --gpu-assisted-validation <t|f>      Bounds-check shader accesses on the GPU.\n"
 	         "                                       Implies --vulkan-validation; very slow.\n");
 	::printf("  --shader-validation <true|false>     Enable shader validation.\n");
-	::printf("  --tessellation                      Draw tessellation patches; skipped by default.\n");
+	::printf("  --no-tessellation                    Skip tessellation patches instead of drawing them.\n");
+	::printf(
+	    "  --no-async-pipelines                 Wait for new pipelines instead of skipping the\n"
+	    "                                       draws that need them while they compile.\n");
 	::printf("  --shader-optimization-type <value>   None, Size, or Performance.\n");
 	::printf("  --shader-log-direction <value>       Silent, Console, or File.\n");
 	::printf("  --shader-log-folder <path>           Shader log output folder.\n");
@@ -85,8 +88,8 @@ static void PrintUsage() {
 	::printf("  --printf-output-file <path>          Guest printf output file.\n");
 	::printf("  --profile                            Enable the Tracy profiler.\n");
 	::printf("  --spirv-debug-printf <true|false>    Enable SPIR-V debug printf.\n");
-	::printf(
-	    "  --readback-linear-images <true|false> Read back writable linear images on submit.\n");
+	::printf("  --readback-linear-images <true|false> Read back writable linear images on submit\n"
+	         "                                       (default: true).\n");
 	::printf(
 	    "  --sync-raw-image-buffers <true|false> Synchronize raw reads of GPU images. Default: false.\n");
 	::printf(
@@ -95,8 +98,12 @@ static void PrintUsage() {
 	::printf(
 	    "  --skip-notice-screen <true|false>    Skip startup logos and notices in supported games.\n"
 	    "                                      Default: false.\n");
+	::printf("  --gpu-pipeline <0|1|mask>            Emulated GPU stages on their own threads.\n"
+	         "                                       0: all inline, 1: all (default). The\n"
+	         "                                       KYTY_GPU_PIPELINE variable overrides it.\n");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	::printf("  --redzone                            Protect the guest SysV red zone.\n");
+	::printf("  --redzone                            Protect the guest SysV red zone (default).\n");
+	::printf("  --no-redzone                         Do not protect the guest SysV red zone.\n");
 #endif
 	::printf("  --keymap <Control=Input>             DualSense mapping; may be repeated.\n");
 	::printf("  --rd                                 Enable RenderDoc capture.\n");
@@ -252,6 +259,21 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			continue;
 		}
 
+		if (arg == "--no-tessellation") {
+			options.config.tessellation_enabled = false;
+			continue;
+		}
+
+		if (arg == "--async-pipelines") {
+			options.config.async_pipelines_enabled = true;
+			continue;
+		}
+
+		if (arg == "--no-async-pipelines") {
+			options.config.async_pipelines_enabled = false;
+			continue;
+		}
+
 		if (arg == "--profile") {
 			options.config.profiler_enabled = true;
 			continue;
@@ -260,6 +282,10 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		if (arg == "--redzone") {
 			options.config.red_zone_protection_enabled = true;
+			continue;
+		}
+		if (arg == "--no-redzone") {
+			options.config.red_zone_protection_enabled = false;
 			continue;
 		}
 #endif
@@ -272,6 +298,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 		if (!NextArg(argc, argv, i, value)) {
 			::printf("missing value for %s\n", arg.c_str());
 			return false;
+		}
+
+		if (arg == "--gpu-pipeline") {
+			options.config.gpu_pipeline_stages = Config::ParseGpuPipelineStages(value.c_str());
+			continue;
 		}
 
 		if (arg == "--game") {
