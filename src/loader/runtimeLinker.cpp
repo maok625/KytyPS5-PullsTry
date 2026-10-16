@@ -131,6 +131,7 @@ struct StubbedImportRecord {
 
 static std::vector<StubbedImportRecord> g_stubbed_imports;
 static std::atomic_uint32_t             g_unresolved_stub_call_log_count {0};
+static std::atomic_uint32_t             g_native_unknown_syscall_log_count {0};
 static std::vector<uint64_t>            g_unresolved_stub_thunk_pages;
 static uint64_t                         g_unresolved_stub_thunk_offset = 0;
 static constexpr uint64_t               UNRESOLVED_STUB_PAGE_SIZE      = 4096;
@@ -508,7 +509,7 @@ static bool DispatchNativeSyscall(NativeArm64GuestMemory& memory,
 			return true;
 
 		default:
-			if (unknown_syscall_log_count.fetch_add(1) < 64) {
+			if (g_native_unknown_syscall_log_count.fetch_add(1) < 64) {
 				LOGF("Native ARM64 guest syscall not yet implemented: number=%" PRIu64
 				     ", rip=0x%016" PRIx64 "\n", number, state.rip);
 			}
@@ -736,14 +737,25 @@ static KYTY_SYSV_ABI void RunEntry(uint64_t addr, EntryParams* params, atexit_fu
 	               "xmm11", "xmm12", "xmm13", "xmm14", "xmm15");
 #endif
 #elif defined(__aarch64__) || defined(_M_ARM64)
+#if defined(KYTY_NATIVE_MACOS_ARM64_KOSMICKRISP)
+	auto* runtime = Common::Singleton<RuntimeLinker>::Instance();
+	std::vector<uint64_t> callbacks;
+	if (atexit_func != nullptr) {
+		callbacks.push_back(reinterpret_cast<uint64_t>(atexit_func));
+	}
+	bool exited = false;
+	(void)RunNativeArm64Guest(
+	    *runtime, addr,
+	    {reinterpret_cast<uint64_t>(params), reinterpret_cast<uint64_t>(atexit_func), 0, 0, 0, 0},
+	    stack_top, std::move(callbacks), reinterpret_cast<uint64_t>(atexit_func), &exited);
+#else
 	// Never cast a PS5 x86-64 entry address to a native function pointer on ARM64.
-	// Until the interpreter/DBT is connected to the loader and host-import ABI
-	// bridge, fail explicitly instead of executing guest bytes as AArch64 code.
 	(void)addr;
 	(void)params;
 	(void)atexit_func;
 	(void)stack_top;
-	EXIT("Native ARM64 guest execution is not integrated: refusing to call an x86-64 entry point directly");
+	EXIT("Native ARM64 guest execution requires KYTY_NATIVE_MACOS_ARM64_KOSMICKRISP");
+#endif
 #else
 	(void)stack_top;
 	reinterpret_cast<entry_func_t>(addr)(params, atexit_func);
@@ -1664,13 +1676,40 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 		const auto& arguments = Config::GetGuestArguments();
 		const auto params_size = offsetof(EntryParams, argv) +
 		                         (arguments.size() + 2) * sizeof(const char*);
+#if defined(KYTY_NATIVE_MACOS_ARM64_KOSMICKRISP)
+		size_t argv_strings_size = 0;
+		for (const auto& argument: arguments) {
+			if (argument.size() >= SIZE_MAX - argv_strings_size) {
+				EXIT("Native ARM64 guest argv is too large");
+			}
+			argv_strings_size += argument.size() + 1;
+		}
+		const auto stack_top_address = reinterpret_cast<uintptr_t>(main_stack_top);
+		if (params_size > stack_top_address || argv_strings_size > stack_top_address - params_size ||
+		    0x100u > stack_top_address - params_size - argv_strings_size) {
+			EXIT("Native ARM64 guest argv does not fit on the main guest stack");
+		}
+		auto* params = reinterpret_cast<EntryParams*>(
+		    (stack_top_address - params_size - argv_strings_size - 0x100u) &
+		    ~static_cast<uintptr_t>(0x0f));
+#else
 		auto* params = reinterpret_cast<EntryParams*>(
 		    (reinterpret_cast<uintptr_t>(main_stack_top) - params_size - 0x100u) &
 		    ~static_cast<uintptr_t>(0x0f));
+#endif
 		std::memset(params, 0, params_size);
+#if defined(KYTY_NATIVE_MACOS_ARM64_KOSMICKRISP)
+		char* string_cursor = reinterpret_cast<char*>(reinterpret_cast<uintptr_t>(params) + params_size);
+		for (const auto& argument: arguments) {
+			params->argv[params->argc++] = string_cursor;
+			std::memcpy(string_cursor, argument.c_str(), argument.size() + 1);
+			string_cursor += argument.size() + 1;
+		}
+#else
 		for (const auto& argument: arguments) {
 			params->argv[params->argc++] = argument.c_str();
 		}
+#endif
 
 		LOGF("stack_addr = %" PRIx64 "\n", reinterpret_cast<uint64_t>(params));
 
@@ -1936,8 +1975,28 @@ int RuntimeLinker::StartModule(Program* program, size_t args, const void* argp,
 	LOGF_COLOR(Log::Color::BrightYellow, "---\n--- Start module: %s\n---\n",
 	           Common::PathToString(program->file_name).c_str());
 
+#if defined(KYTY_NATIVE_MACOS_ARM64_KOSMICKRISP)
+	constexpr uint64_t stack_size = 1024 * 1024;
+	const auto stack_base = Libs::LibKernel::Memory::AllocateRuntimeMemory(
+	    0, stack_size, Common::VirtualMemory::Mode::ReadWrite, "native_arm64_module_start");
+	EXIT_IF(stack_base == 0);
+	std::vector<uint64_t> callbacks;
+	if (func != nullptr &&
+	    FindProgramByAddr(reinterpret_cast<uint64_t>(func)) == nullptr) {
+		callbacks.push_back(reinterpret_cast<uint64_t>(func));
+	}
+	bool exited = false;
+	const auto result = RunNativeArm64Guest(
+	    *this, program->dynamic_info->init_vaddr + program->base_vaddr,
+	    {static_cast<uint64_t>(args), reinterpret_cast<uint64_t>(argp),
+	     reinterpret_cast<uint64_t>(func), 0, 0, 0},
+	    reinterpret_cast<void*>(stack_base + stack_size), std::move(callbacks), 0, &exited);
+	EXIT_IF(!Libs::LibKernel::Memory::FreeGuestMemory(stack_base, stack_size));
+	return static_cast<int>(result);
+#else
 	return reinterpret_cast<module_ini_fini_func_t>(program->dynamic_info->init_vaddr +
 	                                                program->base_vaddr)(args, argp, func);
+#endif
 }
 
 int RuntimeLinker::StopModule(Program* program, size_t args, const void* argp, module_func_t func) {
@@ -1951,8 +2010,27 @@ int RuntimeLinker::StopModule(Program* program, size_t args, const void* argp, m
 	LOGF_COLOR(Log::Color::BrightYellow, "---\n--- Stop module: %s\n---\n",
 	           Common::PathToString(program->file_name).c_str());
 
+#if defined(KYTY_NATIVE_MACOS_ARM64_KOSMICKRISP)
+	constexpr uint64_t stack_size = 1024 * 1024;
+	const auto stack_base = Libs::LibKernel::Memory::AllocateRuntimeMemory(
+	    0, stack_size, Common::VirtualMemory::Mode::ReadWrite, "native_arm64_module_stop");
+	EXIT_IF(stack_base == 0);
+	std::vector<uint64_t> callbacks;
+	if (func != nullptr &&
+	    FindProgramByAddr(reinterpret_cast<uint64_t>(func)) == nullptr) {
+		callbacks.push_back(reinterpret_cast<uint64_t>(func));
+	}
+	bool exited = false;
+	const auto result = RunNativeArm64Guest(
+	    *this, program->dynamic_info->fini_vaddr + program->base_vaddr,
+	    {static_cast<uint64_t>(args), reinterpret_cast<uint64_t>(argp),
+	     reinterpret_cast<uint64_t>(func), 0, 0, 0},
+	    reinterpret_cast<void*>(stack_base + stack_size), std::move(callbacks), 0, &exited);
+	EXIT_IF(!Libs::LibKernel::Memory::FreeGuestMemory(stack_base, stack_size));
+#else
 	int result = reinterpret_cast<module_ini_fini_func_t>(program->dynamic_info->fini_vaddr +
 	                                                      program->base_vaddr)(args, argp, func);
+#endif
 
 	Libs::LibKernel::PthreadDeleteStaticObjects(program);
 
