@@ -253,6 +253,26 @@ int main() {
 	CHECK(state.gpr[static_cast<std::size_t>(GuestGpr::Rsp)] == 0x1800);
 	CHECK(state.gpr[static_cast<std::size_t>(GuestGpr::Rbx)] == 0x123456789abcdef0ULL);
 
+	// PUSH imm8 sign-extends to a 64-bit stack value in long mode.
+	CHECK(memory.Load(0x1f60, {0x6a, 0xff}));
+	state = GuestCpuState{};
+	state.rip = 0x1f60;
+	state.gpr[static_cast<std::size_t>(GuestGpr::Rsp)] = 0x1800;
+	const BlockExit push_imm_exit = interpreter.RunBlock(state, memory, 1);
+	CHECK(push_imm_exit.reason == BlockExitReason::InstructionBudget);
+	CHECK(state.gpr[static_cast<std::size_t>(GuestGpr::Rsp)] == 0x17f8);
+	CHECK(memory.ReadU64(0x17f8, stored_value));
+	CHECK(stored_value == UINT64_MAX);
+
+	// MOVSXD sign-extends a 32-bit source when REX.W is set.
+	CHECK(memory.Load(0x1f70, {0x48, 0x63, 0xc0}));
+	state = GuestCpuState{};
+	state.rip = 0x1f70;
+	state.gpr[static_cast<std::size_t>(GuestGpr::Rax)] = 0x80000000ULL;
+	const BlockExit movsxd_exit = interpreter.RunBlock(state, memory, 1);
+	CHECK(movsxd_exit.reason == BlockExitReason::InstructionBudget);
+	CHECK(state.gpr[static_cast<std::size_t>(GuestGpr::Rax)] == 0xffffffff80000000ULL);
+
 	// LEAVE restores RBP from the guest frame and advances RSP atomically.
 	CHECK(memory.Load(0x1b10, {0xc9}));
 	CHECK(memory.WriteU64(0x1700, 0x1999));
