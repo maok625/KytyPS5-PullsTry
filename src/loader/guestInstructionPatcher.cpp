@@ -3,6 +3,57 @@
 
 #include "loader/guestInstructionPatcher.h"
 
+#if defined(__aarch64__) || defined(_M_ARM64)
+
+// The instruction patcher emits x86-64 trampolines with Xbyak. Those machine
+// bytes are not executable by an ARM64 host. Keep the public API available to
+// the common loader, but do not pretend that x86 patching is implemented on
+// ARM64; guest entry execution is separately guarded until a translator and
+// host-import ABI bridge are connected.
+namespace Loader {
+
+GuestInstructionHostFeatures GetGuestInstructionHostFeatures() {
+	return {};
+}
+
+void RegisterGuestInstructionPatchModule(void* module_ptr, uint64_t module_size,
+                                         void* trampoline_area_ptr, uint64_t trampoline_area_size) {
+	(void)module_ptr;
+	(void)module_size;
+	(void)trampoline_area_ptr;
+	(void)trampoline_area_size;
+}
+
+void UnregisterGuestInstructionPatchModule(void* module_ptr) {
+	(void)module_ptr;
+}
+
+GuestInstructionPatchResult PatchGuestInstructions(
+    uint64_t segment_addr, uint64_t segment_size, std::span<const uintptr_t> function_starts,
+    bool protect_memory, bool emulate_amd, GuestInstructionHostFeatures host_features) {
+	(void)segment_addr;
+	(void)segment_size;
+	(void)function_starts;
+	(void)protect_memory;
+	(void)emulate_amd;
+	(void)host_features;
+	return {};
+}
+
+bool DecodeEhFrameFunctionStarts(uint64_t eh_frame_header_addr, uint64_t eh_frame_header_size,
+                                 std::vector<uintptr_t>* function_starts) {
+	(void)eh_frame_header_addr;
+	(void)eh_frame_header_size;
+	if (function_starts != nullptr) {
+		function_starts->clear();
+	}
+	return false;
+}
+
+} // namespace Loader
+
+#else
+
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/virtualMemory.h"
@@ -1761,3 +1812,5 @@ void UnregisterGuestInstructionPatchModule(void* module_ptr) {
 #undef ASSERT
 
 } // namespace Loader
+
+#endif // defined(__aarch64__) || defined(_M_ARM64)
