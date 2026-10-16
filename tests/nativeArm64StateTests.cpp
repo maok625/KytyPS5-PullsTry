@@ -253,6 +253,30 @@ int main() {
 	CHECK(state.gpr[static_cast<std::size_t>(GuestGpr::Rsp)] == 0x1800);
 	CHECK(state.gpr[static_cast<std::size_t>(GuestGpr::Rbx)] == 0x123456789abcdef0ULL);
 
+	// LEAVE restores RBP from the guest frame and advances RSP atomically.
+	CHECK(memory.Load(0x1b10, {0xc9}));
+	CHECK(memory.WriteU64(0x1700, 0x1999));
+	state = GuestCpuState{};
+	state.rip = 0x1b10;
+	state.gpr[static_cast<std::size_t>(GuestGpr::Rsp)] = 0x1800;
+	state.gpr[static_cast<std::size_t>(GuestGpr::Rbp)] = 0x1700;
+	const BlockExit leave_exit = interpreter.RunBlock(state, memory, 1);
+	CHECK(leave_exit.reason == BlockExitReason::InstructionBudget);
+	CHECK(state.gpr[static_cast<std::size_t>(GuestGpr::Rsp)] == 0x1708);
+	CHECK(state.gpr[static_cast<std::size_t>(GuestGpr::Rbp)] == 0x1999);
+	CHECK(state.rip == 0x1b11);
+
+	// RET imm16 adds the immediate cleanup to the popped return address.
+	CHECK(memory.Load(0x1b20, {0xc2, 0x08, 0x00}));
+	CHECK(memory.WriteU64(0x1800, 0x3333));
+	state = GuestCpuState{};
+	state.rip = 0x1b20;
+	state.gpr[static_cast<std::size_t>(GuestGpr::Rsp)] = 0x1800;
+	const BlockExit ret_imm_exit = interpreter.RunBlock(state, memory, 1);
+	CHECK(ret_imm_exit.reason == BlockExitReason::BlockCompleted);
+	CHECK(state.rip == 0x3333);
+	CHECK(state.gpr[static_cast<std::size_t>(GuestGpr::Rsp)] == 0x1810);
+
 	// Direct CALL rel32 pushes the address of the next guest instruction.
 	CHECK(memory.Load(0x1f00, {0xe8, 0x05, 0x00, 0x00, 0x00}));
 	state = GuestCpuState{};
