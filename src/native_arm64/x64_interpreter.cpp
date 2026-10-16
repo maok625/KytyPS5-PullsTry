@@ -296,6 +296,107 @@ bool WriteRmOperand(const RmOperand& operand, GuestCpuState& state, GuestMemory&
 	return true;
 }
 
+std::size_t ByteRegisterIndex(std::size_t decoded_index, std::uint8_t encoded_low,
+                              bool rex_present, bool* high_byte) noexcept {
+	*high_byte = !rex_present && encoded_low >= 4 && encoded_low <= 7;
+	return *high_byte ? static_cast<std::size_t>(encoded_low - 4) : decoded_index;
+}
+
+std::uint8_t ReadByteRegister(const GuestCpuState& state, std::size_t decoded_index,
+                              std::uint8_t encoded_low, bool rex_present) noexcept {
+	bool high_byte = false;
+	const auto index = ByteRegisterIndex(decoded_index, encoded_low, rex_present, &high_byte);
+	return static_cast<std::uint8_t>(state.gpr[index] >> (high_byte ? 8 : 0));
+}
+
+void WriteByteRegister(GuestCpuState& state, std::size_t decoded_index,
+                       std::uint8_t encoded_low, bool rex_present, std::uint8_t value) noexcept {
+	bool high_byte = false;
+	const auto index = ByteRegisterIndex(decoded_index, encoded_low, rex_present, &high_byte);
+	const unsigned shift = high_byte ? 8 : 0;
+	const std::uint64_t mask = static_cast<std::uint64_t>(0xff) << shift;
+	state.gpr[index] = (state.gpr[index] & ~mask) | (static_cast<std::uint64_t>(value) << shift);
+}
+
+bool ReadRmByte(const RmOperand& operand, const GuestCpuState& state, const GuestMemory& memory,
+                std::uint64_t next_rip, std::uint8_t segment_override, bool rex_present,
+                std::uint8_t encoded_rm, std::uint8_t& value,
+                std::uint64_t& fault_address) noexcept {
+	if (operand.is_register) {
+		value = ReadByteRegister(state, operand.register_index, encoded_rm, rex_present);
+		return true;
+	}
+	const auto address = EffectiveAddress(operand, next_rip, state, segment_override, true);
+	if (!memory.Read(address, &value, sizeof(value))) {
+		fault_address = address;
+		return false;
+	}
+	return true;
+}
+
+bool WriteRmByte(const RmOperand& operand, GuestCpuState& state, GuestMemory& memory,
+                 std::uint64_t next_rip, std::uint8_t segment_override, bool rex_present,
+                 std::uint8_t encoded_rm, std::uint8_t value,
+                 std::uint64_t& fault_address) noexcept {
+	if (operand.is_register) {
+		WriteByteRegister(state, operand.register_index, encoded_rm, rex_present, value);
+		return true;
+	}
+	const auto address = EffectiveAddress(operand, next_rip, state, segment_override, true);
+	if (!memory.Write(address, &value, sizeof(value))) {
+		fault_address = address;
+		return false;
+	}
+	return true;
+}
+
+void UpdateArithmeticFlagsSized(GuestCpuState& state, ArithmeticOperation operation,
+                                std::uint64_t lhs, std::uint64_t rhs,
+                                std::uint64_t result, unsigned bits) noexcept {
+	const std::uint64_t mask = bits == 64 ? UINT64_MAX : ((1ULL << bits) - 1ULL);
+	const std::uint64_t sign = 1ULL << (bits - 1);
+	lhs &= mask;
+	rhs &= mask;
+	result &= mask;
+
+	std::uint64_t updated = 0;
+	bool carry = false;
+	bool overflow = false;
+	bool auxiliary = false;
+	switch (operation) {
+		case ArithmeticOperation::Add:
+			carry = bits == 64 ? result < lhs : (lhs + rhs) > mask;
+			overflow = ((~(lhs ^ rhs) & (lhs ^ result) & sign) != 0);
+			auxiliary = ((lhs ^ rhs ^ result) & 0x10) != 0;
+			break;
+		case ArithmeticOperation::Subtract:
+			carry = lhs < rhs;
+			overflow = (((lhs ^ rhs) & (lhs ^ result) & sign) != 0);
+			auxiliary = ((lhs ^ rhs ^ result) & 0x10) != 0;
+			break;
+		case ArithmeticOperation::Xor:
+			break;
+	}
+	if (carry) updated |= kFlagCarry;
+	if ((std::popcount(static_cast<std::uint8_t>(result)) & 1) == 0) updated |= kFlagParity;
+	if (auxiliary) updated |= kFlagAuxiliary;
+	if (result == 0) updated |= kFlagZero;
+	if ((result & sign) != 0) updated |= kFlagSign;
+	if (overflow) updated |= kFlagOverflow;
+	state.rflags = (state.rflags & ~kArithmeticFlags) | updated | kRflagsReservedOne;
+}
+
+void UpdateLogicalFlagsSized(GuestCpuState& state, std::uint64_t result, unsigned bits) noexcept {
+	const std::uint64_t mask = bits == 64 ? UINT64_MAX : ((1ULL << bits) - 1ULL);
+	const std::uint64_t sign = 1ULL << (bits - 1);
+	result &= mask;
+	std::uint64_t updated = 0;
+	if ((std::popcount(static_cast<std::uint8_t>(result)) & 1) == 0) updated |= kFlagParity;
+	if (result == 0) updated |= kFlagZero;
+	if ((result & sign) != 0) updated |= kFlagSign;
+	state.rflags = (state.rflags & ~kArithmeticFlags) | updated | kRflagsReservedOne;
+}
+
 void UpdateLogicalFlags(GuestCpuState& state, std::uint64_t result, bool wide) noexcept {
 	const std::uint64_t mask = wide ? UINT64_MAX : 0xffffffffULL;
 	const std::uint64_t sign = wide ? (1ULL << 63) : (1ULL << 31);
