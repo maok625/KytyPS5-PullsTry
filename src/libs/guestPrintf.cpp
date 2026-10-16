@@ -801,6 +801,7 @@ static int kyty_snprintf_ctx(VaContext* ctx) {
 	return kyty_printf_internal(true, s, n, format, &ctx->va_list);
 }
 
+#if defined(__x86_64__) || defined(_M_X64)
 static int KYTY_SYSV_ABI kyty_printf_std(VA_ARGS) {
 	VA_CONTEXT(ctx); // NOLINT(cppcoreguidelines-pro-type-member-init,hicpp-member-init)
 
@@ -810,6 +811,44 @@ static int KYTY_SYSV_ABI kyty_printf_std(VA_ARGS) {
 guest_printf_std_func_t GetGuestPrintfStdFunc() {
 	return reinterpret_cast<guest_printf_std_func_t>(kyty_printf_std);
 }
+#elif defined(__aarch64__) || defined(_M_ARM64)
+// The native runtime calls this wrapper with an explicitly marshalled x86-64
+// SysV register image: six integer registers, a pointer to copied stack
+// arguments, and the eight 128-bit XMM argument registers. This gives the
+// printf parser the guest va_list layout without using the host's va_list ABI.
+static int kyty_printf_std_arm64(uint64_t rdi, uint64_t rsi, uint64_t rdx, uint64_t rcx,
+                                uint64_t r8, uint64_t r9, uintptr_t overflow_arg_area,
+                                VaFpRegister xmm0, VaFpRegister xmm1, VaFpRegister xmm2,
+                                VaFpRegister xmm3, VaFpRegister xmm4, VaFpRegister xmm5,
+                                VaFpRegister xmm6, VaFpRegister xmm7) {
+	alignas(16) VaContext ctx {};
+	ctx.reg_save_area.gp[0] = rdi;
+	ctx.reg_save_area.gp[1] = rsi;
+	ctx.reg_save_area.gp[2] = rdx;
+	ctx.reg_save_area.gp[3] = rcx;
+	ctx.reg_save_area.gp[4] = r8;
+	ctx.reg_save_area.gp[5] = r9;
+	ctx.reg_save_area.fp[0] = xmm0;
+	ctx.reg_save_area.fp[1] = xmm1;
+	ctx.reg_save_area.fp[2] = xmm2;
+	ctx.reg_save_area.fp[3] = xmm3;
+	ctx.reg_save_area.fp[4] = xmm4;
+	ctx.reg_save_area.fp[5] = xmm5;
+	ctx.reg_save_area.fp[6] = xmm6;
+	ctx.reg_save_area.fp[7] = xmm7;
+	ctx.va_list.reg_save_area = &ctx.reg_save_area;
+	ctx.va_list.gp_offset = offsetof(VaRegSave, gp);
+	ctx.va_list.fp_offset = offsetof(VaRegSave, fp);
+	ctx.va_list.overflow_arg_area = reinterpret_cast<void*>(overflow_arg_area);
+	return kyty_printf_ctx(&ctx);
+}
+
+guest_printf_std_func_t GetGuestPrintfStdFunc() {
+	return reinterpret_cast<guest_printf_std_func_t>(kyty_printf_std_arm64);
+}
+#else
+#error "Guest printf requires x86-64 or ARM64 ABI support"
+#endif
 
 guest_printf_ctx_func_t GetGuestPrintfCtxFunc() {
 	return kyty_printf_ctx;
