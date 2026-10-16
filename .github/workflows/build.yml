@@ -5,6 +5,7 @@ on:
   push:
     branches: [ main, master ]
   pull_request:
+    branches: [ main, master ]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -30,7 +31,6 @@ jobs:
           echo "value=KytyPS5-$(date -u +'%Y-%m-%d')-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
 
   windows:
-    if: ${{ github.head_ref != 'feat/macos-arm64-kosmickrisp' }}
     name: Build KytyPS5 (Windows)
     needs: metadata
     runs-on: windows-2022
@@ -293,7 +293,6 @@ jobs:
           if-no-files-found: error
 
   linux:
-    if: ${{ github.head_ref != 'feat/macos-arm64-kosmickrisp' }}
     name: Build KytyPS5 (Linux)
     needs: metadata
     runs-on: ubuntu-24.04
@@ -436,7 +435,6 @@ jobs:
           if-no-files-found: error
 
   release:
-    if: ${{ github.head_ref != 'feat/macos-arm64-kosmickrisp' }}
     name: Release KytyPS5
     if: >-
       always() &&
