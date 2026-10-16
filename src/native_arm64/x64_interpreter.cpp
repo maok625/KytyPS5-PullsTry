@@ -350,6 +350,63 @@ bool WriteRmByte(const RmOperand& operand, GuestCpuState& state, GuestMemory& me
 	return true;
 }
 
+std::uint64_t MaskForBits(unsigned bits) noexcept {
+	return bits == 64 ? UINT64_MAX : ((1ULL << bits) - 1ULL);
+}
+
+std::uint64_t ReadGprSized(const GuestCpuState& state, std::size_t index, unsigned bits) noexcept {
+	return state.gpr[index] & MaskForBits(bits);
+}
+
+void WriteGprSized(GuestCpuState& state, std::size_t index, unsigned bits,
+                   std::uint64_t value) noexcept {
+	const std::uint64_t mask = MaskForBits(bits);
+	if (bits == 64 || bits == 32) {
+		// x86-64 32-bit writes zero-extend; 64-bit writes replace the full register.
+		state.gpr[index] = value & mask;
+	} else {
+		state.gpr[index] = (state.gpr[index] & ~mask) | (value & mask);
+	}
+}
+
+bool ReadRmSized(const RmOperand& operand, const GuestCpuState& state, const GuestMemory& memory,
+                 unsigned bits, std::uint64_t next_rip, std::uint8_t segment_override,
+                 std::uint64_t& value, std::uint64_t& fault_address) noexcept {
+	if (operand.is_register) {
+		value = ReadGprSized(state, operand.register_index, bits);
+		return true;
+	}
+	const auto address = EffectiveAddress(operand, next_rip, state, segment_override, true);
+	std::uint8_t bytes[sizeof(std::uint64_t)]{};
+	const std::size_t size = bits / 8;
+	if (!memory.Read(address, bytes, size)) {
+		fault_address = address;
+		return false;
+	}
+	value = ReadLittleEndianU64(bytes) & MaskForBits(bits);
+	return true;
+}
+
+bool WriteRmSized(const RmOperand& operand, GuestCpuState& state, GuestMemory& memory,
+                  unsigned bits, std::uint64_t next_rip, std::uint8_t segment_override,
+                  std::uint64_t value, std::uint64_t& fault_address) noexcept {
+	if (operand.is_register) {
+		WriteGprSized(state, operand.register_index, bits, value);
+		return true;
+	}
+	const auto address = EffectiveAddress(operand, next_rip, state, segment_override, true);
+	std::uint8_t bytes[sizeof(std::uint64_t)]{};
+	const std::size_t size = bits / 8;
+	for (std::size_t i = 0; i < size; ++i) {
+		bytes[i] = static_cast<std::uint8_t>(value >> (i * 8));
+	}
+	if (!memory.Write(address, bytes, size)) {
+		fault_address = address;
+		return false;
+	}
+	return true;
+}
+
 void UpdateArithmeticFlagsSized(GuestCpuState& state, ArithmeticOperation operation,
                                 std::uint64_t lhs, std::uint64_t rhs,
                                 std::uint64_t result, unsigned bits) noexcept {
