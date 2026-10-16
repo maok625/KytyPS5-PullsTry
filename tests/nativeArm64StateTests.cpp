@@ -225,6 +225,41 @@ int main() {
 	CHECK(state.gpr[static_cast<std::size_t>(GuestGpr::Rsp)] == 0x1800);
 	CHECK(state.gpr[static_cast<std::size_t>(GuestGpr::Rbx)] == 0x123456789abcdef0ULL);
 
+	// Direct CALL rel32 pushes the address of the next guest instruction.
+	CHECK(memory.Load(0x1f00, {0xe8, 0x05, 0x00, 0x00, 0x00}));
+	state = GuestCpuState{};
+	state.rip = 0x1f00;
+	state.gpr[static_cast<std::size_t>(GuestGpr::Rsp)] = 0x1800;
+	const BlockExit direct_call_exit = interpreter.RunBlock(state, memory, 1);
+	CHECK(direct_call_exit.reason == BlockExitReason::BlockCompleted);
+	CHECK(state.rip == 0x1f0a);
+	CHECK(state.gpr[static_cast<std::size_t>(GuestGpr::Rsp)] == 0x17f8);
+	CHECK(memory.ReadU64(0x17f8, stored_value));
+	CHECK(stored_value == 0x1f05);
+
+	// Indirect CALL RAX and JMP RAX honor the guest register target.
+	CHECK(memory.Load(0x1f10, {0xff, 0xd0}));
+	state = GuestCpuState{};
+	state.rip = 0x1f10;
+	state.gpr[static_cast<std::size_t>(GuestGpr::Rax)] = 0x2222;
+	state.gpr[static_cast<std::size_t>(GuestGpr::Rsp)] = 0x1800;
+	const BlockExit indirect_call_exit = interpreter.RunBlock(state, memory, 1);
+	CHECK(indirect_call_exit.reason == BlockExitReason::BlockCompleted);
+	CHECK(state.rip == 0x2222);
+	CHECK(state.gpr[static_cast<std::size_t>(GuestGpr::Rsp)] == 0x17f8);
+	CHECK(memory.ReadU64(0x17f8, stored_value));
+	CHECK(stored_value == 0x1f12);
+
+	CHECK(memory.Load(0x1f20, {0xff, 0xe0}));
+	state = GuestCpuState{};
+	state.rip = 0x1f20;
+	state.gpr[static_cast<std::size_t>(GuestGpr::Rax)] = 0x3333;
+	state.gpr[static_cast<std::size_t>(GuestGpr::Rsp)] = 0x1800;
+	const BlockExit indirect_jump_exit = interpreter.RunBlock(state, memory, 1);
+	CHECK(indirect_jump_exit.reason == BlockExitReason::BlockCompleted);
+	CHECK(state.rip == 0x3333);
+	CHECK(state.gpr[static_cast<std::size_t>(GuestGpr::Rsp)] == 0x1800);
+
 	// FS segment override is added to the effective address in long mode.
 	CHECK(memory.WriteU64(0x1810, 0xfeedfacecafebeefULL));
 	CHECK(memory.Load(0x1c00, {0x64, 0x48, 0x8b, 0x00})); // MOV RAX, FS:[RAX]
