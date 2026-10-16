@@ -35,7 +35,7 @@ macOS support is experimental. The emulator is built for x86-64 and runs on Appl
 Rosetta 2, with Vulkan provided by MoltenVK. A small number of titles have been verified in-game
 on Apple Silicon hardware; see [Building on macOS](#building-on-macos).
 
-A separate [native Apple Silicon ARM64 branch](https://github.com/maok625/KytyPS5-PullsTry/tree/feat/macos-arm64-kosmickrisp) targets macOS only. It requires macOS 26+, an installed LunarG Vulkan SDK that includes KosmicKrisp, and does not bundle the SDK or driver. The native Vulkan path selects KosmicKrisp through the SDK loader; the legacy x86-64/Rosetta 2 path remains as a fallback and uses MoltenVK. The x86-64 interpreter subset is tested but is not yet connected to the PS5 loader/runtime, so the native branch cannot yet run PS5 games. See the [native ARM64 build instructions](docs/macos-arm64-native-port.md).
+A separate [native Apple Silicon ARM64 branch](https://github.com/maok625/KytyPS5-PullsTry/tree/feat/macos-arm64-kosmickrisp) targets macOS only. It requires macOS 26+ and a LunarG Vulkan SDK installed with the optional KosmicKrisp component selected. The SDK and driver are never bundled with native ARM64 builds. The native Vulkan path selects KosmicKrisp through the SDK loader; the legacy x86-64/Rosetta 2 path remains as a fallback and uses MoltenVK. The x86-64 interpreter subset is tested but is not yet connected to the PS5 loader/runtime, so the native branch cannot yet run PS5 games. See the [native ARM64 build instructions](docs/macos-arm64-native-port.md).
 
 Community game test results are available in the
 [KytyPS5 Compatibility List](https://kytyps5.github.io/).
