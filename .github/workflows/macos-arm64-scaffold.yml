@@ -1,0 +1,41 @@
+name: macOS ARM64 scaffold
+
+on:
+  push:
+    branches:
+      - feat/macos-arm64-kosmickrisp
+  pull_request:
+    branches:
+      - rever3
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  guest-state-contract:
+    name: Compile arm64 guest-state contract
+    runs-on: macos-15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Compile arm64 contract and tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="$RUNNER_TEMP/native-arm64-state-tests"
+          clang++ -std=c++20 -Wall -Wextra -Werror -arch arm64 \
+            -Isrc tests/nativeArm64StateTests.cpp -o "$binary"
+          file "$binary"
+          file "$binary" | grep -q 'arm64'
+
+      - name: Run tests when hosted runner is arm64
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$(uname -m)" == "arm64" ]]; then
+            "$RUNNER_TEMP/native-arm64-state-tests"
+          else
+            echo "The contract was cross-compiled for arm64; runtime execution requires an Apple Silicon runner."
+          fi
