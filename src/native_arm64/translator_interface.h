@@ -49,6 +49,19 @@ public:
 	                                std::size_t size) const noexcept = 0;
 	[[nodiscard]] virtual bool Write(std::uint64_t guest_address, const void* source,
 	                                 std::size_t size) noexcept = 0;
+
+	// Native ARM64 execution must never jump into a host AArch64 function as if
+	// its bytes were x86-64 instructions. The runtime can claim a call target
+	// only when it knows that target is a registered host import or callback.
+	// tail_call means the x86 instruction is JMP through an import thunk, so
+	// the current guest return address is already at [RSP].
+	virtual bool TryDispatchHostCall(std::uint64_t target, GuestCpuState& state,
+	                                 bool tail_call) noexcept {
+		(void)target;
+		(void)state;
+		(void)tail_call;
+		return false;
+	}
 };
 
 // Interface for an x86-64 guest execution backend. The first implementation is
