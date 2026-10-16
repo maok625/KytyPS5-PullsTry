@@ -546,6 +546,42 @@ InstructionStep X64Interpreter::ExecuteOne(GuestCpuState& state, GuestMemory& me
 
 	// Register-direct forms only. Memory operands are deliberately rejected
 	// until guest-address translation and page-fault behavior are implemented.
+	if (opcode == 0xff) { // Indirect CALL/JMP r/m64 (groups /2 and /4)
+		std::uint8_t modrm = 0;
+		if (!reader.ReadByte(modrm)) {
+			return ReaderFailure(reader);
+		}
+		const std::uint8_t group = static_cast<std::uint8_t>((modrm >> 3) & 0x07);
+		if (group != 0x02 && group != 0x04) {
+			return Unsupported(instruction_rip, opcode);
+		}
+		RmOperand target_operand{};
+		if (!DecodeRmOperand(reader, state, modrm, rex, target_operand)) {
+			return ReaderFailure(reader);
+		}
+		std::uint64_t target = 0;
+		std::uint64_t fault_address = 0;
+		if (!ReadRmOperand(target_operand, state, memory, true, reader.Cursor(),
+		                   segment_override, target, fault_address)) {
+			return {InstructionStepStatus::MemoryFault, instruction_rip, fault_address};
+		}
+		if (group == 0x02) {
+			const std::uint64_t return_address = reader.Cursor();
+			const auto old_stack = state.gpr[static_cast<std::size_t>(GuestGpr::Rsp)];
+			const auto new_stack = old_stack - sizeof(return_address);
+			std::uint8_t bytes[sizeof(return_address)]{};
+			for (std::size_t i = 0; i < sizeof(return_address); ++i) {
+				bytes[i] = static_cast<std::uint8_t>(return_address >> (i * 8));
+			}
+			if (!memory.Write(new_stack, bytes, sizeof(bytes))) {
+				return {InstructionStepStatus::MemoryFault, instruction_rip, new_stack};
+			}
+			state.gpr[static_cast<std::size_t>(GuestGpr::Rsp)] = new_stack;
+		}
+		state.rip = target;
+		return {InstructionStepStatus::ControlFlow, instruction_rip, opcode};
+	}
+
 	if (opcode == 0xc7) { // MOV r/m32/r/m64, imm32 (group /0)
 		std::uint8_t modrm = 0;
 		if (!reader.ReadByte(modrm)) {
