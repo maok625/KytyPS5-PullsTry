@@ -627,6 +627,14 @@ static uint64_t RunNativeArm64Guest(RuntimeLinker& runtime, uint64_t entry,
 		}
 	}
 }
+
+uint64_t RunNativeArm64GuestThread(uint64_t entry, void* arg, void* stack_top) {
+	auto* runtime = Common::Singleton<RuntimeLinker>::Instance();
+	bool  guest_exited = false;
+	return RunNativeArm64Guest(*runtime, entry,
+	                           {reinterpret_cast<uint64_t>(arg), 0, 0, 0, 0, 0},
+	                           stack_top, {}, 0, &guest_exited);
+}
 #endif
 
 static KYTY_SYSV_ABI void RunEntry(uint64_t addr, EntryParams* params, atexit_func_t atexit_func,
