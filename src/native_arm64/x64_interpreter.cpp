@@ -466,6 +466,7 @@ InstructionStep X64Interpreter::ExecuteOne(GuestCpuState& state, GuestMemory& me
 	InstructionReader reader(memory, instruction_rip);
 
 	std::uint8_t rex = 0;
+	bool rex_present = false;
 	std::uint8_t segment_override = 0;
 	std::uint8_t opcode = 0;
 	for (;;) {
@@ -474,11 +475,13 @@ InstructionStep X64Interpreter::ExecuteOne(GuestCpuState& state, GuestMemory& me
 		}
 		if (opcode >= 0x40 && opcode <= 0x4f) {
 			rex = opcode;
+			rex_present = true;
 			continue;
 		}
 		if (opcode == 0x64 || opcode == 0x65) { // FS / GS segment override
 			segment_override = opcode;
-			rex = 0; // REX is effective only when it precedes the opcode.
+			rex = 0;
+			rex_present = false; // A legacy prefix after REX makes that REX ineffective.
 			continue;
 		}
 		if (opcode == 0x66 || opcode == 0x67 || opcode == 0xf0 ||
