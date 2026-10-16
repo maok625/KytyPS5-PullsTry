@@ -1,6 +1,6 @@
 # Native Apple Silicon (arm64) port
 
-**Status: early scaffolding only — this branch is not yet capable of running PS5 games natively.**
+**Status: initial interpreter subset implemented — still not connected to the PS5 loader/runtime, and not yet capable of running games natively.**
 
 ## Goal
 
@@ -15,20 +15,24 @@ Build KytyPS5 itself as an arm64 macOS process and execute the PS5's x86-64 gues
 
 ## Initial code boundary
 
-`src/native_arm64/guest_cpu_state.h` defines the guest architectural state needed at the translator boundary. `src/native_arm64/translator_interface.h` defines the future block-execution contract. These files are deliberately not wired into the emulator yet: there is no implementation behind the interface, and routing guest execution through it before it is implemented would be unsafe.
+`src/native_arm64/guest_cpu_state.h` defines the guest architectural state. `src/native_arm64/translator_interface.h` defines guest memory and the execution-backend contract. `src/native_arm64/x64_interpreter.cpp` now implements a first, deliberately limited interpreter that executes as ordinary C++ on the host; it does not emit or execute x86-64 host machine code, so this backend itself does not need Rosetta 2 or JIT executable memory.
 
-The initial state model covers the 16 x86-64 general-purpose registers, RIP/RFLAGS, FS/GS bases, 16 256-bit YMM registers (AVX/AVX2), x87 register storage, and MXCSR/control state. The model is a starting contract, not a complete CPU implementation; exception details, signal/context integration, x87/MMX aliasing, and additional architectural state still need explicit handling.
+**Supported bring-up subset:** NOP; MOV register-to-register; MOV register-immediate (32-bit and 64-bit); register-direct ADD, SUB, and XOR with arithmetic flag updates; direct short and near JMP; and RET through the guest-memory interface. Writes to 32-bit registers zero-extend as on x86-64. A block stops at control-flow boundaries, unsupported instructions, or memory faults, and the reported guest RIP remains at an unsupported/faulting instruction.
+
+**Important limitations:** this is not a complete x86-64 implementation and is not connected to `RuntimeLinker`. It currently rejects memory operands (apart from reading a RET target), conditional branches, calls, syscalls, SSE/AVX, x87, atomics, and most other instructions. The interpreter has no translated-code cache, and its `InvalidateCodeRange` method is intentionally a no-op. It is a testable first milestone, not gameplay support.
+
+The guest state model includes the 16 x86-64 general-purpose registers, RIP/RFLAGS, FS/GS bases, 16 256-bit YMM registers (AVX/AVX2), x87 register storage, and MXCSR/control state. It remains a starting contract: signal/context integration, x87/MMX aliasing, precise exceptions, and additional architectural state need explicit handling.
 
 ## Work plan and acceptance criteria
 
 1. **Native build plumbing:** make the emulator compile as arm64 without changing the current x86-64 build. Inventory all x86-only assembly, code emitters, linker flags, guest-memory assumptions, and executable-memory requirements.
-2. **Guest CPU backend:** implement and test an AArch64 DBT/interpreter backend. Preserve x86-64 integer semantics and flags, RIP-relative addressing, SSE/AVX/AVX2 behavior needed by PS5 titles, and guest exception/fault semantics. The PS5 CPU is Zen 2 class; do not assume AVX-512 is available.
+2. **Guest CPU backend:** expand the interpreter with complete memory addressing and conditional control flow, then build a tested AArch64 DBT path. Preserve x86-64 integer semantics and flags, RIP-relative addressing, SSE/AVX/AVX2 behavior needed by PS5 titles, and guest exception/fault semantics. The PS5 CPU is Zen 2 class; do not assume AVX-512 is available.
 3. **Kernel/loader integration:** route guest code entry points, calls/returns, syscalls, signals, faults, and code writes through the backend. Invalidate translated blocks when executable guest memory changes.
 4. **Native memory model:** separate PS5 guest virtual addresses from host pointers and remove the macOS x86-64-only `-segaddr` / `-image_base` strategy from the arm64 path.
 5. **Graphics:** evaluate KosmicKrisp as an alternative Vulkan ICD to MoltenVK through the Vulkan loader. Compare the Vulkan extensions, formats, synchronization behavior, and limits Kyty actually requires; keep a proven fallback. This work must remain independent from the CPU translator.
 6. **CI and regression testing:** build the native binary on an Apple Silicon runner and run state, instruction, memory, syscall, exception, and existing emulator tests. Keep a separate x86-64 macOS/Rosetta job until parity is demonstrated.
 
-## Build the state-contract smoke test
+## Build and run the interpreter smoke test
 
 On macOS with Xcode Command Line Tools, CMake, Ninja, and the project dependencies installed:
 
@@ -44,8 +48,4 @@ cmake --build _Build/macos-arm64-native --target native_arm64_state_tests --para
 ctest --test-dir _Build/macos-arm64-native -R native_arm64_state --output-on-failure
 ```
 
-The standalone GitHub Actions workflow compiles the same test for the arm64 target. Neither the CMake target nor the workflow builds the complete emulator or validates guest instruction execution.
-
-## Current validation
-
-The accompanying `macos-arm64-scaffold.yml` workflow only checks that the new guest-state boundary can be compiled for the arm64 target. It does **not** mean that the complete KytyPS5 application builds or runs natively yet.
+The standalone GitHub Actions workflow compiles the interpreter and runs its tests when the runner is Apple Silicon. This smoke target does **not** build the complete emulator or validate broad game compatibility. Keep the full application build separate until the runtime-linker and JIT assumptions have been removed from the native execution path.
