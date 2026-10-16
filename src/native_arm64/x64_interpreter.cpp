@@ -805,9 +805,207 @@ InstructionStep X64Interpreter::ExecuteOne(GuestCpuState& state, GuestMemory& me
 		return {InstructionStepStatus::Continue, instruction_rip, opcode};
 	}
 
+	// Operand-size override selects 16-bit integer operations in long mode,
+	// unless REX.W is present (which takes precedence over 66h).
+	if (operand_size_override && !wide && opcode >= 0xb8 && opcode <= 0xbf) {
+		std::uint16_t immediate = 0;
+		if (!ReadLittleEndian(reader, immediate)) {
+			return ReaderFailure(reader);
+		}
+		const auto destination = RegisterIndex(static_cast<std::uint8_t>(opcode - 0xb8), rex_b);
+		WriteGprSized(state, destination, 16, immediate);
+		state.rip = reader.Cursor();
+		return {InstructionStepStatus::Continue, instruction_rip, opcode};
+	}
+
+	if (operand_size_override && !wide && opcode == 0xc7) { // MOV r/m16, imm16 (/0)
+		std::uint8_t modrm = 0;
+		if (!reader.ReadByte(modrm)) {
+			return ReaderFailure(reader);
+		}
+		if (((modrm >> 3) & 0x07) != 0) {
+			return Unsupported(instruction_rip, opcode);
+		}
+		RmOperand destination{};
+		if (!DecodeRmOperand(reader, state, modrm, rex, destination)) {
+			return ReaderFailure(reader);
+		}
+		std::uint16_t immediate = 0;
+		if (!ReadLittleEndian(reader, immediate)) {
+			return ReaderFailure(reader);
+		}
+		std::uint64_t fault_address = 0;
+		if (!WriteRmSized(destination, state, memory, 16, reader.Cursor(), segment_override,
+		                  immediate, fault_address)) {
+			return {InstructionStepStatus::MemoryFault, instruction_rip, fault_address};
+		}
+		state.rip = reader.Cursor();
+		return {InstructionStepStatus::Continue, instruction_rip, opcode};
+	}
+
+	if (operand_size_override && !wide &&
+	    (opcode == 0x89 || opcode == 0x8b || opcode == 0x8d ||
+	     opcode == 0x01 || opcode == 0x03 || opcode == 0x09 || opcode == 0x0b ||
+	     opcode == 0x21 || opcode == 0x23 || opcode == 0x29 || opcode == 0x2b ||
+	     opcode == 0x31 || opcode == 0x33 || opcode == 0x39 || opcode == 0x3b ||
+	     opcode == 0x85)) {
+		std::uint8_t modrm = 0;
+		if (!reader.ReadByte(modrm)) {
+			return ReaderFailure(reader);
+		}
+		RmOperand rm{};
+		if (!DecodeRmOperand(reader, state, modrm, rex, rm)) {
+			return ReaderFailure(reader);
+		}
+		const auto reg_low = static_cast<std::uint8_t>((modrm >> 3) & 0x07);
+		const auto reg = RegisterIndex(reg_low, rex_r);
+		const auto next_rip = reader.Cursor();
+
+		if (opcode == 0x89) { // MOV r/m16, r16
+			std::uint64_t fault_address = 0;
+			if (!WriteRmSized(rm, state, memory, 16, next_rip, segment_override,
+			                  ReadGprSized(state, reg, 16), fault_address)) {
+				return {InstructionStepStatus::MemoryFault, instruction_rip, fault_address};
+			}
+			state.rip = next_rip;
+			return {InstructionStepStatus::Continue, instruction_rip, opcode};
+		}
+		if (opcode == 0x8b) { // MOV r16, r/m16
+			std::uint64_t source = 0;
+			std::uint64_t fault_address = 0;
+			if (!ReadRmSized(rm, state, memory, 16, next_rip, segment_override,
+			                 source, fault_address)) {
+				return {InstructionStepStatus::MemoryFault, instruction_rip, fault_address};
+			}
+			WriteGprSized(state, reg, 16, source);
+			state.rip = next_rip;
+			return {InstructionStepStatus::Continue, instruction_rip, opcode};
+		}
+		if (opcode == 0x8d) { // LEA r16, m
+			if (rm.is_register) {
+				return Unsupported(instruction_rip, opcode);
+			}
+			WriteGprSized(state, reg, 16,
+			              EffectiveAddress(rm, next_rip, state, 0, false));
+			state.rip = next_rip;
+			return {InstructionStepStatus::Continue, instruction_rip, opcode};
+		}
+
+		std::uint64_t rm_value = 0;
+		std::uint64_t fault_address = 0;
+		if (!ReadRmSized(rm, state, memory, 16, next_rip, segment_override,
+		                 rm_value, fault_address)) {
+			return {InstructionStepStatus::MemoryFault, instruction_rip, fault_address};
+		}
+		const std::uint64_t reg_value = ReadGprSized(state, reg, 16);
+		const bool test = opcode == 0x85;
+		const bool rm_is_destination = test || (opcode & 0x02) == 0;
+		const std::uint64_t lhs = rm_is_destination ? rm_value : reg_value;
+		const std::uint64_t rhs = rm_is_destination ? reg_value : rm_value;
+		std::uint64_t result = 0;
+		bool logical = false;
+		bool compare = false;
+		ArithmeticOperation operation = ArithmeticOperation::Add;
+		switch (opcode) {
+			case 0x01: case 0x03: result = lhs + rhs; break;
+			case 0x09: case 0x0b: result = lhs | rhs; logical = true; break;
+			case 0x21: case 0x23: result = lhs & rhs; logical = true; break;
+			case 0x29: case 0x2b: result = lhs - rhs; operation = ArithmeticOperation::Subtract; break;
+			case 0x31: case 0x33: result = lhs ^ rhs; operation = ArithmeticOperation::Xor; break;
+			case 0x39: case 0x3b: result = lhs - rhs; operation = ArithmeticOperation::Subtract; compare = true; break;
+			case 0x85: result = lhs & rhs; logical = true; break;
+			default: return Unsupported(instruction_rip, opcode);
+		}
+		result &= 0xffff;
+		if (!compare && !test) {
+			if (rm_is_destination) {
+				if (!WriteRmSized(rm, state, memory, 16, next_rip, segment_override,
+				                  result, fault_address)) {
+					return {InstructionStepStatus::MemoryFault, instruction_rip, fault_address};
+				}
+			} else {
+				WriteGprSized(state, reg, 16, result);
+			}
+		}
+		if (logical) {
+			UpdateLogicalFlagsSized(state, result, 16);
+		} else {
+			UpdateArithmeticFlagsSized(state, operation, lhs, rhs, result, 16);
+		}
+		state.rip = next_rip;
+		return {InstructionStepStatus::Continue, instruction_rip, opcode};
+	}
+
+	if (operand_size_override && !wide && (opcode == 0x81 || opcode == 0x83)) {
+		std::uint8_t modrm = 0;
+		if (!reader.ReadByte(modrm)) {
+			return ReaderFailure(reader);
+		}
+		const std::uint8_t group = static_cast<std::uint8_t>((modrm >> 3) & 0x07);
+		if (!(group == 0 || group == 1 || group == 4 || group == 5 ||
+		      group == 6 || group == 7)) {
+			return Unsupported(instruction_rip, opcode);
+		}
+		RmOperand destination{};
+		if (!DecodeRmOperand(reader, state, modrm, rex, destination)) {
+			return ReaderFailure(reader);
+		}
+		std::uint16_t immediate = 0;
+		if (opcode == 0x83) {
+			std::uint8_t encoded = 0;
+			if (!ReadLittleEndian(reader, encoded)) {
+				return ReaderFailure(reader);
+			}
+			immediate = static_cast<std::uint16_t>(std::bit_cast<std::int8_t>(encoded));
+		} else {
+			if (!ReadLittleEndian(reader, immediate)) {
+				return ReaderFailure(reader);
+			}
+		}
+		const auto next_rip = reader.Cursor();
+		std::uint64_t lhs = 0;
+		std::uint64_t fault_address = 0;
+		if (!ReadRmSized(destination, state, memory, 16, next_rip, segment_override,
+		                 lhs, fault_address)) {
+			return {InstructionStepStatus::MemoryFault, instruction_rip, fault_address};
+		}
+		const std::uint64_t rhs = immediate;
+		std::uint64_t result = 0;
+		bool is_compare = false;
+		bool is_logical = false;
+		ArithmeticOperation operation = ArithmeticOperation::Add;
+		switch (group) {
+			case 0: result = lhs + rhs; break;
+			case 1: result = lhs | rhs; is_logical = true; break;
+			case 4: result = lhs & rhs; is_logical = true; break;
+			case 5: result = lhs - rhs; operation = ArithmeticOperation::Subtract; break;
+			case 6: result = lhs ^ rhs; operation = ArithmeticOperation::Xor; is_logical = true; break;
+			case 7: result = lhs - rhs; operation = ArithmeticOperation::Subtract; is_compare = true; break;
+			default: return Unsupported(instruction_rip, opcode);
+		}
+		result &= 0xffff;
+		if (!is_compare && !WriteRmSized(destination, state, memory, 16, next_rip,
+		                                segment_override, result, fault_address)) {
+			return {InstructionStepStatus::MemoryFault, instruction_rip, fault_address};
+		}
+		if (is_logical) {
+			UpdateLogicalFlagsSized(state, result, 16);
+		} else {
+			UpdateArithmeticFlagsSized(state, operation, lhs, rhs, result, 16);
+		}
+		state.rip = next_rip;
+		return {InstructionStepStatus::Continue, instruction_rip, opcode};
+	}
+
 	if (opcode == 0x90) { // NOP
 		state.rip = reader.Cursor();
 		return {InstructionStepStatus::Continue, instruction_rip, opcode};
+	}
+
+	// Do not silently reinterpret an unimplemented 16-bit instruction as its
+	// 32-bit counterpart merely because an operand-size prefix was decoded.
+	if (operand_size_override && !wide) {
+		return Unsupported(instruction_rip, opcode);
 	}
 
 	if (opcode >= 0xb8 && opcode <= 0xbf) { // MOV r32/r64, imm32/imm64
