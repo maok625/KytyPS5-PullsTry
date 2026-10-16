@@ -65,6 +65,25 @@ public:
 		return true;
 	}
 
+	static constexpr std::uint64_t kHostCallTarget = 0x2ff0;
+	static constexpr std::uint64_t kHostCallResult = 0x0123456789abcdefULL;
+
+	bool TryDispatchHostCall(std::uint64_t target, GuestCpuState& state,
+	                         bool tail_call) noexcept override {
+		if (target != kHostCallTarget) {
+			return false;
+		}
+		++host_dispatch_count_;
+		last_host_dispatch_was_tail_call_ = tail_call;
+		state.gpr[static_cast<std::size_t>(GuestGpr::Rax)] = kHostCallResult;
+		return true;
+	}
+
+	[[nodiscard]] std::size_t HostDispatchCount() const noexcept { return host_dispatch_count_; }
+	[[nodiscard]] bool LastHostDispatchWasTailCall() const noexcept {
+		return last_host_dispatch_was_tail_call_;
+	}
+
 	bool Load(std::uint64_t address, std::initializer_list<std::uint8_t> bytes) noexcept {
 		return Write(address, bytes.begin(), bytes.size());
 	}
@@ -91,6 +110,8 @@ public:
 
 private:
 	std::vector<std::uint8_t> bytes_;
+	std::size_t host_dispatch_count_ = 0;
+	bool last_host_dispatch_was_tail_call_ = false;
 };
 
 int main() {
@@ -568,6 +589,49 @@ int main() {
 	CHECK(indirect_jump_exit.reason == BlockExitReason::BlockCompleted);
 	CHECK(state.rip == 0x3333);
 	CHECK(state.gpr[static_cast<std::size_t>(GuestGpr::Rsp)] == 0x1800);
+
+	// Native-host import dispatch must emulate CALL/RET net effects: preserve
+	// guest RSP, return to the next instruction, and propagate the host RAX value.
+	CHECK(memory.Load(0x1f30, {0xe8, 0xbb, 0x10, 0x00, 0x00})); // CALL 0x2ff0
+	state = GuestCpuState{};
+	state.rip = 0x1f30;
+	state.gpr[static_cast<std::size_t>(GuestGpr::Rsp)] = 0x1800;
+	const BlockExit direct_host_call_exit = interpreter.RunBlock(state, memory, 1);
+	CHECK(direct_host_call_exit.reason == BlockExitReason::BlockCompleted);
+	CHECK(state.rip == 0x1f35);
+	CHECK(state.gpr[static_cast<std::size_t>(GuestGpr::Rsp)] == 0x1800);
+	CHECK(state.gpr[static_cast<std::size_t>(GuestGpr::Rax)] == TestMemory::kHostCallResult);
+	CHECK(memory.HostDispatchCount() == 1);
+	CHECK(!memory.LastHostDispatchWasTailCall());
+
+	CHECK(memory.Load(0x1f40, {0xff, 0xd0})); // CALL RAX
+	state = GuestCpuState{};
+	state.rip = 0x1f40;
+	state.gpr[static_cast<std::size_t>(GuestGpr::Rax)] = TestMemory::kHostCallTarget;
+	state.gpr[static_cast<std::size_t>(GuestGpr::Rsp)] = 0x1800;
+	const BlockExit indirect_host_call_exit = interpreter.RunBlock(state, memory, 1);
+	CHECK(indirect_host_call_exit.reason == BlockExitReason::BlockCompleted);
+	CHECK(state.rip == 0x1f42);
+	CHECK(state.gpr[static_cast<std::size_t>(GuestGpr::Rsp)] == 0x1800);
+	CHECK(state.gpr[static_cast<std::size_t>(GuestGpr::Rax)] == TestMemory::kHostCallResult);
+	CHECK(memory.HostDispatchCount() == 2);
+	CHECK(!memory.LastHostDispatchWasTailCall());
+
+	// A tail JMP to a native import must consume the caller's existing return
+	// address only after the host function returns.
+	CHECK(memory.Load(0x1f50, {0xff, 0xe0})); // JMP RAX
+	CHECK(memory.WriteU64(0x1800, 0x1b55));
+	state = GuestCpuState{};
+	state.rip = 0x1f50;
+	state.gpr[static_cast<std::size_t>(GuestGpr::Rax)] = TestMemory::kHostCallTarget;
+	state.gpr[static_cast<std::size_t>(GuestGpr::Rsp)] = 0x1800;
+	const BlockExit tail_host_call_exit = interpreter.RunBlock(state, memory, 1);
+	CHECK(tail_host_call_exit.reason == BlockExitReason::BlockCompleted);
+	CHECK(state.rip == 0x1b55);
+	CHECK(state.gpr[static_cast<std::size_t>(GuestGpr::Rsp)] == 0x1808);
+	CHECK(state.gpr[static_cast<std::size_t>(GuestGpr::Rax)] == TestMemory::kHostCallResult);
+	CHECK(memory.HostDispatchCount() == 3);
+	CHECK(memory.LastHostDispatchWasTailCall());
 
 	// FS segment override is added to the effective address in long mode.
 	CHECK(memory.WriteU64(0x1810, 0xfeedfacecafebeefULL));
