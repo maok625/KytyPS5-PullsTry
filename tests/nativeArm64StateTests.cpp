@@ -278,6 +278,30 @@ int main() {
 	CHECK(unsupported_word_exit.guest_rip == 0x2024);
 	CHECK(state.gpr[static_cast<std::size_t>(GuestGpr::Rax)] == 5);
 
+	// OR and AND update logical flags and preserve x86-64 operand direction.
+	CHECK(memory.Load(0x2040, {0x09, 0xd8})); // OR EAX, EBX
+	state = GuestCpuState{};
+	state.rip = 0x2040;
+	state.gpr[static_cast<std::size_t>(GuestGpr::Rax)] = 0xffff0000ULL;
+	state.gpr[static_cast<std::size_t>(GuestGpr::Rbx)] = 0x000000f0ULL;
+	state.rflags = (1ULL << 1) | (1ULL << 0) | (1ULL << 11);
+	const BlockExit or_exit = interpreter.RunBlock(state, memory, 1);
+	CHECK(or_exit.reason == BlockExitReason::InstructionBudget);
+	CHECK(state.gpr[static_cast<std::size_t>(GuestGpr::Rax)] == 0x0000f0f0ULL);
+	CHECK((state.rflags & (1ULL << 2)) != 0); // even parity of low result byte 0xf0
+	CHECK((state.rflags & (1ULL << 0)) == 0); // logical operations clear CF
+	CHECK((state.rflags & (1ULL << 11)) == 0); // logical operations clear OF
+
+	CHECK(memory.Load(0x2042, {0x23, 0xca})); // AND ECX, EDX
+	state = GuestCpuState{};
+	state.rip = 0x2042;
+	state.gpr[static_cast<std::size_t>(GuestGpr::Rcx)] = 0xaaaaaaaa0000ffffULL;
+	state.gpr[static_cast<std::size_t>(GuestGpr::Rdx)] = 0x12345678ULL;
+	const BlockExit and_exit = interpreter.RunBlock(state, memory, 1);
+	CHECK(and_exit.reason == BlockExitReason::InstructionBudget);
+	CHECK(state.gpr[static_cast<std::size_t>(GuestGpr::Rcx)] == 0x5678ULL);
+	CHECK((state.rflags & (1ULL << 6)) == 0);
+
 	// Memory MOV and immediate ADD exercise base-register effective addresses.
 	CHECK(memory.Load(0x1600, {
 	    0x48, 0xb8, 0x00, 0x17, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // RAX = 0x1700
