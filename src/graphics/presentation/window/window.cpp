@@ -877,7 +877,7 @@ static void ConfigureNativeKosmicKrispVulkan() {
 	LOGF("Vulkan loader: %s\n", loader_path.string().c_str());
 	LOGF("Vulkan ICD: KosmicKrisp from %s\n", manifest.string().c_str());
 }
-
+#endif
 
 static void WindowCreate(WindowContext& context) {
 	EXIT_IF(context.window != nullptr);
