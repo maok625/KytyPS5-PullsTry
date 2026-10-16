@@ -147,6 +147,7 @@ static std::atomic_uint32_t g_install_state {0};
 static_assert(decltype(g_handler)::is_always_lock_free);
 static_assert(decltype(g_install_state)::is_always_lock_free);
 
+#if defined(__x86_64__) || defined(_M_X64)
 // Translate the x86-64 page-fault error code (mcontext __es.__err) into an access type.
 // bit 1 (0x2) = write, bit 4 (0x10) = instruction fetch, otherwise a read.
 static AccessViolationType DecodeAccess(uint64_t err) {
@@ -159,10 +160,7 @@ static AccessViolationType DecodeAccess(uint64_t err) {
 	return AccessViolationType::Read;
 }
 
-// POSIX signal handler that mirrors the Windows vectored handler: build an ExceptionInfo
-// from the mcontext and dispatch. A resolved fault (handler returns true) simply returns,
-// re-executing the faulting instruction against the now-fixed protection. An unresolved
-// fault restores the default disposition so the retry terminates the process.
+// POSIX signal handler for the existing Intel macOS/Rosetta execution path.
 static void SignalHandler(int sig, siginfo_t* si, void* uctx) {
 	auto*       uc = static_cast<ucontext_t*>(uctx);
 	const auto* mc = uc->uc_mcontext;
@@ -200,16 +198,64 @@ static void SignalHandler(int sig, siginfo_t* si, void* uctx) {
 
 	const auto handler = g_handler.load(std::memory_order_acquire);
 	if (handler != nullptr && handler(info)) {
-		return; // retry the faulting instruction against the fixed mapping
+		return; // retry the faulting instruction against the fixed protection
 	}
 
-	// Unresolved: restore the default action so the re-executed instruction terminates.
 	struct sigaction dfl {};
 	dfl.sa_handler = SIG_DFL;
 	sigemptyset(&dfl.sa_mask);
 	sigaction(sig, &dfl, nullptr);
 }
+#elif defined(__aarch64__) || defined(_M_ARM64)
+// AArch64 uses a different Darwin thread-state structure (x[0..28], fp, lr, sp,
+// pc and ESR) rather than the x86-64 __r* register fields. Guest x86 registers
+// live in NativeArm64::GuestCpuState and must not be fabricated from host registers.
+static AccessViolationType DecodeArmAccess(uint32_t esr) {
+	const auto exception_class = (esr >> 26) & 0x3fu;
+	if (exception_class == 0x20 || exception_class == 0x21) {
+		return AccessViolationType::Execute; // Instruction abort.
+	}
+	if (exception_class == 0x24 || exception_class == 0x25) {
+		return (esr & (1u << 6)) != 0 ? AccessViolationType::Write : AccessViolationType::Read;
+	}
+	return AccessViolationType::Unknown;
+}
 
+static void SignalHandler(int sig, siginfo_t* si, void* uctx) {
+	auto*       uc = static_cast<ucontext_t*>(uctx);
+	const auto* mc = uc->uc_mcontext;
+	const auto& ss = mc->__ss;
+
+	if (sig != SIGSEGV && sig != SIGBUS) {
+		// Do not send a host AArch64 SIGILL through the x86 instruction emulator.
+		struct sigaction dfl {};
+		dfl.sa_handler = SIG_DFL;
+		sigemptyset(&dfl.sa_mask);
+		sigaction(sig, &dfl, nullptr);
+		return;
+	}
+
+	ExceptionInfo info {};
+	info.exception_address      = ss.__pc;
+	info.native_code             = static_cast<uint32_t>(si->si_code);
+	info.native_context          = uctx;
+	info.type                    = ExceptionType::AccessViolation;
+	info.access_violation_type   = DecodeArmAccess(mc->__es.__esr);
+	info.access_violation_vaddr  = reinterpret_cast<uint64_t>(si->si_addr);
+
+	const auto handler = g_handler.load(std::memory_order_acquire);
+	if (handler != nullptr && handler(info)) {
+		return; // Retry the faulting host access after the mapping/protection is fixed.
+	}
+
+	struct sigaction dfl {};
+	dfl.sa_handler = SIG_DFL;
+	sigemptyset(&dfl.sa_mask);
+	sigaction(sig, &dfl, nullptr);
+}
+#else
+#error "The Apple host exception handler requires x86-64 or AArch64 register-state support"
+#endif
 #else
 
 // x86-64 page-fault error bits.
