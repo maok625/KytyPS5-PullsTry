@@ -273,6 +273,64 @@ int main() {
 	CHECK(movsxd_exit.reason == BlockExitReason::InstructionBudget);
 	CHECK(state.gpr[static_cast<std::size_t>(GuestGpr::Rax)] == 0xffffffff80000000ULL);
 
+	// FF /0 INC and FF /1 DEC preserve CF while updating other arithmetic flags.
+	CHECK(memory.Load(0x1f90, {0xff, 0xc0})); // INC EAX
+	state = GuestCpuState{};
+	state.rip = 0x1f90;
+	state.rflags = (1ULL << 1) | (1ULL << 0);
+	state.gpr[static_cast<std::size_t>(GuestGpr::Rax)] = 0xffffffffULL;
+	const BlockExit inc_exit = interpreter.RunBlock(state, memory, 1);
+	CHECK(inc_exit.reason == BlockExitReason::InstructionBudget);
+	CHECK(state.gpr[static_cast<std::size_t>(GuestGpr::Rax)] == 0);
+	CHECK((state.rflags & (1ULL << 0)) != 0);
+	CHECK((state.rflags & (1ULL << 6)) != 0);
+
+	CHECK(memory.Load(0x1f92, {0xff, 0xc8})); // DEC EAX
+	state = GuestCpuState{};
+	state.rip = 0x1f92;
+	state.rflags = (1ULL << 1) | (1ULL << 0);
+	state.gpr[static_cast<std::size_t>(GuestGpr::Rax)] = 0;
+	const BlockExit dec_exit = interpreter.RunBlock(state, memory, 1);
+	CHECK(dec_exit.reason == BlockExitReason::InstructionBudget);
+	CHECK(state.gpr[static_cast<std::size_t>(GuestGpr::Rax)] == 0xffffffffULL);
+	CHECK((state.rflags & (1ULL << 0)) != 0);
+	CHECK((state.rflags & (1ULL << 7)) != 0);
+
+	// FF /6 pushes the 64-bit value read from guest memory.
+	CHECK(memory.WriteU64(0x1700, 0x0123456789abcdefULL));
+	CHECK(memory.Load(0x1f94, {0xff, 0x30})); // PUSH qword [RAX]
+	state = GuestCpuState{};
+	state.rip = 0x1f94;
+	state.gpr[static_cast<std::size_t>(GuestGpr::Rax)] = 0x1700;
+	state.gpr[static_cast<std::size_t>(GuestGpr::Rsp)] = 0x1800;
+	const BlockExit push_mem_exit = interpreter.RunBlock(state, memory, 1);
+	CHECK(push_mem_exit.reason == BlockExitReason::InstructionBudget);
+	CHECK(state.gpr[static_cast<std::size_t>(GuestGpr::Rsp)] == 0x17f8);
+	CHECK(memory.ReadU64(0x17f8, stored_value));
+	CHECK(stored_value == 0x0123456789abcdefULL);
+
+	// F7 /3 NEG EAX sets CF for a nonzero operand.
+	CHECK(memory.Load(0x1f96, {0xf7, 0xd8}));
+	state = GuestCpuState{};
+	state.rip = 0x1f96;
+	state.gpr[static_cast<std::size_t>(GuestGpr::Rax)] = 2;
+	const BlockExit neg_exit = interpreter.RunBlock(state, memory, 1);
+	CHECK(neg_exit.reason == BlockExitReason::InstructionBudget);
+	CHECK(state.gpr[static_cast<std::size_t>(GuestGpr::Rax)] == 0xfffffffeULL);
+	CHECK((state.rflags & (1ULL << 0)) != 0);
+	CHECK((state.rflags & (1ULL << 7)) != 0);
+
+	// REX.W F7 /0 TEST [RIP+disp32], imm32 uses RIP after the whole instruction.
+	CHECK(memory.WriteU64(0x2800, 0x10));
+	CHECK(memory.Load(0x1fa0, {0x48, 0xf7, 0x05, 0x74, 0x08, 0x00, 0x00,
+	                            0x10, 0x00, 0x00, 0x00}));
+	state = GuestCpuState{};
+	state.rip = 0x1fa0;
+	const BlockExit test_imm_exit = interpreter.RunBlock(state, memory, 1);
+	CHECK(test_imm_exit.reason == BlockExitReason::InstructionBudget);
+	CHECK(state.rip == 0x1fab);
+	CHECK((state.rflags & (1ULL << 6)) == 0); // ZF cleared: memory & immediate != 0
+
 	// LEAVE restores RBP from the guest frame and advances RSP atomically.
 	CHECK(memory.Load(0x1b10, {0xc9}));
 	CHECK(memory.WriteU64(0x1700, 0x1999));
