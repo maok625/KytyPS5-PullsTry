@@ -12,6 +12,7 @@ on:
 permissions:
   contents: read
 
+jobs:
   native-emulator-build:
     name: Build the full emulator for native ARM64
     runs-on: macos-15
@@ -38,54 +39,20 @@ permissions:
         shell: bash
         run: |
           set -euo pipefail
-          cmake -S . -B _Build/macos-arm64-native -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_OSX_ARCHITECTURES=arm64 \
-            -DCMAKE_C_COMPILER=clang \
-            -DCMAKE_CXX_COMPILER=clang++ \
-            -DKYTY_BUILD_LAUNCHER=OFF \
-            -DKYTY_BUILD_ORIGIN=Source
+          cmake -S . -B _Build/macos-arm64-native -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DKYTY_BUILD_LAUNCHER=OFF -DKYTY_BUILD_ORIGIN=Source
 
       - name: Build full emulator and state tests
         shell: bash
         run: |
           set -euo pipefail
-          cmake --build _Build/macos-arm64-native \
-            --target kyty_emulator native_arm64_state_tests --parallel
+          cmake --build _Build/macos-arm64-native --target kyty_emulator native_arm64_state_tests --parallel
 
       - name: Run native ARM64 interpreter tests
         shell: bash
         run: |
           set -euo pipefail
-          ctest --test-dir _Build/macos-arm64-native \
-            -R '^native_arm64_state    name: Compile and test native x86-64 interpreter subset
-    runs-on: macos-15
-    steps:
-      - name: Check out source
-        uses: actions/checkout@v4
+          ctest --test-dir _Build/macos-arm64-native -R '^native_arm64_state$' --output-on-failure
 
-      - name: Compile arm64 contract and tests
-        shell: bash
-        run: |
-          set -euo pipefail
-          binary="$RUNNER_TEMP/native-arm64-state-tests"
-          clang++ -std=c++20 -Wall -Wextra -Werror -arch arm64 \
-            -Isrc src/native_arm64/x64_interpreter.cpp tests/nativeArm64StateTests.cpp -o "$binary"
-          file "$binary"
-          file "$binary" | grep -q 'arm64'
-
-      - name: Run interpreter tests
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ "$(uname -m)" == "arm64" ]]; then
-            "$RUNNER_TEMP/native-arm64-state-tests"
-          else
-            echo "The interpreter tests were cross-compiled for arm64; execution is skipped because this runner is not Apple Silicon."
-          fi
- --output-on-failure
-
-jobs:
   guest-state-contract:
     name: Compile and test native x86-64 interpreter subset
     runs-on: macos-15
@@ -98,8 +65,7 @@ jobs:
         run: |
           set -euo pipefail
           binary="$RUNNER_TEMP/native-arm64-state-tests"
-          clang++ -std=c++20 -Wall -Wextra -Werror -arch arm64 \
-            -Isrc src/native_arm64/x64_interpreter.cpp tests/nativeArm64StateTests.cpp -o "$binary"
+          clang++ -std=c++20 -Wall -Wextra -Werror -arch arm64 -Isrc src/native_arm64/x64_interpreter.cpp tests/nativeArm64StateTests.cpp -o "$binary"
           file "$binary"
           file "$binary" | grep -q 'arm64'
 
