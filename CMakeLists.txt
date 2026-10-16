@@ -74,13 +74,32 @@ if(KYTY_NATIVE_MACOS_ARM64_KOSMICKRISP)
 	if(CMAKE_OSX_DEPLOYMENT_TARGET VERSION_LESS "26.0")
 		message(FATAL_ERROR "KosmicKrisp requires macOS 26 or newer; set CMAKE_OSX_DEPLOYMENT_TARGET=26.0 or newer")
 	endif()
+	if(KYTY_VULKAN_SDK_ROOT STREQUAL "" AND NOT "$ENV{VULKAN_SDK}" STREQUAL "")
+		set(KYTY_VULKAN_SDK_ROOT "$ENV{VULKAN_SDK}" CACHE PATH
+		    "Installed LunarG Vulkan SDK root (the macOS directory containing include/, lib/, and share/)" FORCE)
+	endif()
 	if(KYTY_VULKAN_SDK_ROOT STREQUAL "")
-		if(NOT "$ENV{VULKAN_SDK}" STREQUAL "")
-			set(KYTY_VULKAN_SDK_ROOT "$ENV{VULKAN_SDK}" CACHE PATH
-			    "Installed LunarG Vulkan SDK root (the macOS directory containing include/, lib/, and share/)" FORCE)
-		else()
-			message(FATAL_ERROR "Native KosmicKrisp builds require the installed LunarG Vulkan SDK. Set VULKAN_SDK to its macOS directory or pass -DKYTY_VULKAN_SDK_ROOT=/path/to/VulkanSDK/<version>/macOS")
-		endif()
+		# Detect the standard per-user installation used by the LunarG installer.
+		file(GLOB KYTY_VULKAN_SDK_CANDIDATES LIST_DIRECTORIES true
+			"$ENV{HOME}/VulkanSDK/*/macOS")
+		list(SORT KYTY_VULKAN_SDK_CANDIDATES)
+		list(REVERSE KYTY_VULKAN_SDK_CANDIDATES)
+		foreach(KYTY_VULKAN_SDK_CANDIDATE IN LISTS KYTY_VULKAN_SDK_CANDIDATES)
+			if(EXISTS "${KYTY_VULKAN_SDK_CANDIDATE}/include/vulkan/vulkan.h" AND
+			   (EXISTS "${KYTY_VULKAN_SDK_CANDIDATE}/lib/libvulkan.1.dylib" OR
+			    EXISTS "${KYTY_VULKAN_SDK_CANDIDATE}/lib/libvulkan.dylib"))
+				file(GLOB KYTY_VULKAN_SDK_CANDIDATE_MANIFESTS
+					"${KYTY_VULKAN_SDK_CANDIDATE}/share/vulkan/icd.d/*[Kk]osmic[Kk]risp*.json")
+				if(KYTY_VULKAN_SDK_CANDIDATE_MANIFESTS)
+					set(KYTY_VULKAN_SDK_ROOT "${KYTY_VULKAN_SDK_CANDIDATE}" CACHE PATH
+					    "Installed LunarG Vulkan SDK root (the macOS directory containing include/, lib/, and share/)" FORCE)
+					break()
+				endif()
+			endif()
+		endforeach()
+	endif()
+	if(KYTY_VULKAN_SDK_ROOT STREQUAL "")
+		message(FATAL_ERROR "Native KosmicKrisp builds require the installed LunarG Vulkan SDK, with the KosmicKrisp component selected. Set VULKAN_SDK, pass -DKYTY_VULKAN_SDK_ROOT=/path/to/VulkanSDK/<version>/macOS, or install it under ~/VulkanSDK/<version>/macOS.")
 	endif()
 	if(NOT EXISTS "${KYTY_VULKAN_SDK_ROOT}/include/vulkan/vulkan.h")
 		message(FATAL_ERROR "Vulkan SDK headers were not found under ${KYTY_VULKAN_SDK_ROOT}/include")
