@@ -164,6 +164,70 @@ int main() {
 	CHECK((state.rflags & (1ULL << 0)) != 0);
 	CHECK((state.rflags & (1ULL << 7)) != 0);
 
+	// Legacy byte-register encoding addresses AH; a REX prefix changes it to SPL.
+	CHECK(memory.Load(0x1fd0, {0xb4, 0x7f}));
+	state = GuestCpuState{};
+	state.rip = 0x1fd0;
+	state.gpr[static_cast<std::size_t>(GuestGpr::Rax)] = 0x1122334455667788ULL;
+	const BlockExit mov_ah_exit = interpreter.RunBlock(state, memory, 1);
+	CHECK(mov_ah_exit.reason == BlockExitReason::InstructionBudget);
+	CHECK(state.gpr[static_cast<std::size_t>(GuestGpr::Rax)] == 0x1122334455667f88ULL);
+
+	CHECK(memory.Load(0x1fd4, {0x40, 0xb4, 0x7f}));
+	state = GuestCpuState{};
+	state.rip = 0x1fd4;
+	state.gpr[static_cast<std::size_t>(GuestGpr::Rsp)] = 0x1800;
+	const BlockExit mov_spl_exit = interpreter.RunBlock(state, memory, 1);
+	CHECK(mov_spl_exit.reason == BlockExitReason::InstructionBudget);
+	CHECK(state.gpr[static_cast<std::size_t>(GuestGpr::Rsp)] == 0x187f);
+
+	std::uint8_t byte_value = 0;
+	// Byte memory MOV, INC, and register-direct ADD preserve adjacent register bits.
+	CHECK(memory.Load(0x1fd8, {0xc6, 0x00, 0x7f, 0x8a, 0x08, 0xfe, 0x00}));
+	state = GuestCpuState{};
+	state.rip = 0x1fd8;
+	state.gpr[static_cast<std::size_t>(GuestGpr::Rax)] = 0x1700;
+	state.gpr[static_cast<std::size_t>(GuestGpr::Rcx)] = 0x1234000000000000ULL;
+	const BlockExit byte_mem_exit = interpreter.RunBlock(state, memory, 3);
+	CHECK(byte_mem_exit.reason == BlockExitReason::InstructionBudget);
+	CHECK(state.rip == 0x1fdf);
+	CHECK((state.gpr[static_cast<std::size_t>(GuestGpr::Rcx)] & 0xff) == 0x7f);
+	CHECK(memory.Read(0x1700, &byte_value, sizeof(byte_value)));
+	CHECK(byte_value == 0x80);
+
+	// ADD AL, BL with wraparound sets CF/ZF and leaves upper RAX bits unchanged.
+	CHECK(memory.Load(0x1fe0, {0x00, 0xd8}));
+	state = GuestCpuState{};
+	state.rip = 0x1fe0;
+	state.gpr[static_cast<std::size_t>(GuestGpr::Rax)] = 0x11223344556677ffULL;
+	state.gpr[static_cast<std::size_t>(GuestGpr::Rbx)] = 1;
+	const BlockExit add_byte_exit = interpreter.RunBlock(state, memory, 1);
+	CHECK(add_byte_exit.reason == BlockExitReason::InstructionBudget);
+	CHECK(state.gpr[static_cast<std::size_t>(GuestGpr::Rax)] == 0x1122334455667700ULL);
+	CHECK((state.rflags & (1ULL << 0)) != 0);
+	CHECK((state.rflags & (1ULL << 6)) != 0);
+
+	// ModRM rm=4 means AH without REX: ADD AH, BL.
+	CHECK(memory.Load(0x1fe2, {0x00, 0xdc}));
+	state = GuestCpuState{};
+	state.rip = 0x1fe2;
+	state.gpr[static_cast<std::size_t>(GuestGpr::Rax)] = 0x100;
+	state.gpr[static_cast<std::size_t>(GuestGpr::Rbx)] = 2;
+	const BlockExit add_ah_exit = interpreter.RunBlock(state, memory, 1);
+	CHECK(add_ah_exit.reason == BlockExitReason::InstructionBudget);
+	CHECK(state.gpr[static_cast<std::size_t>(GuestGpr::Rax)] == 0x300);
+
+	// F6 /0 TEST AL, imm8 updates flags without modifying AL.
+	CHECK(memory.Load(0x1fe4, {0xf6, 0xc0, 0x80}));
+	state = GuestCpuState{};
+	state.rip = 0x1fe4;
+	state.gpr[static_cast<std::size_t>(GuestGpr::Rax)] = 0x80;
+	const BlockExit test_byte_exit = interpreter.RunBlock(state, memory, 1);
+	CHECK(test_byte_exit.reason == BlockExitReason::InstructionBudget);
+	CHECK((state.gpr[static_cast<std::size_t>(GuestGpr::Rax)] & 0xff) == 0x80);
+	CHECK((state.rflags & (1ULL << 7)) != 0);
+	CHECK((state.rflags & (1ULL << 6)) == 0);
+
 	// Memory MOV and immediate ADD exercise base-register effective addresses.
 	CHECK(memory.Load(0x1600, {
 	    0x48, 0xb8, 0x00, 0x17, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // RAX = 0x1700
