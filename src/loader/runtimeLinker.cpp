@@ -23,6 +23,17 @@
 #include "loader/symbolDatabase.h"
 #include "loader/x64InstructionEmulator.h"
 
+#if defined(KYTY_NATIVE_MACOS_ARM64_KOSMICKRISP)
+#include "native_arm64/x64_interpreter.h"
+
+#include <array>
+#include <cerrno>
+#include <ctime>
+#include <sched.h>
+#include <sys/time.h>
+#include <unistd.h>
+#endif
+
 #include <algorithm>
 #include <atomic>
 #include <cstddef>
@@ -221,6 +232,373 @@ static uint64_t g_invalid_memory    = 0;
 static Program*              g_tls_main_program        = nullptr;
 static thread_local Program* g_tls_cached_main_program = nullptr;
 static thread_local uint8_t* g_tls_cached_main_tcb     = nullptr;
+
+#if defined(KYTY_NATIVE_MACOS_ARM64_KOSMICKRISP)
+static KYTY_MS_ABI uint8_t* TlsMainGetAddr();
+
+class NativeArm64GuestMemory final : public Kyty::NativeArm64::GuestMemory {
+public:
+	NativeArm64GuestMemory(RuntimeLinker& runtime, std::vector<uint64_t> host_callbacks)
+	    : runtime_(runtime), host_callbacks_(std::move(host_callbacks)) {
+		host_callbacks_.push_back(reinterpret_cast<uint64_t>(&UnresolvedImportStub));
+		host_callbacks_.push_back(reinterpret_cast<uint64_t>(&TlsMainGetAddr));
+	}
+
+	[[nodiscard]] bool Read(uint64_t guest_address, void* destination,
+	                        size_t size) const noexcept override {
+		if (size == 0) {
+			return true;
+		}
+		if (destination == nullptr || !CheckRange(guest_address, size, 1)) {
+			return false;
+		}
+		std::memcpy(destination, reinterpret_cast<const void*>(guest_address), size);
+		return true;
+	}
+
+	[[nodiscard]] bool Write(uint64_t guest_address, const void* source,
+	                         size_t size) noexcept override {
+		if (size == 0) {
+			return true;
+		}
+		if (source == nullptr || !CheckRange(guest_address, size, 2)) {
+			return false;
+		}
+		std::memcpy(reinterpret_cast<void*>(guest_address), source, size);
+		return true;
+	}
+
+	[[nodiscard]] bool CanRead(uint64_t guest_address, size_t size) const noexcept {
+		return size == 0 || CheckRange(guest_address, size, 1);
+	}
+
+	[[nodiscard]] bool CanWrite(uint64_t guest_address, size_t size) const noexcept {
+		return size == 0 || CheckRange(guest_address, size, 2);
+	}
+
+	bool TryDispatchHostCall(uint64_t target, Kyty::NativeArm64::GuestCpuState& state,
+	                         bool tail_call) noexcept override {
+		// Unresolved import thunks live in guest executable memory. Intercept them
+		// before fetching their x86 bytes so they can report the missing symbol.
+		for (size_t i = 0; i < g_stubbed_imports.size(); ++i) {
+			if (g_stubbed_imports[i].thunk_vaddr == target && target != 0) {
+				state.gpr[static_cast<size_t>(Kyty::NativeArm64::GuestGpr::Rax)] =
+				    UnresolvedImportStub(static_cast<uint64_t>(i));
+				return true;
+			}
+		}
+
+		const auto* symbols = runtime_.Symbols();
+		const bool registered =
+		    (symbols != nullptr && symbols->IsFunctionAddress(target)) ||
+		    std::find(host_callbacks_.begin(), host_callbacks_.end(), target) != host_callbacks_.end();
+		if (!registered || target == 0) {
+			return false;
+		}
+
+		// x86-64 SysV has six integer argument registers. Convert those plus up to
+		// ten stack arguments into the native ARM64 C ABI's argument sequence.
+		// This deliberately covers the integer/pointer ABI only; floating-point,
+		// vector, variadic, and aggregate-by-value arguments need type-aware stubs.
+		std::array<uintptr_t, 16> arguments {};
+		const auto& gpr = state.gpr;
+		arguments[0] = static_cast<uintptr_t>(gpr[static_cast<size_t>(Kyty::NativeArm64::GuestGpr::Rdi)]);
+		arguments[1] = static_cast<uintptr_t>(gpr[static_cast<size_t>(Kyty::NativeArm64::GuestGpr::Rsi)]);
+		arguments[2] = static_cast<uintptr_t>(gpr[static_cast<size_t>(Kyty::NativeArm64::GuestGpr::Rdx)]);
+		arguments[3] = static_cast<uintptr_t>(gpr[static_cast<size_t>(Kyty::NativeArm64::GuestGpr::Rcx)]);
+		arguments[4] = static_cast<uintptr_t>(gpr[static_cast<size_t>(Kyty::NativeArm64::GuestGpr::R8)]);
+		arguments[5] = static_cast<uintptr_t>(gpr[static_cast<size_t>(Kyty::NativeArm64::GuestGpr::R9)]);
+
+		const uint64_t stack_pointer =
+		    gpr[static_cast<size_t>(Kyty::NativeArm64::GuestGpr::Rsp)];
+		const uint64_t stack_argument_base = stack_pointer + (tail_call ? sizeof(uint64_t) : 0);
+		for (size_t i = 6; i < arguments.size(); ++i) {
+			uint64_t value = 0;
+			const uint64_t offset = (i - 6) * sizeof(uint64_t);
+			if (stack_argument_base <= UINT64_MAX - offset) {
+				(void)Read(stack_argument_base + offset, &value, sizeof(value));
+			}
+			arguments[i] = static_cast<uintptr_t>(value);
+		}
+
+		using HostFunction = uintptr_t (*)(
+		    uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t,
+		    uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t);
+		const auto function = reinterpret_cast<HostFunction>(static_cast<uintptr_t>(target));
+		const uintptr_t result =
+		    function(arguments[0], arguments[1], arguments[2], arguments[3], arguments[4],
+		             arguments[5], arguments[6], arguments[7], arguments[8], arguments[9],
+		             arguments[10], arguments[11], arguments[12], arguments[13], arguments[14],
+		             arguments[15]);
+		state.gpr[static_cast<size_t>(Kyty::NativeArm64::GuestGpr::Rax)] =
+		    static_cast<uint64_t>(result);
+		state.rflags |= (1ULL << 1);
+
+		if (host_call_log_count_++ < 64) {
+			LOGF("Native ARM64 guest import call: target=0x%016" PRIx64
+			     ", tail_call=%u, guest_rip=0x%016" PRIx64 "\n",
+			     target, tail_call ? 1u : 0u, state.rip);
+		}
+		return true;
+	}
+
+private:
+	bool CheckRange(uint64_t address, size_t size, int required_protection) const noexcept {
+		if (address == 0 || address > UINT64_MAX - size) {
+			return false;
+		}
+		uint64_t current = address;
+		uint64_t remaining = size;
+		while (remaining != 0) {
+			Libs::LibKernel::Memory::VirtualQueryInfo info {};
+			if (cached_region_valid_ && current >= cached_region_.start &&
+			    current < cached_region_.end) {
+				info = cached_region_;
+			} else {
+				const int result = Libs::LibKernel::Memory::KernelVirtualQuery(
+				    reinterpret_cast<const void*>(current), 0, &info, sizeof(info));
+				if (result != 0) {
+					cached_region_valid_ = false;
+					return false;
+				}
+				cached_region_ = info;
+				cached_region_valid_ = true;
+			}
+			if (info.end <= current || info.is_committed == 0 ||
+			    (info.protection & required_protection) != required_protection) {
+				return false;
+			}
+			const uint64_t available = static_cast<uint64_t>(info.end) - current;
+			const uint64_t chunk = std::min<uint64_t>(remaining, available);
+			if (chunk == 0) {
+				return false;
+			}
+			current += chunk;
+			remaining -= chunk;
+		}
+		return true;
+	}
+
+	RuntimeLinker& runtime_;
+	std::vector<uint64_t> host_callbacks_;
+	mutable Libs::LibKernel::Memory::VirtualQueryInfo cached_region_ {};
+	mutable bool cached_region_valid_ = false;
+	uint32_t host_call_log_count_ = 0;
+};
+
+static void SetNativeSyscallResult(Kyty::NativeArm64::GuestCpuState& state, int64_t result,
+                                   int error_number = 0) {
+	const auto rax = static_cast<size_t>(Kyty::NativeArm64::GuestGpr::Rax);
+	if (error_number != 0) {
+		state.gpr[rax] = static_cast<uint64_t>(error_number);
+		state.rflags |= 1ULL; // FreeBSD x86-64 uses CF to signal syscall failure.
+	} else {
+		state.gpr[rax] = static_cast<uint64_t>(result);
+		state.rflags &= ~1ULL;
+	}
+	state.rflags |= (1ULL << 1);
+}
+
+static bool DispatchNativeSyscall(NativeArm64GuestMemory& memory,
+                                  Kyty::NativeArm64::GuestCpuState& state,
+                                  bool& exit_requested) {
+	using Kyty::NativeArm64::GuestGpr;
+	const auto& gpr = state.gpr;
+	const auto get = [&gpr](GuestGpr reg) { return gpr[static_cast<size_t>(reg)]; };
+	uint64_t number = get(GuestGpr::Rax);
+	std::array<uint64_t, 6> args {
+	    get(GuestGpr::Rdi), get(GuestGpr::Rsi), get(GuestGpr::Rdx),
+	    get(GuestGpr::R10), get(GuestGpr::R8), get(GuestGpr::R9)};
+
+	// FreeBSD's indirect syscall wrapper passes the real number in RDI and shifts
+	// the remaining arguments left by one register.
+	if (number == 0) {
+		number = args[0];
+		args = {get(GuestGpr::Rsi), get(GuestGpr::Rdx), get(GuestGpr::R10),
+		        get(GuestGpr::R8), get(GuestGpr::R9), 0};
+	}
+
+	constexpr uint64_t kMaxHostIoBytes = 1024 * 1024;
+	switch (number) {
+		case 1: // exit
+			exit_requested = true;
+			SetNativeSyscallResult(state, static_cast<int64_t>(args[0]));
+			return true;
+
+		case 3: // read
+		case 4: { // write
+			if (args[2] > kMaxHostIoBytes) {
+				SetNativeSyscallResult(state, -1, EINVAL);
+				return true;
+			}
+			const auto count = static_cast<size_t>(args[2]);
+			std::vector<uint8_t> buffer(count);
+			ssize_t result = -1;
+			if (number == 3) {
+				if (!memory.CanWrite(args[1], count)) {
+					SetNativeSyscallResult(state, -1, EFAULT);
+					return true;
+				}
+				result = ::read(static_cast<int>(args[0]), buffer.data(), count);
+				if (result >= 0 && !memory.Write(args[1], buffer.data(), static_cast<size_t>(result))) {
+					SetNativeSyscallResult(state, -1, EFAULT);
+					return true;
+				}
+			} else {
+				if (!memory.Read(args[1], buffer.data(), count)) {
+					SetNativeSyscallResult(state, -1, EFAULT);
+					return true;
+				}
+				result = ::write(static_cast<int>(args[0]), buffer.data(), count);
+			}
+			if (result < 0) {
+				SetNativeSyscallResult(state, -1, errno);
+			} else {
+				SetNativeSyscallResult(state, result);
+			}
+			return true;
+		}
+
+		case 20: // getpid
+			SetNativeSyscallResult(state, static_cast<int64_t>(::getpid()));
+			return true;
+
+		case 116: { // gettimeofday
+			struct GuestTimeval {
+				int64_t seconds;
+				int64_t microseconds;
+			} value {};
+			struct timeval host_value {};
+			if (::gettimeofday(&host_value, nullptr) != 0) {
+				SetNativeSyscallResult(state, -1, errno);
+				return true;
+			}
+			value.seconds = static_cast<int64_t>(host_value.tv_sec);
+			value.microseconds = static_cast<int64_t>(host_value.tv_usec);
+			if (args[0] != 0 && !memory.Write(args[0], &value, sizeof(value))) {
+				SetNativeSyscallResult(state, -1, EFAULT);
+				return true;
+			}
+			SetNativeSyscallResult(state, 0);
+			return true;
+		}
+
+		case 232: { // clock_gettime
+			struct GuestTimespec {
+				int64_t seconds;
+				int64_t nanoseconds;
+			} value {};
+			struct timespec host_value {};
+			if (::clock_gettime(static_cast<clockid_t>(args[0]), &host_value) != 0) {
+				SetNativeSyscallResult(state, -1, errno);
+				return true;
+			}
+			value.seconds = static_cast<int64_t>(host_value.tv_sec);
+			value.nanoseconds = static_cast<int64_t>(host_value.tv_nsec);
+			if (!memory.Write(args[1], &value, sizeof(value))) {
+				SetNativeSyscallResult(state, -1, EFAULT);
+				return true;
+			}
+			SetNativeSyscallResult(state, 0);
+			return true;
+		}
+
+		case 331: // sched_yield
+			SetNativeSyscallResult(state, ::sched_yield());
+			return true;
+
+		default:
+			if (unknown_syscall_log_count.fetch_add(1) < 64) {
+				LOGF("Native ARM64 guest syscall not yet implemented: number=%" PRIu64
+				     ", rip=0x%016" PRIx64 "\n", number, state.rip);
+			}
+			SetNativeSyscallResult(state, -1, ENOSYS);
+			return true;
+	}
+}
+
+static uint64_t RunNativeArm64Guest(RuntimeLinker& runtime, uint64_t entry,
+                                    const std::array<uint64_t, 6>& args, void* stack_top,
+                                    std::vector<uint64_t> host_callbacks, bool* guest_exited) {
+	using namespace Kyty::NativeArm64;
+	if (entry == 0 || stack_top == nullptr) {
+		EXIT("Native ARM64 guest dispatcher received an invalid entry or stack");
+	}
+	if (guest_exited != nullptr) {
+		*guest_exited = false;
+	}
+
+	NativeArm64GuestMemory memory(runtime, std::move(host_callbacks));
+	X64Interpreter interpreter;
+	GuestCpuState state {};
+	const auto aligned_top = reinterpret_cast<uintptr_t>(stack_top) & ~static_cast<uintptr_t>(0x0f);
+	if (aligned_top < 0x1000) {
+		EXIT("Native ARM64 guest stack top is invalid: 0x%016" PRIx64,
+		     static_cast<uint64_t>(aligned_top));
+	}
+	const uint64_t guest_rbp = static_cast<uint64_t>(aligned_top - 2 * sizeof(uint64_t));
+	const uint64_t guest_rsp = guest_rbp - sizeof(uint64_t);
+	const uint64_t zero_frame[2] = {0, 0};
+	constexpr uint64_t kNativeGuestReturnSentinel = UINT64_C(0xfffffffffffffff0);
+	if (!memory.Write(guest_rbp, zero_frame, sizeof(zero_frame)) ||
+	    !memory.Write(guest_rsp, &kNativeGuestReturnSentinel, sizeof(kNativeGuestReturnSentinel))) {
+		EXIT("Native ARM64 guest dispatcher could not initialize guest stack at 0x%016" PRIx64,
+		     guest_rsp);
+	}
+
+	state.rip = entry;
+	state.gpr[static_cast<size_t>(GuestGpr::Rdi)] = args[0];
+	state.gpr[static_cast<size_t>(GuestGpr::Rsi)] = args[1];
+	state.gpr[static_cast<size_t>(GuestGpr::Rdx)] = args[2];
+	state.gpr[static_cast<size_t>(GuestGpr::Rcx)] = args[3];
+	state.gpr[static_cast<size_t>(GuestGpr::R8)] = args[4];
+	state.gpr[static_cast<size_t>(GuestGpr::R9)] = args[5];
+	state.gpr[static_cast<size_t>(GuestGpr::Rsp)] = guest_rsp;
+	state.gpr[static_cast<size_t>(GuestGpr::Rbp)] = guest_rbp;
+	if (g_tls_main_program != nullptr) {
+		state.fs_base = reinterpret_cast<uint64_t>(TlsMainGetAddr());
+	}
+
+	LOGF("Native ARM64 x86-64 interpreter entering guest: entry=0x%016" PRIx64
+	     ", RSP=0x%016" PRIx64 ", backend=%s\n", entry, guest_rsp, interpreter.BackendName());
+
+	for (;;) {
+		if (state.rip == kNativeGuestReturnSentinel) {
+			return state.gpr[static_cast<size_t>(GuestGpr::Rax)];
+		}
+		const BlockExit block = interpreter.RunBlock(state, memory, 10000);
+		switch (block.reason) {
+			case BlockExitReason::BlockCompleted:
+			case BlockExitReason::InstructionBudget:
+				break;
+			case BlockExitReason::SystemCall: {
+				bool exit_requested = false;
+				if (!DispatchNativeSyscall(memory, state, exit_requested)) {
+					EXIT("Native ARM64 guest syscall dispatcher failed at RIP=0x%016" PRIx64,
+					     block.guest_rip);
+				}
+				if (exit_requested) {
+					if (guest_exited != nullptr) {
+						*guest_exited = true;
+					}
+					return state.gpr[static_cast<size_t>(GuestGpr::Rax)];
+				}
+				break;
+			}
+			case BlockExitReason::GuestException:
+				EXIT("Native ARM64 guest exception %llu at RIP=0x%016" PRIx64,
+				     static_cast<unsigned long long>(block.detail), block.guest_rip);
+			case BlockExitReason::MemoryFault:
+				EXIT("Native ARM64 guest memory fault at RIP=0x%016" PRIx64
+				     ", address=0x%016" PRIx64, block.guest_rip, block.detail);
+			case BlockExitReason::UnsupportedInstruction:
+				EXIT("Native ARM64 guest unsupported x86-64 instruction at RIP=0x%016" PRIx64
+				     ", opcode/detail=0x%llx", block.guest_rip,
+				     static_cast<unsigned long long>(block.detail));
+		}
+	}
+}
+#endif
 
 static KYTY_SYSV_ABI void RunEntry(uint64_t addr, EntryParams* params, atexit_func_t atexit_func,
                                    void* stack_top) {
