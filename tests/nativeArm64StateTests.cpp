@@ -228,6 +228,56 @@ int main() {
 	CHECK((state.rflags & (1ULL << 7)) != 0);
 	CHECK((state.rflags & (1ULL << 6)) == 0);
 
+	// Operand-size override MOV preserves the upper 48 bits of a GPR.
+	CHECK(memory.Load(0x1ff0, {0x66, 0xb8, 0x34, 0x12}));
+	state = GuestCpuState{};
+	state.rip = 0x1ff0;
+	state.gpr[static_cast<std::size_t>(GuestGpr::Rax)] = 0x1122334455667788ULL;
+	const BlockExit mov_ax_exit = interpreter.RunBlock(state, memory, 1);
+	CHECK(mov_ax_exit.reason == BlockExitReason::InstructionBudget);
+	CHECK(state.gpr[static_cast<std::size_t>(GuestGpr::Rax)] == 0x1122334455661234ULL);
+
+	// MOV word [RAX],imm16 and MOV CX,word [RAX] use two-byte memory accesses.
+	CHECK(memory.Load(0x1ff4, {0x66, 0xc7, 0x00, 0x34, 0x12}));
+	state = GuestCpuState{};
+	state.rip = 0x1ff4;
+	state.gpr[static_cast<std::size_t>(GuestGpr::Rax)] = 0x1718;
+	const BlockExit mov_word_mem_exit = interpreter.RunBlock(state, memory, 1);
+	CHECK(mov_word_mem_exit.reason == BlockExitReason::InstructionBudget);
+	std::uint8_t word_bytes[2]{};
+	CHECK(memory.Read(0x1718, word_bytes, sizeof(word_bytes)));
+	CHECK(word_bytes[0] == 0x34 && word_bytes[1] == 0x12);
+
+	CHECK(memory.Load(0x1ff9, {0x66, 0x8b, 0x08}));
+	state = GuestCpuState{};
+	state.rip = 0x1ff9;
+	state.gpr[static_cast<std::size_t>(GuestGpr::Rax)] = 0x1718;
+	state.gpr[static_cast<std::size_t>(GuestGpr::Rcx)] = 0x1122334455660000ULL;
+	const BlockExit mov_cx_exit = interpreter.RunBlock(state, memory, 1);
+	CHECK(mov_cx_exit.reason == BlockExitReason::InstructionBudget);
+	CHECK(state.gpr[static_cast<std::size_t>(GuestGpr::Rcx)] == 0x1122334455661234ULL);
+
+	// 16-bit ADD observes bit 15 for SF/OF and leaves upper RAX bits unchanged.
+	CHECK(memory.Load(0x2020, {0x66, 0x83, 0xc0, 0x01}));
+	state = GuestCpuState{};
+	state.rip = 0x2020;
+	state.gpr[static_cast<std::size_t>(GuestGpr::Rax)] = 0x1122334455667fffULL;
+	const BlockExit add_ax_exit = interpreter.RunBlock(state, memory, 1);
+	CHECK(add_ax_exit.reason == BlockExitReason::InstructionBudget);
+	CHECK(state.gpr[static_cast<std::size_t>(GuestGpr::Rax)] == 0x1122334455668000ULL);
+	CHECK((state.rflags & (1ULL << 7)) != 0);  // SF
+	CHECK((state.rflags & (1ULL << 11)) != 0); // OF
+
+	// Unsupported 16-bit forms stay explicit instead of silently executing as 32-bit.
+	CHECK(memory.Load(0x2024, {0x66, 0xff, 0xc0})); // INC AX is not implemented yet
+	state = GuestCpuState{};
+	state.rip = 0x2024;
+	state.gpr[static_cast<std::size_t>(GuestGpr::Rax)] = 5;
+	const BlockExit unsupported_word_exit = interpreter.RunBlock(state, memory, 1);
+	CHECK(unsupported_word_exit.reason == BlockExitReason::UnsupportedInstruction);
+	CHECK(unsupported_word_exit.guest_rip == 0x2024);
+	CHECK(state.gpr[static_cast<std::size_t>(GuestGpr::Rax)] == 5);
+
 	// Memory MOV and immediate ADD exercise base-register effective addresses.
 	CHECK(memory.Load(0x1600, {
 	    0x48, 0xb8, 0x00, 0x17, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // RAX = 0x1700
