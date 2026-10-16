@@ -254,6 +254,30 @@ int main() {
 	CHECK(unsupported_exit.detail == 0x0f00); // 0F escape opcode plus decoded second byte
 	CHECK(state.rip == 0x1400);
 
+	// SYSCALL returns to the guest kernel/dispatcher with x86-64 RCX/R11 effects.
+	CHECK(memory.Load(0x1d00, {0x0f, 0x05}));
+	state = GuestCpuState{};
+	state.rip = 0x1d00;
+	state.rflags = 0x246;
+	state.gpr[static_cast<std::size_t>(GuestGpr::Rax)] = 0x1234;
+	const BlockExit syscall_exit = interpreter.RunBlock(state, memory, 2);
+	CHECK(syscall_exit.reason == BlockExitReason::SystemCall);
+	CHECK(syscall_exit.guest_rip == 0x1d02);
+	CHECK(syscall_exit.detail == 0x1234);
+	CHECK(state.rip == 0x1d02);
+	CHECK(state.gpr[static_cast<std::size_t>(GuestGpr::Rcx)] == 0x1d02);
+	CHECK(state.gpr[static_cast<std::size_t>(GuestGpr::R11)] == 0x246);
+
+	// UD2 reports the x86 invalid-opcode exception without advancing RIP.
+	CHECK(memory.Load(0x1e00, {0x0f, 0x0b}));
+	state = GuestCpuState{};
+	state.rip = 0x1e00;
+	const BlockExit exception_exit = interpreter.RunBlock(state, memory, 1);
+	CHECK(exception_exit.reason == BlockExitReason::GuestException);
+	CHECK(exception_exit.guest_rip == 0x1e00);
+	CHECK(exception_exit.detail == 6); // #UD
+	CHECK(state.rip == 0x1e00);
+
 	// Instruction fetch faults report the exact inaccessible guest address.
 	state = GuestCpuState{};
 	state.rip = 0x4000;
