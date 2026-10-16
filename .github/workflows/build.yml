@@ -30,7 +30,7 @@ jobs:
           echo "value=KytyPS5-$(date -u +'%Y-%m-%d')-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
 
   windows:
-    if: github.ref_name != 'feat/macos-arm64-kosmickrisp' && github.head_ref != 'feat/macos-arm64-kosmickrisp'
+    if: ${{ github.ref_name != 'feat/macos-arm64-kosmickrisp' && github.head_ref != 'feat/macos-arm64-kosmickrisp' }}
     name: Build KytyPS5 (Windows)
     needs: metadata
     runs-on: windows-2022
@@ -293,7 +293,7 @@ jobs:
           if-no-files-found: error
 
   linux:
-    if: github.ref_name != 'feat/macos-arm64-kosmickrisp' && github.head_ref != 'feat/macos-arm64-kosmickrisp'
+    if: ${{ github.ref_name != 'feat/macos-arm64-kosmickrisp' && github.head_ref != 'feat/macos-arm64-kosmickrisp' }}
     name: Build KytyPS5 (Linux)
     needs: metadata
     runs-on: ubuntu-24.04
@@ -436,7 +436,7 @@ jobs:
           if-no-files-found: error
 
   release:
-    if: github.ref_name != 'feat/macos-arm64-kosmickrisp' && github.head_ref != 'feat/macos-arm64-kosmickrisp'
+    if: ${{ github.ref_name != 'feat/macos-arm64-kosmickrisp' && github.head_ref != 'feat/macos-arm64-kosmickrisp' }}
     name: Release KytyPS5
     if: >-
       always() &&
