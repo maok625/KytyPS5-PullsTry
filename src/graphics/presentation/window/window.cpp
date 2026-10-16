@@ -762,7 +762,7 @@ static void ConfigureNativeKosmicKrispVulkan() {
 		sdk_root = sdk_env;
 	} else if (const char* home = std::getenv("HOME"); home != nullptr && home[0] != '\0') {
 		// Finder-launched apps do not inherit shell setup-env.sh exports. Discover
-		// a normal per-user SDK installation when VULKAN_SDK is not supplied.
+		// the normal per-user SDK installation when VULKAN_SDK is not supplied.
 		const auto sdk_directory = std::filesystem::path(home) / "VulkanSDK";
 		std::vector<std::filesystem::path> candidates;
 		std::error_code search_error;
@@ -796,29 +796,69 @@ static void ConfigureNativeKosmicKrispVulkan() {
 		loader_path = sdk_root / "lib/libvulkan.dylib";
 	}
 	if (!Common::File::IsFileExisting(loader_path)) {
-		EXIT("The Vulkan loader was not found under VULKAN_SDK=%s/lib. Reinstall or select a valid macOS Vulkan SDK.\n",
+		EXIT("The Vulkan loader was not found under %s/lib. Reinstall or select a valid macOS Vulkan SDK.\n",
 		     sdk_root_string.c_str());
 	}
 
-	// The renderer currently requires VK_EXT_image_view_min_lod. KosmicKrisp
-	// gates that extension behind this experimental switch; preserve any other
-	// user-selected KosmicKrisp options while ensuring the required feature is enabled.
+	if (const char* configured_loader = std::getenv("SDL_VULKAN_LIBRARY");
+	    configured_loader != nullptr && configured_loader[0] != '\0') {
+		std::string loader_name = std::filesystem::path(configured_loader).filename().string();
+		std::transform(loader_name.begin(), loader_name.end(), loader_name.begin(),
+		               [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+		if (loader_name.find("moltenvk") != std::string::npos) {
+			EXIT("The native KosmicKrisp build cannot load libMoltenVK.dylib directly. Unset SDL_VULKAN_LIBRARY or point it to a Vulkan loader.\n");
+		}
+	} else if (SDL_setenv_unsafe("SDL_VULKAN_LIBRARY", loader_path.string().c_str(), 0) != 0) {
+		EXIT("Could not select the Vulkan SDK loader: %s\n", SDL_GetError());
+	}
+
+	// Pin the native ARM64 target to the SDK's KosmicKrisp driver. This avoids
+	// accidentally selecting a system-wide MoltenVK manifest through legacy
+	// Vulkan environment variables on a machine with both drivers installed.
+	const auto icd_dir = sdk_root / "share/vulkan/icd.d";
+	std::filesystem::path manifest;
+	std::error_code icd_error;
+	if (std::filesystem::is_directory(icd_dir, icd_error)) {
+		for (std::filesystem::directory_iterator it(icd_dir, icd_error), end;
+		     !icd_error && it != end; it.increment(icd_error)) {
+			if (!it->is_regular_file(icd_error) || icd_error || it->path().extension() != ".json") {
+				continue;
+			}
+			std::string filename = it->path().filename().string();
+			std::transform(filename.begin(), filename.end(), filename.begin(),
+			               [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+			if (filename.find("kosmickrisp") != std::string::npos) {
+				manifest = it->path();
+				break;
+			}
+		}
+	}
+	if (manifest.empty()) {
+		EXIT("KosmicKrisp was not found in %s/share/vulkan/icd.d. Install the SDK with its optional KosmicKrisp component; Kyty does not bundle the driver.\n",
+		     sdk_root_string.c_str());
+	}
+	if (SDL_setenv_unsafe("VK_DRIVER_FILES", manifest.string().c_str(), 1) != 0) {
+		EXIT("Could not select the SDK's KosmicKrisp ICD manifest: %s\n", SDL_GetError());
+	}
+
+	// The renderer requires VK_EXT_image_view_min_lod. KosmicKrisp gates this
+	// extension behind MESA_KK_EXPERIMENTAL; preserve any other selected options.
 	const char* configured_experimental = std::getenv("MESA_KK_EXPERIMENTAL");
 	std::string experimental = configured_experimental != nullptr ? configured_experimental : "";
 	const auto has_experimental_feature = [&](const std::string& feature) {
-		std::size_t start = 0;
-		while (start <= experimental.size()) {
-			const auto end = experimental.find(',', start);
-			const auto token = experimental.substr(start, end == std::string::npos
-			                                                ? std::string::npos
-			                                                : end - start);
+		std::size_t token_start = 0;
+		while (token_start <= experimental.size()) {
+			const auto token_end = experimental.find(',', token_start);
+			const auto token = experimental.substr(token_start, token_end == std::string::npos
+			                                                       ? std::string::npos
+			                                                       : token_end - token_start);
 			if (token == "all" || token == feature) {
 				return true;
 			}
-			if (end == std::string::npos) {
+			if (token_end == std::string::npos) {
 				break;
 			}
-			start = end + 1;
+			token_start = token_end + 1;
 		}
 		return false;
 	};
@@ -834,54 +874,10 @@ static void ConfigureNativeKosmicKrispVulkan() {
 		LOGF("KosmicKrisp: enabled experimental VK_EXT_image_view_min_lod support\n");
 	}
 
-	if (const char* configured_loader = std::getenv("SDL_VULKAN_LIBRARY");
-	    configured_loader != nullptr && configured_loader[0] != '\0') {
-		std::string loader_name = std::filesystem::path(configured_loader).filename().string();
-		std::transform(loader_name.begin(), loader_name.end(), loader_name.begin(),
-		               [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
-		if (loader_name.find("moltenvk") != std::string::npos) {
-			EXIT("The native KosmicKrisp build cannot load libMoltenVK.dylib directly. Unset SDL_VULKAN_LIBRARY or point it to the Vulkan SDK loader (libvulkan.1.dylib).\n");
-		}
-	} else if (SDL_setenv_unsafe("SDL_VULKAN_LIBRARY", loader_path.string().c_str(), 0) != 0) {
-		EXIT("Could not select the Vulkan SDK loader: %s\n", SDL_GetError());
-	}
-
-	// Prefer the SDK's KosmicKrisp ICD by default. Respect an explicit user
-	// driver selection, including VK_DRIVER_FILES, VK_ICD_FILENAMES, or
-	// VK_ADD_DRIVER_FILES, instead of overwriting it.
-	if (std::getenv("VK_DRIVER_FILES") == nullptr &&
-	    std::getenv("VK_ICD_FILENAMES") == nullptr &&
-	    std::getenv("VK_ADD_DRIVER_FILES") == nullptr) {
-		const auto icd_dir = sdk_root / "share/vulkan/icd.d";
-		std::filesystem::path manifest;
-		std::error_code error;
-		if (std::filesystem::is_directory(icd_dir, error)) {
-			for (std::filesystem::directory_iterator it(icd_dir, error), end; !error && it != end;
-			     it.increment(error)) {
-				if (!it->is_regular_file(error) || error || it->path().extension() != ".json") {
-					continue;
-				}
-				std::string filename = it->path().filename().string();
-				std::transform(filename.begin(), filename.end(), filename.begin(),
-				               [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
-				if (filename.find("kosmickrisp") != std::string::npos) {
-					manifest = it->path();
-					break;
-				}
-			}
-		}
-		if (manifest.empty()) {
-			EXIT("KosmicKrisp was not found in %s/share/vulkan/icd.d. Install a current Vulkan SDK that includes KosmicKrisp; Kyty does not bundle the driver.\n",
-			     sdk_root_string.c_str());
-		}
-		if (SDL_setenv_unsafe("VK_DRIVER_FILES", manifest.string().c_str(), 0) != 0) {
-			EXIT("Could not select the SDK's KosmicKrisp ICD manifest: %s\n", SDL_GetError());
-		}
-		LOGF("Vulkan ICD: KosmicKrisp from %s\n", manifest.string().c_str());
-	}
 	LOGF("Vulkan loader: %s\n", loader_path.string().c_str());
+	LOGF("Vulkan ICD: KosmicKrisp from %s\n", manifest.string().c_str());
 }
-#endif
+
 
 static void WindowCreate(WindowContext& context) {
 	EXIT_IF(context.window != nullptr);
