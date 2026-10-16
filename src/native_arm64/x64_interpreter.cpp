@@ -502,6 +502,36 @@ InstructionStep X64Interpreter::ExecuteOne(GuestCpuState& state, GuestMemory& me
 		return {InstructionStepStatus::ControlFlow, instruction_rip, opcode};
 	}
 
+	if (opcode == 0x68 || opcode == 0x6a) { // PUSH sign-extended imm32/imm8
+		std::int64_t signed_immediate = 0;
+		if (opcode == 0x6a) {
+			std::uint8_t encoded = 0;
+			if (!ReadLittleEndian(reader, encoded)) {
+				return ReaderFailure(reader);
+			}
+			signed_immediate = std::bit_cast<std::int8_t>(encoded);
+		} else {
+			std::uint32_t encoded = 0;
+			if (!ReadLittleEndian(reader, encoded)) {
+				return ReaderFailure(reader);
+			}
+			signed_immediate = std::bit_cast<std::int32_t>(encoded);
+		}
+		const std::uint64_t value = static_cast<std::uint64_t>(signed_immediate);
+		const auto old_stack = state.gpr[static_cast<std::size_t>(GuestGpr::Rsp)];
+		const auto new_stack = old_stack - sizeof(value);
+		std::uint8_t bytes[sizeof(value)]{};
+		for (std::size_t i = 0; i < sizeof(value); ++i) {
+			bytes[i] = static_cast<std::uint8_t>(value >> (i * 8));
+		}
+		if (!memory.Write(new_stack, bytes, sizeof(bytes))) {
+			return {InstructionStepStatus::MemoryFault, instruction_rip, new_stack};
+		}
+		state.gpr[static_cast<std::size_t>(GuestGpr::Rsp)] = new_stack;
+		state.rip = reader.Cursor();
+		return {InstructionStepStatus::Continue, instruction_rip, opcode};
+	}
+
 	if (opcode >= 0x50 && opcode <= 0x57) { // PUSH r64
 		const auto source = RegisterIndex(static_cast<std::uint8_t>(opcode - 0x50), rex_b);
 		const auto old_stack = state.gpr[static_cast<std::size_t>(GuestGpr::Rsp)];
@@ -598,6 +628,33 @@ InstructionStep X64Interpreter::ExecuteOne(GuestCpuState& state, GuestMemory& me
 		}
 		state.rip = target;
 		return {InstructionStepStatus::ControlFlow, instruction_rip, opcode};
+	}
+
+	if (opcode == 0x63) { // MOVSXD r64, r/m32
+		std::uint8_t modrm = 0;
+		if (!reader.ReadByte(modrm)) {
+			return ReaderFailure(reader);
+		}
+		RmOperand source_operand{};
+		if (!DecodeRmOperand(reader, state, modrm, rex, source_operand)) {
+			return ReaderFailure(reader);
+		}
+		const auto destination = RegisterIndex(static_cast<std::uint8_t>((modrm >> 3) & 0x07), rex_r);
+		std::uint64_t source = 0;
+		std::uint64_t fault_address = 0;
+		if (!ReadRmOperand(source_operand, state, memory, false, reader.Cursor(),
+		                   segment_override, source, fault_address)) {
+			return {InstructionStepStatus::MemoryFault, instruction_rip, fault_address};
+		}
+		if (wide) {
+			const auto signed_source = std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(source));
+			WriteGpr(state, destination, true,
+			         static_cast<std::uint64_t>(static_cast<std::int64_t>(signed_source)));
+		} else {
+			WriteGpr(state, destination, false, source);
+		}
+		state.rip = reader.Cursor();
+		return {InstructionStepStatus::Continue, instruction_rip, opcode};
 	}
 
 	if (opcode == 0xc7) { // MOV r/m32/r/m64, imm32 (group /0)
