@@ -163,6 +163,8 @@ void UpdateArithmeticFlags(GuestCpuState& state, ArithmeticOperation operation,
 	state.rflags = (state.rflags & ~kArithmeticFlags) | updated | kRflagsReservedOne;
 }
 
+std::uint64_t ReadLittleEndianU64(const std::uint8_t* bytes) noexcept;
+
 struct RmOperand {
 	bool is_register = false;
 	std::size_t register_index = 0;
