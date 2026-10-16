@@ -684,14 +684,8 @@ InstructionStep X64Interpreter::ExecuteOne(GuestCpuState& state, GuestMemory& me
 		if (!DecodeRmOperand(reader, state, modrm, rex, operand)) {
 			return ReaderFailure(reader);
 		}
-		const auto next_rip = reader.Cursor();
-		std::uint64_t value = 0;
-		std::uint64_t fault_address = 0;
-		if (!ReadRmOperand(operand, state, memory, wide, next_rip, segment_override,
-		                   value, fault_address)) {
-			return {InstructionStepStatus::MemoryFault, instruction_rip, fault_address};
-		}
-		if (group == 0x00) { // TEST r/m, imm32 (sign-extended for 64-bit operation)
+
+		if (group == 0x00) { // TEST r/m, imm32; RIP-relative base includes the immediate
 			std::uint64_t immediate = 0;
 			if (wide) {
 				std::uint32_t encoded = 0;
@@ -707,10 +701,24 @@ InstructionStep X64Interpreter::ExecuteOne(GuestCpuState& state, GuestMemory& me
 				}
 				immediate = encoded;
 			}
+			std::uint64_t value = 0;
+			std::uint64_t fault_address = 0;
+			if (!ReadRmOperand(operand, state, memory, wide, reader.Cursor(), segment_override,
+			                   value, fault_address)) {
+				return {InstructionStepStatus::MemoryFault, instruction_rip, fault_address};
+			}
 			const std::uint64_t result = value & (wide ? immediate : static_cast<std::uint32_t>(immediate));
 			UpdateLogicalFlags(state, result, wide);
 			state.rip = reader.Cursor();
 			return {InstructionStepStatus::Continue, instruction_rip, opcode};
+		}
+
+		const auto next_rip = reader.Cursor();
+		std::uint64_t value = 0;
+		std::uint64_t fault_address = 0;
+		if (!ReadRmOperand(operand, state, memory, wide, next_rip, segment_override,
+		                   value, fault_address)) {
+			return {InstructionStepStatus::MemoryFault, instruction_rip, fault_address};
 		}
 		if (group == 0x02) { // NOT does not change flags
 			const std::uint64_t result = ~value;
