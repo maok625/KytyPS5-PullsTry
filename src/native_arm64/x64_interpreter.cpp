@@ -1410,8 +1410,8 @@ InstructionStep X64Interpreter::ExecuteOne(GuestCpuState& state, GuestMemory& me
 	}
 
 	if (opcode == 0x89 || opcode == 0x8b || opcode == 0x8d ||
-	    opcode == 0x01 || opcode == 0x03 ||
-	    opcode == 0x29 || opcode == 0x2b ||
+	    opcode == 0x01 || opcode == 0x03 || opcode == 0x09 || opcode == 0x0b ||
+	    opcode == 0x21 || opcode == 0x23 || opcode == 0x29 || opcode == 0x2b ||
 	    opcode == 0x31 || opcode == 0x33 ||
 	    opcode == 0x39 || opcode == 0x3b || opcode == 0x85) {
 		std::uint8_t modrm = 0;
@@ -1456,7 +1456,8 @@ InstructionStep X64Interpreter::ExecuteOne(GuestCpuState& state, GuestMemory& me
 			return {InstructionStepStatus::Continue, instruction_rip, opcode};
 		}
 
-		const bool destination_is_rm = opcode == 0x01 || opcode == 0x29 ||
+		const bool destination_is_rm = opcode == 0x01 || opcode == 0x09 ||
+		                               opcode == 0x21 || opcode == 0x29 ||
 		                               opcode == 0x31 || opcode == 0x39 || opcode == 0x85;
 		const bool is_compare = opcode == 0x39 || opcode == 0x3b;
 		const bool is_test = opcode == 0x85;
@@ -1480,18 +1481,27 @@ InstructionStep X64Interpreter::ExecuteOne(GuestCpuState& state, GuestMemory& me
 
 		ArithmeticOperation operation = ArithmeticOperation::Add;
 		std::uint64_t result = 0;
+		bool is_logical = false;
 		if (opcode == 0x01 || opcode == 0x03) {
 			operation = ArithmeticOperation::Add;
 			result = lhs + rhs;
+		} else if (opcode == 0x09 || opcode == 0x0b) {
+			result = lhs | rhs;
+			is_logical = true;
+		} else if (opcode == 0x21 || opcode == 0x23) {
+			result = lhs & rhs;
+			is_logical = true;
 		} else if (opcode == 0x29 || opcode == 0x2b || is_compare) {
 			operation = ArithmeticOperation::Subtract;
 			result = lhs - rhs;
 		} else if (opcode == 0x31 || opcode == 0x33) {
 			operation = ArithmeticOperation::Xor;
 			result = lhs ^ rhs;
+			is_logical = true;
 		} else {
 			// TEST computes flags from AND without writing the destination.
 			result = lhs & rhs;
+			is_logical = true;
 		}
 
 		if (!wide) {
@@ -1509,7 +1519,7 @@ InstructionStep X64Interpreter::ExecuteOne(GuestCpuState& state, GuestMemory& me
 				return {InstructionStepStatus::MemoryFault, instruction_rip, fault_address};
 			}
 		}
-		if (is_test) {
+		if (is_logical || is_test) {
 			UpdateLogicalFlags(state, result, wide);
 		} else {
 			UpdateArithmeticFlags(state, operation, lhs, rhs, result, wide);
