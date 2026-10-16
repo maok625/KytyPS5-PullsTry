@@ -302,6 +302,46 @@ int main() {
 	CHECK(state.gpr[static_cast<std::size_t>(GuestGpr::Rcx)] == 0x5678ULL);
 	CHECK((state.rflags & (1ULL << 6)) == 0);
 
+	// MOVZX from AH uses the legacy high-byte register when no REX prefix is present.
+	CHECK(memory.Load(0x2060, {0x0f, 0xb6, 0xc4})); // MOVZX EAX, AH
+	state = GuestCpuState{};
+	state.rip = 0x2060;
+	state.gpr[static_cast<std::size_t>(GuestGpr::Rax)] = 0x1122334455667788ULL;
+	const BlockExit movzx_ah_exit = interpreter.RunBlock(state, memory, 1);
+	CHECK(movzx_ah_exit.reason == BlockExitReason::InstructionBudget);
+	CHECK(state.gpr[static_cast<std::size_t>(GuestGpr::Rax)] == 0x77ULL);
+	CHECK(state.rip == 0x2063);
+
+	// MOVSX RAX, byte [RAX] sign-extends 0x80 to 64 bits.
+	const std::uint8_t signed_byte = 0x80;
+	CHECK(memory.Write(0x1700, &signed_byte, sizeof(signed_byte)));
+	CHECK(memory.Load(0x2068, {0x48, 0x0f, 0xbe, 0x00}));
+	state = GuestCpuState{};
+	state.rip = 0x2068;
+	state.gpr[static_cast<std::size_t>(GuestGpr::Rax)] = 0x1700;
+	const BlockExit movsx_byte_exit = interpreter.RunBlock(state, memory, 1);
+	CHECK(movsx_byte_exit.reason == BlockExitReason::InstructionBudget);
+	CHECK(state.gpr[static_cast<std::size_t>(GuestGpr::Rax)] == 0xffffffffffffff80ULL);
+
+	// MOVZX AX, byte [RAX] preserves upper register bits on a 16-bit destination.
+	CHECK(memory.Load(0x2070, {0x66, 0x0f, 0xb6, 0x00}));
+	state = GuestCpuState{};
+	state.rip = 0x2070;
+	state.gpr[static_cast<std::size_t>(GuestGpr::Rax)] = 0x1122334455661700ULL;
+	const BlockExit movzx_ax_exit = interpreter.RunBlock(state, memory, 1);
+	CHECK(movzx_ax_exit.reason == BlockExitReason::InstructionBudget);
+	CHECK(state.gpr[static_cast<std::size_t>(GuestGpr::Rax)] == 0x1122334455660080ULL);
+
+	// MOVSX EAX, word [RAX] produces signed 32-bit output then zero-extends RAX.
+	CHECK(memory.WriteU64(0x1710, 0x8001));
+	CHECK(memory.Load(0x2078, {0x0f, 0xbf, 0x00}));
+	state = GuestCpuState{};
+	state.rip = 0x2078;
+	state.gpr[static_cast<std::size_t>(GuestGpr::Rax)] = 0x1710;
+	const BlockExit movsx_word_exit = interpreter.RunBlock(state, memory, 1);
+	CHECK(movsx_word_exit.reason == BlockExitReason::InstructionBudget);
+	CHECK(state.gpr[static_cast<std::size_t>(GuestGpr::Rax)] == 0xffff8001ULL);
+
 	// Memory MOV and immediate ADD exercise base-register effective addresses.
 	CHECK(memory.Load(0x1600, {
 	    0x48, 0xb8, 0x00, 0x17, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // RAX = 0x1700
