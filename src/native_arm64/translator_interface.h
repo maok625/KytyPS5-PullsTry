@@ -27,6 +27,8 @@ struct BlockExit {
 enum class InstructionStepStatus : std::uint8_t {
 	Continue,
 	ControlFlow,
+	SystemCall,
+	GuestException,
 	MemoryFault,
 	UnsupportedInstruction,
 };
