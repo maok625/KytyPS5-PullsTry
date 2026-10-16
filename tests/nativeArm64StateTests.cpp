@@ -282,7 +282,7 @@ int main() {
 	CHECK(memory.Load(0x2040, {0x09, 0xd8})); // OR EAX, EBX
 	state = GuestCpuState{};
 	state.rip = 0x2040;
-	state.gpr[static_cast<std::size_t>(GuestGpr::Rax)] = 0xffff0000ULL;
+	state.gpr[static_cast<std::size_t>(GuestGpr::Rax)] = 0x112233440000f000ULL;
 	state.gpr[static_cast<std::size_t>(GuestGpr::Rbx)] = 0x000000f0ULL;
 	state.rflags = (1ULL << 1) | (1ULL << 0) | (1ULL << 11);
 	const BlockExit or_exit = interpreter.RunBlock(state, memory, 1);
@@ -324,10 +324,11 @@ int main() {
 	CHECK(state.gpr[static_cast<std::size_t>(GuestGpr::Rax)] == 0xffffffffffffff80ULL);
 
 	// MOVZX AX, byte [RAX] preserves upper register bits on a 16-bit destination.
-	CHECK(memory.Load(0x2070, {0x66, 0x0f, 0xb6, 0x00}));
+	CHECK(memory.Load(0x2070, {0x66, 0x0f, 0xb6, 0x03}));
 	state = GuestCpuState{};
 	state.rip = 0x2070;
-	state.gpr[static_cast<std::size_t>(GuestGpr::Rax)] = 0x1122334455661700ULL;
+	state.gpr[static_cast<std::size_t>(GuestGpr::Rax)] = 0x1122334455660000ULL;
+	state.gpr[static_cast<std::size_t>(GuestGpr::Rbx)] = 0x1700;
 	const BlockExit movzx_ax_exit = interpreter.RunBlock(state, memory, 1);
 	CHECK(movzx_ax_exit.reason == BlockExitReason::InstructionBudget);
 	CHECK(state.gpr[static_cast<std::size_t>(GuestGpr::Rax)] == 0x1122334455660080ULL);
