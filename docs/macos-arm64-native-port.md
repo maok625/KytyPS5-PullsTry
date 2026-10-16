@@ -10,7 +10,7 @@ Build KytyPS5 itself as an arm64 macOS process and execute the PS5's x86-64 gues
 
 - **Guest CPU translation:** required to execute PS5 x86-64 instructions on an arm64 host. This needs an x86-64 decoder, an AArch64 code emitter or interpreter, correct guest-register/flags/SIMD state, code-cache invalidation, guest memory fault handling, and explicit exits for syscalls and exceptions.
 - **Host ABI and guest address space:** the current macOS x86-64 path relies on x86-64 guest-address-space linker layout and emits x86-64 trampolines/PLT stubs. These assumptions must be separated from the arm64 host path; changing only the build architecture is not enough.
-- **Graphics:** [KosmicKrisp](https://github.com/crueter-ci/KosmicKrisp) is a collection/build workflow for Mesa, MoltenVK, and the Vulkan loader on macOS. It can be investigated for the native Vulkan stack, but it does **not** translate x86-64 CPU instructions to AArch64.
+- **Graphics:** [KosmicKrisp](https://www.lunarg.com/products/kosmickrisp/) is LunarG's Mesa Vulkan driver for Apple Silicon; it maps Vulkan calls to Metal 4 and is documented for macOS 26+. It is a possible **alternative host Vulkan ICD** to the current MoltenVK path, not a layer that translates CPU instructions. The [crueter-ci/KosmicKrisp repository](https://github.com/crueter-ci/KosmicKrisp) contains build/package scripts for related macOS graphics components. KosmicKrisp does **not** translate x86-64 CPU instructions to AArch64.
 - **Rosetta 2:** must not be a runtime dependency of the native arm64 build. The existing x86-64 build remains available as a fallback during development.
 
 ## Initial code boundary
@@ -25,7 +25,7 @@ The initial state model covers the 16 x86-64 general-purpose registers, RIP/RFLA
 2. **Guest CPU backend:** implement and test an AArch64 DBT/interpreter backend. Preserve x86-64 integer semantics and flags, RIP-relative addressing, SSE/AVX/AVX2 behavior needed by PS5 titles, and guest exception/fault semantics. The PS5 CPU is Zen 2 class; do not assume AVX-512 is available.
 3. **Kernel/loader integration:** route guest code entry points, calls/returns, syscalls, signals, faults, and code writes through the backend. Invalidate translated blocks when executable guest memory changes.
 4. **Native memory model:** separate PS5 guest virtual addresses from host pointers and remove the macOS x86-64-only `-segaddr` / `-image_base` strategy from the arm64 path.
-5. **Graphics:** validate an arm64 Vulkan loader/MoltenVK path first; evaluate KosmicKrisp as an optional way to build/package graphics dependencies. This work must remain independent from the CPU translator.
+5. **Graphics:** evaluate KosmicKrisp as an alternative Vulkan ICD to MoltenVK through the Vulkan loader. Compare the Vulkan extensions, formats, synchronization behavior, and limits Kyty actually requires; keep a proven fallback. This work must remain independent from the CPU translator.
 6. **CI and regression testing:** build the native binary on an Apple Silicon runner and run state, instruction, memory, syscall, exception, and existing emulator tests. Keep a separate x86-64 macOS/Rosetta job until parity is demonstrated.
 
 ## Build the state-contract smoke test
