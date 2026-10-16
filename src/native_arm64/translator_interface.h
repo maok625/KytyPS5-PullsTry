@@ -24,16 +24,36 @@ struct BlockExit {
 	std::uint64_t detail = 0;
 };
 
-// Contract for a future x86-64 guest -> AArch64 host backend.
-//
-// Implementations are responsible for translating guest instructions, caching
-// host blocks, preserving x86 architectural state, and returning at syscalls,
-// exceptions, and memory faults so Kyty's existing kernel/loader can handle
-// those events. Executable guest-memory writes must invalidate overlapping
-// cached blocks.
-//
-// No implementation is provided in this scaffold. Do not route live guest
-// execution through this interface until a tested backend is available.
+enum class InstructionStepStatus : std::uint8_t {
+	Continue,
+	ControlFlow,
+	MemoryFault,
+	UnsupportedInstruction,
+};
+
+struct InstructionStep {
+	InstructionStepStatus status = InstructionStepStatus::Continue;
+	std::uint64_t guest_rip = 0;
+	std::uint64_t detail = 0;
+};
+
+// Guest memory is addressed in PS5 guest virtual-address space, never through
+// a host pointer assumed to match that address. Implementations must check the
+// guest mapping and return false for unmapped or inaccessible ranges.
+class GuestMemory {
+public:
+	virtual ~GuestMemory() = default;
+	[[nodiscard]] virtual bool Read(std::uint64_t guest_address, void* destination,
+	                                std::size_t size) const noexcept = 0;
+	[[nodiscard]] virtual bool Write(std::uint64_t guest_address, const void* source,
+	                                 std::size_t size) noexcept = 0;
+};
+
+// Interface for an x86-64 guest execution backend. The first implementation is
+// a deliberately small interpreter subset; a later AArch64 DBT can implement
+// this same contract. Every backend must preserve guest state and return at
+// syscalls, exceptions, unsupported instructions, and memory faults.
+// Executable guest-memory writes must invalidate overlapping cached blocks.
 class GuestTranslator {
 public:
 	virtual ~GuestTranslator() = default;
@@ -41,7 +61,7 @@ public:
 	[[nodiscard]] virtual const char* BackendName() const noexcept = 0;
 	[[nodiscard]] virtual bool IsSupported() const noexcept = 0;
 
-	virtual BlockExit RunBlock(GuestCpuState& state,
+	virtual BlockExit RunBlock(GuestCpuState& state, GuestMemory& memory,
 	                           std::uint64_t instruction_budget) = 0;
 
 	virtual void InvalidateCodeRange(std::uint64_t guest_address,
