@@ -594,40 +594,144 @@ InstructionStep X64Interpreter::ExecuteOne(GuestCpuState& state, GuestMemory& me
 
 	// Register-direct forms only. Memory operands are deliberately rejected
 	// until guest-address translation and page-fault behavior are implemented.
-	if (opcode == 0xff) { // Indirect CALL/JMP r/m64 (groups /2 and /4)
+	if (opcode == 0xff) { // INC/DEC/PUSH and indirect CALL/JMP r/m
 		std::uint8_t modrm = 0;
 		if (!reader.ReadByte(modrm)) {
 			return ReaderFailure(reader);
 		}
 		const std::uint8_t group = static_cast<std::uint8_t>((modrm >> 3) & 0x07);
-		if (group != 0x02 && group != 0x04) {
+		if (!(group == 0x00 || group == 0x01 || group == 0x02 ||
+		      group == 0x04 || group == 0x06)) {
 			return Unsupported(instruction_rip, opcode);
 		}
-		RmOperand target_operand{};
-		if (!DecodeRmOperand(reader, state, modrm, rex, target_operand)) {
+		RmOperand operand{};
+		if (!DecodeRmOperand(reader, state, modrm, rex, operand)) {
 			return ReaderFailure(reader);
 		}
-		std::uint64_t target = 0;
+		std::uint64_t value = 0;
 		std::uint64_t fault_address = 0;
-		if (!ReadRmOperand(target_operand, state, memory, true, reader.Cursor(),
-		                   segment_override, target, fault_address)) {
+		const bool stack_push = group == 0x06;
+		const bool control_flow = group == 0x02 || group == 0x04;
+		const bool operand_wide = stack_push || control_flow || wide;
+		if (!ReadRmOperand(operand, state, memory, operand_wide, reader.Cursor(),
+		                   segment_override, value, fault_address)) {
 			return {InstructionStepStatus::MemoryFault, instruction_rip, fault_address};
 		}
-		if (group == 0x02) {
-			const std::uint64_t return_address = reader.Cursor();
-			const auto old_stack = state.gpr[static_cast<std::size_t>(GuestGpr::Rsp)];
-			const auto new_stack = old_stack - sizeof(return_address);
-			std::uint8_t bytes[sizeof(return_address)]{};
-			for (std::size_t i = 0; i < sizeof(return_address); ++i) {
-				bytes[i] = static_cast<std::uint8_t>(return_address >> (i * 8));
+
+		if (group == 0x00 || group == 0x01) { // INC / DEC r/m32 or r/m64
+			const bool decrement = group == 0x01;
+			const bool operation_wide = wide;
+			const std::uint64_t result = decrement ? value - 1 : value + 1;
+			const std::uint64_t masked_result =
+			    operation_wide ? result : static_cast<std::uint32_t>(result);
+			if (!WriteRmOperand(operand, state, memory, operation_wide, reader.Cursor(),
+			                    segment_override, masked_result, fault_address)) {
+				return {InstructionStepStatus::MemoryFault, instruction_rip, fault_address};
+			}
+			const std::uint64_t old_carry = state.rflags & kFlagCarry;
+			UpdateArithmeticFlags(state, decrement ? ArithmeticOperation::Subtract
+			                                      : ArithmeticOperation::Add,
+			                     value, 1, masked_result, operation_wide);
+			state.rflags = (state.rflags & ~kFlagCarry) | old_carry | kRflagsReservedOne;
+			state.rip = reader.Cursor();
+			return {InstructionStepStatus::Continue, instruction_rip, opcode};
+		}
+
+		if (stack_push) {
+			const std::uint64_t old_stack = state.gpr[static_cast<std::size_t>(GuestGpr::Rsp)];
+			const std::uint64_t new_stack = old_stack - sizeof(value);
+			std::uint8_t bytes[sizeof(value)]{};
+			for (std::size_t i = 0; i < sizeof(value); ++i) {
+				bytes[i] = static_cast<std::uint8_t>(value >> (i * 8));
 			}
 			if (!memory.Write(new_stack, bytes, sizeof(bytes))) {
 				return {InstructionStepStatus::MemoryFault, instruction_rip, new_stack};
 			}
 			state.gpr[static_cast<std::size_t>(GuestGpr::Rsp)] = new_stack;
+			state.rip = reader.Cursor();
+			return {InstructionStepStatus::Continue, instruction_rip, opcode};
 		}
-		state.rip = target;
-		return {InstructionStepStatus::ControlFlow, instruction_rip, opcode};
+
+		if (control_flow) {
+			if (group == 0x02) { // CALL r/m64
+				const std::uint64_t return_address = reader.Cursor();
+				const auto old_stack = state.gpr[static_cast<std::size_t>(GuestGpr::Rsp)];
+				const auto new_stack = old_stack - sizeof(return_address);
+				std::uint8_t bytes[sizeof(return_address)]{};
+				for (std::size_t i = 0; i < sizeof(return_address); ++i) {
+					bytes[i] = static_cast<std::uint8_t>(return_address >> (i * 8));
+				}
+				if (!memory.Write(new_stack, bytes, sizeof(bytes))) {
+					return {InstructionStepStatus::MemoryFault, instruction_rip, new_stack};
+				}
+				state.gpr[static_cast<std::size_t>(GuestGpr::Rsp)] = new_stack;
+			}
+			state.rip = value;
+			return {InstructionStepStatus::ControlFlow, instruction_rip, opcode};
+		}
+	}
+
+	if (opcode == 0xf7) { // TEST, NOT, NEG r/m32/r/m64
+		std::uint8_t modrm = 0;
+		if (!reader.ReadByte(modrm)) {
+			return ReaderFailure(reader);
+		}
+		const std::uint8_t group = static_cast<std::uint8_t>((modrm >> 3) & 0x07);
+		if (!(group == 0x00 || group == 0x02 || group == 0x03)) {
+			return Unsupported(instruction_rip, opcode);
+		}
+		RmOperand operand{};
+		if (!DecodeRmOperand(reader, state, modrm, rex, operand)) {
+			return ReaderFailure(reader);
+		}
+		const auto next_rip = reader.Cursor();
+		std::uint64_t value = 0;
+		std::uint64_t fault_address = 0;
+		if (!ReadRmOperand(operand, state, memory, wide, next_rip, segment_override,
+		                   value, fault_address)) {
+			return {InstructionStepStatus::MemoryFault, instruction_rip, fault_address};
+		}
+		if (group == 0x00) { // TEST r/m, imm32 (sign-extended for 64-bit operation)
+			std::uint64_t immediate = 0;
+			if (wide) {
+				std::uint32_t encoded = 0;
+				if (!ReadLittleEndian(reader, encoded)) {
+					return ReaderFailure(reader);
+				}
+				immediate = static_cast<std::uint64_t>(static_cast<std::int64_t>(
+				    std::bit_cast<std::int32_t>(encoded)));
+			} else {
+				std::uint32_t encoded = 0;
+				if (!ReadLittleEndian(reader, encoded)) {
+					return ReaderFailure(reader);
+				}
+				immediate = encoded;
+			}
+			const std::uint64_t result = value & (wide ? immediate : static_cast<std::uint32_t>(immediate));
+			UpdateLogicalFlags(state, result, wide);
+			state.rip = reader.Cursor();
+			return {InstructionStepStatus::Continue, instruction_rip, opcode};
+		}
+		if (group == 0x02) { // NOT does not change flags
+			const std::uint64_t result = ~value;
+			if (!WriteRmOperand(operand, state, memory, wide, next_rip,
+			                    segment_override, result, fault_address)) {
+				return {InstructionStepStatus::MemoryFault, instruction_rip, fault_address};
+			}
+			state.rip = next_rip;
+			return {InstructionStepStatus::Continue, instruction_rip, opcode};
+		}
+		// NEG is SUB 0, value. CF is set exactly when the operand is nonzero.
+		const std::uint64_t result = std::uint64_t{0} - value;
+		const std::uint64_t masked_result = wide ? result : static_cast<std::uint32_t>(result);
+		if (!WriteRmOperand(operand, state, memory, wide, next_rip,
+		                    segment_override, masked_result, fault_address)) {
+			return {InstructionStepStatus::MemoryFault, instruction_rip, fault_address};
+		}
+		UpdateArithmeticFlags(state, ArithmeticOperation::Subtract, 0, value,
+		                      masked_result, wide);
+		state.rip = next_rip;
+		return {InstructionStepStatus::Continue, instruction_rip, opcode};
 	}
 
 	if (opcode == 0x63) { // MOVSXD r64, r/m32
