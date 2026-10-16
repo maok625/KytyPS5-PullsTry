@@ -363,15 +363,27 @@ InstructionStep X64Interpreter::ExecuteOne(GuestCpuState& state, GuestMemory& me
 	InstructionReader reader(memory, instruction_rip);
 
 	std::uint8_t rex = 0;
+	std::uint8_t segment_override = 0;
 	std::uint8_t opcode = 0;
 	for (;;) {
 		if (!reader.ReadByte(opcode)) {
 			return ReaderFailure(reader);
 		}
-		if (opcode < 0x40 || opcode > 0x4f) {
-			break;
+		if (opcode >= 0x40 && opcode <= 0x4f) {
+			rex = opcode;
+			continue;
 		}
-		rex = opcode;
+		if (opcode == 0x64 || opcode == 0x65) { // FS / GS segment override
+			segment_override = opcode;
+			rex = 0; // REX is effective only when it precedes the opcode.
+			continue;
+		}
+		if (opcode == 0x66 || opcode == 0x67 || opcode == 0xf0 ||
+		    opcode == 0xf2 || opcode == 0xf3 || opcode == 0x26 ||
+		    opcode == 0x2e || opcode == 0x36 || opcode == 0x3e) {
+			return Unsupported(instruction_rip, opcode);
+		}
+		break;
 	}
 
 	const bool wide = (rex & 0x08) != 0;
@@ -402,6 +414,62 @@ InstructionStep X64Interpreter::ExecuteOne(GuestCpuState& state, GuestMemory& me
 		return {InstructionStepStatus::Continue, instruction_rip, opcode};
 	}
 
+	if (opcode >= 0x70 && opcode <= 0x7f) { // Jcc rel8
+		std::uint8_t encoded = 0;
+		if (!ReadLittleEndian(reader, encoded)) {
+			return ReaderFailure(reader);
+		}
+		const std::uint64_t next_rip = reader.Cursor();
+		const auto displacement = std::bit_cast<std::int8_t>(encoded);
+		state.rip = EvaluateCondition(state, static_cast<std::uint8_t>(opcode & 0x0f))
+		                ? next_rip + static_cast<std::uint64_t>(static_cast<std::int64_t>(displacement))
+		                : next_rip;
+		return {InstructionStepStatus::ControlFlow, instruction_rip, opcode};
+	}
+
+	if (opcode == 0x0f) { // Near conditional branch (0F 80..8F rel32)
+		std::uint8_t second_opcode = 0;
+		if (!reader.ReadByte(second_opcode)) {
+			return ReaderFailure(reader);
+		}
+		if (second_opcode < 0x80 || second_opcode > 0x8f) {
+			return Unsupported(instruction_rip,
+			                   (static_cast<std::uint64_t>(opcode) << 8) | second_opcode);
+		}
+		std::uint32_t encoded = 0;
+		if (!ReadLittleEndian(reader, encoded)) {
+			return ReaderFailure(reader);
+		}
+		const std::uint64_t next_rip = reader.Cursor();
+		const auto displacement = std::bit_cast<std::int32_t>(encoded);
+		state.rip = EvaluateCondition(state, static_cast<std::uint8_t>(second_opcode & 0x0f))
+		                ? next_rip + static_cast<std::uint64_t>(static_cast<std::int64_t>(displacement))
+		                : next_rip;
+		return {InstructionStepStatus::ControlFlow, instruction_rip,
+		        (static_cast<std::uint64_t>(opcode) << 8) | second_opcode};
+	}
+
+	if (opcode == 0xe8) { // CALL rel32
+		std::uint32_t encoded = 0;
+		if (!ReadLittleEndian(reader, encoded)) {
+			return ReaderFailure(reader);
+		}
+		const std::uint64_t return_address = reader.Cursor();
+		const auto old_stack = state.gpr[static_cast<std::size_t>(GuestGpr::Rsp)];
+		const auto new_stack = old_stack - sizeof(return_address);
+		std::uint8_t bytes[sizeof(return_address)]{};
+		for (std::size_t i = 0; i < sizeof(return_address); ++i) {
+			bytes[i] = static_cast<std::uint8_t>(return_address >> (i * 8));
+		}
+		if (!memory.Write(new_stack, bytes, sizeof(bytes))) {
+			return {InstructionStepStatus::MemoryFault, instruction_rip, new_stack};
+		}
+		const auto displacement = std::bit_cast<std::int32_t>(encoded);
+		state.gpr[static_cast<std::size_t>(GuestGpr::Rsp)] = new_stack;
+		state.rip = return_address + static_cast<std::uint64_t>(static_cast<std::int64_t>(displacement));
+		return {InstructionStepStatus::ControlFlow, instruction_rip, opcode};
+	}
+
 	if (opcode == 0xeb || opcode == 0xe9) { // JMP rel8 / rel32
 		std::int64_t displacement = 0;
 		if (opcode == 0xeb) {
@@ -419,6 +487,37 @@ InstructionStep X64Interpreter::ExecuteOne(GuestCpuState& state, GuestMemory& me
 		}
 		state.rip = reader.Cursor() + static_cast<std::uint64_t>(displacement);
 		return {InstructionStepStatus::ControlFlow, instruction_rip, opcode};
+	}
+
+	if (opcode >= 0x50 && opcode <= 0x57) { // PUSH r64
+		const auto source = RegisterIndex(static_cast<std::uint8_t>(opcode - 0x50), rex_b);
+		const auto old_stack = state.gpr[static_cast<std::size_t>(GuestGpr::Rsp)];
+		const auto new_stack = old_stack - sizeof(std::uint64_t);
+		std::uint8_t bytes[sizeof(std::uint64_t)]{};
+		const std::uint64_t value = state.gpr[source];
+		for (std::size_t i = 0; i < sizeof(value); ++i) {
+			bytes[i] = static_cast<std::uint8_t>(value >> (i * 8));
+		}
+		if (!memory.Write(new_stack, bytes, sizeof(bytes))) {
+			return {InstructionStepStatus::MemoryFault, instruction_rip, new_stack};
+		}
+		state.gpr[static_cast<std::size_t>(GuestGpr::Rsp)] = new_stack;
+		state.rip = reader.Cursor();
+		return {InstructionStepStatus::Continue, instruction_rip, opcode};
+	}
+
+	if (opcode >= 0x58 && opcode <= 0x5f) { // POP r64
+		const auto destination = RegisterIndex(static_cast<std::uint8_t>(opcode - 0x58), rex_b);
+		const auto old_stack = state.gpr[static_cast<std::size_t>(GuestGpr::Rsp)];
+		std::uint8_t bytes[sizeof(std::uint64_t)]{};
+		if (!memory.Read(old_stack, bytes, sizeof(bytes))) {
+			return {InstructionStepStatus::MemoryFault, instruction_rip, old_stack};
+		}
+		const std::uint64_t value = ReadLittleEndianU64(bytes);
+		state.gpr[static_cast<std::size_t>(GuestGpr::Rsp)] = old_stack + sizeof(bytes);
+		WriteGpr(state, destination, true, value);
+		state.rip = reader.Cursor();
+		return {InstructionStepStatus::Continue, instruction_rip, opcode};
 	}
 
 	if (opcode == 0xc3) { // RET
