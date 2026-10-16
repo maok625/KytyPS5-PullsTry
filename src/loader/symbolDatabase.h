@@ -6,6 +6,7 @@
 #include "common/stringUtils.h"
 
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace Loader {
@@ -46,6 +47,9 @@ public:
 	[[nodiscard]] const SymbolRecord* FindByNid(const std::string& nid, SymbolType type,
 	                                              uint64_t vaddr = 0) const;
 	[[nodiscard]] const SymbolRecord* FindByName(const std::string& name, SymbolType type) const;
+	[[nodiscard]] bool IsFunctionAddress(uint64_t vaddr) const {
+		return m_function_addresses.contains(vaddr);
+	}
 
 	void DbgDump(const std::string& folder, const std::string& file_name);
 
@@ -56,6 +60,7 @@ public:
 private:
 	std::vector<SymbolRecord>               m_symbols;
 	std::unordered_map<std::string, size_t> m_map;
+	std::unordered_set<uint64_t>            m_function_addresses;
 };
 
 } // namespace Loader
