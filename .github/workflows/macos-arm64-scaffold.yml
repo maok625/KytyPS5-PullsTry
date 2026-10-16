@@ -57,7 +57,7 @@ jobs:
           installer_cli="$(find "$installer_app/Contents/MacOS" -maxdepth 1 -type f -name 'vulkansdk-macOS-*' -print -quit)"
           test -n "$installer_cli"
           # KosmicKrisp is optional in the SDK; install its component explicitly.
-          "$installer_cli" --root "$install_root" --accept-licenses --default-answer --confirm-command install copy_only=1 com.lunarg.vulkan.kosmic
+          "$installer_cli" --root "$install_root" --accept-licenses --default-answer --confirm-command install com.lunarg.vulkan.core com.lunarg.vulkan.kosmic copy_only=1
           sdk_root="$install_root/macOS"
           test -f "$sdk_root/include/vulkan/vulkan.h"
           test -f "$sdk_root/lib/libvulkan.1.dylib" -o -f "$sdk_root/lib/libvulkan.dylib"
