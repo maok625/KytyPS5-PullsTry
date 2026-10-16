@@ -163,6 +163,182 @@ void UpdateArithmeticFlags(GuestCpuState& state, ArithmeticOperation operation,
 	state.rflags = (state.rflags & ~kArithmeticFlags) | updated | kRflagsReservedOne;
 }
 
+struct RmOperand {
+	bool is_register = false;
+	std::size_t register_index = 0;
+	std::uint64_t base = 0;
+	std::uint64_t index = 0;
+	std::int64_t displacement = 0;
+	bool rip_relative = false;
+};
+
+bool DecodeRmOperand(InstructionReader& reader, const GuestCpuState& state,
+                     std::uint8_t modrm, std::uint8_t rex, RmOperand& operand) noexcept {
+	const std::uint8_t mod = static_cast<std::uint8_t>((modrm >> 6) & 0x03);
+	const std::uint8_t rm_low = static_cast<std::uint8_t>(modrm & 0x07);
+	const std::uint8_t rex_b = (rex & 0x01) != 0 ? 8 : 0;
+	const std::uint8_t rex_x = (rex & 0x02) != 0 ? 8 : 0;
+
+	if (mod == 0x03) {
+		operand.is_register = true;
+		operand.register_index = RegisterIndex(rm_low, rex_b);
+		return true;
+	}
+
+	if (rm_low == 0x04) { // SIB addressing
+		std::uint8_t sib = 0;
+		if (!reader.ReadByte(sib)) {
+			return false;
+		}
+		const std::uint8_t scale = static_cast<std::uint8_t>(sib >> 6);
+		const std::uint8_t index_low = static_cast<std::uint8_t>((sib >> 3) & 0x07);
+		const std::uint8_t base_low = static_cast<std::uint8_t>(sib & 0x07);
+
+		if (index_low != 0x04 || rex_x != 0) {
+			const auto index_reg = RegisterIndex(index_low, rex_x);
+			operand.index = state.gpr[index_reg] << scale;
+		}
+		const bool has_base = !(mod == 0 && base_low == 0x05);
+		if (has_base) {
+			operand.base = state.gpr[RegisterIndex(base_low, rex_b)];
+		}
+		if (!has_base) {
+			std::uint32_t encoded = 0;
+			if (!ReadLittleEndian(reader, encoded)) {
+				return false;
+			}
+			operand.displacement = std::bit_cast<std::int32_t>(encoded);
+		}
+	} else if (mod == 0 && rm_low == 0x05) { // RIP-relative disp32
+		std::uint32_t encoded = 0;
+		if (!ReadLittleEndian(reader, encoded)) {
+			return false;
+		}
+		operand.rip_relative = true;
+		operand.displacement = std::bit_cast<std::int32_t>(encoded);
+	} else {
+		operand.base = state.gpr[RegisterIndex(rm_low, rex_b)];
+	}
+
+	if (mod == 0x01) {
+		std::uint8_t encoded = 0;
+		if (!ReadLittleEndian(reader, encoded)) {
+			return false;
+		}
+		operand.displacement += std::bit_cast<std::int8_t>(encoded);
+	} else if (mod == 0x02) {
+		std::uint32_t encoded = 0;
+		if (!ReadLittleEndian(reader, encoded)) {
+			return false;
+		}
+		operand.displacement += std::bit_cast<std::int32_t>(encoded);
+	}
+	return true;
+}
+
+std::uint64_t EffectiveAddress(const RmOperand& operand, std::uint64_t next_rip,
+                               const GuestCpuState& state, std::uint8_t segment_override,
+                               bool apply_segment) noexcept {
+	const std::uint64_t base = operand.rip_relative ? next_rip : operand.base;
+	std::uint64_t address = base + operand.index +
+	                        static_cast<std::uint64_t>(operand.displacement);
+	if (apply_segment) {
+		if (segment_override == 0x64) {
+			address += state.fs_base;
+		} else if (segment_override == 0x65) {
+			address += state.gs_base;
+		}
+	}
+	return address;
+}
+
+bool ReadRmOperand(const RmOperand& operand, const GuestCpuState& state,
+                   const GuestMemory& memory, bool wide, std::uint64_t next_rip,
+                   std::uint8_t segment_override, std::uint64_t& value,
+                   std::uint64_t& fault_address) noexcept {
+	if (operand.is_register) {
+		value = ReadGpr(state, operand.register_index, wide);
+		return true;
+	}
+	const auto address = EffectiveAddress(operand, next_rip, state, segment_override, true);
+	std::uint8_t bytes[sizeof(std::uint64_t)]{};
+	const std::size_t size = wide ? sizeof(std::uint64_t) : sizeof(std::uint32_t);
+	if (!memory.Read(address, bytes, size)) {
+		fault_address = address;
+		return false;
+	}
+	value = ReadLittleEndianU64(bytes);
+	if (!wide) {
+		value = static_cast<std::uint32_t>(value);
+	}
+	return true;
+}
+
+bool WriteRmOperand(const RmOperand& operand, GuestCpuState& state, GuestMemory& memory,
+                    bool wide, std::uint64_t next_rip, std::uint8_t segment_override,
+                    std::uint64_t value, std::uint64_t& fault_address) noexcept {
+	if (operand.is_register) {
+		WriteGpr(state, operand.register_index, wide, value);
+		return true;
+	}
+	const auto address = EffectiveAddress(operand, next_rip, state, segment_override, true);
+	std::uint8_t bytes[sizeof(std::uint64_t)]{};
+	const std::size_t size = wide ? sizeof(std::uint64_t) : sizeof(std::uint32_t);
+	for (std::size_t i = 0; i < size; ++i) {
+		bytes[i] = static_cast<std::uint8_t>(value >> (i * 8));
+	}
+	if (!memory.Write(address, bytes, size)) {
+		fault_address = address;
+		return false;
+	}
+	return true;
+}
+
+void UpdateLogicalFlags(GuestCpuState& state, std::uint64_t result, bool wide) noexcept {
+	const std::uint64_t mask = wide ? UINT64_MAX : 0xffffffffULL;
+	const std::uint64_t sign = wide ? (1ULL << 63) : (1ULL << 31);
+	result &= mask;
+	std::uint64_t updated = 0;
+	if ((std::popcount(static_cast<std::uint8_t>(result)) & 1) == 0) {
+		updated |= kFlagParity;
+	}
+	if (result == 0) {
+		updated |= kFlagZero;
+	}
+	if ((result & sign) != 0) {
+		updated |= kFlagSign;
+	}
+	// CF, OF, and AF are cleared deterministically for AND/TEST/XOR.
+	state.rflags = (state.rflags & ~kArithmeticFlags) | updated | kRflagsReservedOne;
+}
+
+bool EvaluateCondition(const GuestCpuState& state, std::uint8_t condition) noexcept {
+	const bool cf = (state.rflags & kFlagCarry) != 0;
+	const bool pf = (state.rflags & kFlagParity) != 0;
+	const bool zf = (state.rflags & kFlagZero) != 0;
+	const bool sf = (state.rflags & kFlagSign) != 0;
+	const bool of = (state.rflags & kFlagOverflow) != 0;
+	switch (condition & 0x0f) {
+		case 0x0: return of;
+		case 0x1: return !of;
+		case 0x2: return cf;
+		case 0x3: return !cf;
+		case 0x4: return zf;
+		case 0x5: return !zf;
+		case 0x6: return cf || zf;
+		case 0x7: return !cf && !zf;
+		case 0x8: return sf;
+		case 0x9: return !sf;
+		case 0xa: return pf;
+		case 0xb: return !pf;
+		case 0xc: return sf != of;
+		case 0xd: return sf == of;
+		case 0xe: return zf || sf != of;
+		case 0xf: return !zf && sf == of;
+	}
+	return false;
+}
+
 std::uint64_t ReadLittleEndianU64(const std::uint8_t* bytes) noexcept {
 	std::uint64_t value = 0;
 	for (std::size_t i = 0; i < sizeof(value); ++i) {
