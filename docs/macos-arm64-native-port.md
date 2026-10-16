@@ -34,7 +34,7 @@ The guest state model includes the 16 x86-64 general-purpose registers, RIP/RFLA
 
 ## Build and run the interpreter smoke test
 
-Requirements: an Apple Silicon Mac running **macOS 26 or newer**, a compatible current Xcode, CMake, Ninja, Homebrew glslang, and the **installed LunarG Vulkan SDK that includes KosmicKrisp**. The project does not distribute the SDK or KosmicKrisp.
+Requirements: an Apple Silicon Mac running **macOS 26 or newer**, a compatible current Xcode, CMake, Ninja, Homebrew glslang, and the **installed LunarG Vulkan SDK with KosmicKrisp**. The project does not distribute the SDK or KosmicKrisp.
 
 Install the Vulkan SDK with its **KosmicKrisp** optional component selected. CMake auto-detects a valid SDK under ~/VulkanSDK/<version>/macOS. For an SDK installed elsewhere, set VULKAN_SDK or pass KYTY_VULKAN_SDK_ROOT. The SDK's macOS directory is the one containing include/, lib/, and share/:
 
@@ -57,4 +57,4 @@ ctest --test-dir _Build/macos-arm64-native -R native_arm64_state --output-on-fai
 
 When VULKAN_SDK is set, Kyty uses that SDK. Otherwise, native startup discovers the newest valid SDK in ~/VulkanSDK/<version>/macOS, so Finder-launched apps do not depend on inheriting shell setup-env.sh variables. Kyty loads libvulkan.1.dylib (or libvulkan.dylib) from the selected SDK and forcibly selects that SDK's KosmicKrisp ICD manifest; system-wide MoltenVK entries and Vulkan driver-selection variables cannot silently redirect the native branch to MoltenVK. An explicitly supplied SDL_VULKAN_LIBRARY is accepted only if it is not libMoltenVK.dylib. Kyty enables the KosmicKrisp experimental image_view_min_lod feature required by the current renderer while preserving other MESA_KK_EXPERIMENTAL options. No SDK or ICD binaries are copied into the build/install output.
 
-The workflow installs the current LunarG Vulkan SDK on a macOS 26+ runner and runs both interpreter tests and a full emulator build. A successful full build still does not mean the emulator can boot games: the x86-64-to-AArch64 backend is not yet connected to the runtime linker, host-import ABI bridge, or syscall dispatcher. The x86-64/Rosetta fallback remains separate and continues to bundle MoltenVK.
+The workflow installs the current LunarG Vulkan SDK on a macOS 26+ runner and checks that the package actually contains the KosmicKrisp ICD manifest and runs both interpreter tests and a full emulator build. A successful full build still does not mean the emulator can boot games: the x86-64-to-AArch64 backend is not yet connected to the runtime linker, host-import ABI bridge, or syscall dispatcher. The x86-64/Rosetta fallback remains separate and continues to bundle MoltenVK.
