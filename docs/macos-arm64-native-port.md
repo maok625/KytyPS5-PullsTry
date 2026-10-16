@@ -28,6 +28,24 @@ The initial state model covers the 16 x86-64 general-purpose registers, RIP/RFLA
 5. **Graphics:** validate an arm64 Vulkan loader/MoltenVK path first; evaluate KosmicKrisp as an optional way to build/package graphics dependencies. This work must remain independent from the CPU translator.
 6. **CI and regression testing:** build the native binary on an Apple Silicon runner and run state, instruction, memory, syscall, exception, and existing emulator tests. Keep a separate x86-64 macOS/Rosetta job until parity is demonstrated.
 
+## Build the state-contract smoke test
+
+On macOS with Xcode Command Line Tools, CMake, Ninja, and the project dependencies installed:
+
+```sh
+git submodule update --init --recursive
+cmake -S . -B _Build/macos-arm64-native -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_OSX_ARCHITECTURES=arm64 \
+  -DCMAKE_C_COMPILER=clang \
+  -DCMAKE_CXX_COMPILER=clang++ \
+  -DKYTY_BUILD_LAUNCHER=OFF
+cmake --build _Build/macos-arm64-native --target native_arm64_state_tests --parallel
+ctest --test-dir _Build/macos-arm64-native -R native_arm64_state --output-on-failure
+```
+
+The standalone GitHub Actions workflow compiles the same test for the arm64 target. Neither the CMake target nor the workflow builds the complete emulator or validates guest instruction execution.
+
 ## Current validation
 
 The accompanying `macos-arm64-scaffold.yml` workflow only checks that the new guest-state boundary can be compiled for the arm64 target. It does **not** mean that the complete KytyPS5 application builds or runs natively yet.
