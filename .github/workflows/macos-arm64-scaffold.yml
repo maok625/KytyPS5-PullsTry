@@ -19,18 +19,18 @@ permissions:
 jobs:
   native-emulator-build:
     name: Build the full emulator for native ARM64
-    runs-on: macos-15
+    runs-on: macos-26
     steps:
       - name: Check out source and submodules
         uses: actions/checkout@v4
         with:
           submodules: recursive
 
-      - name: Select Xcode 26
+      - name: Select Xcode 27
         shell: bash
         run: |
           set -euo pipefail
-          xcode_path="$(ls -d /Applications/Xcode_26*.app | tail -n 1)"
+          xcode_path="$(ls -d /Applications/Xcode_27*.app | tail -n 1)"
           test -n "$xcode_path"
           sudo xcode-select --switch "$xcode_path/Contents/Developer"
           xcodebuild -version
@@ -39,11 +39,46 @@ jobs:
         shell: bash
         run: brew install glslang
 
+      - name: Install the current LunarG Vulkan SDK with KosmicKrisp
+        id: vulkan_sdk
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdk_version="$(curl --fail --silent --show-error --location https://vulkan.lunarg.com/sdk/latest/mac.txt)"
+          archive="$RUNNER_TEMP/vulkansdk-macos-$sdk_version.zip"
+          unpack="$RUNNER_TEMP/vulkansdk-unpack"
+          install_root="$RUNNER_TEMP/VulkanSDK/$sdk_version"
+          curl --fail --location --retry 3 --output "$archive" \
+            "https://sdk.lunarg.com/sdk/download/$sdk_version/mac/vulkan_sdk.zip?Human=true"
+          mkdir -p "$unpack" "$(dirname "$install_root")"
+          unzip -q "$archive" -d "$unpack"
+          installer_app="$(find "$unpack" -maxdepth 3 -type d -name 'vulkansdk-macOS-*.app' -print -quit)"
+          test -n "$installer_app"
+          installer_cli="$(find "$installer_app/Contents/MacOS" -maxdepth 1 -type f -name 'vulkansdk-macOS-*' -print -quit)"
+          test -n "$installer_cli"
+          "$installer_cli" --root "$install_root" --accept-licenses --default-answer --confirm-command install copy_only=1
+          sdk_root="$install_root/macOS"
+          test -f "$sdk_root/include/vulkan/vulkan.h"
+          test -f "$sdk_root/lib/libvulkan.1.dylib" -o -f "$sdk_root/lib/libvulkan.dylib"
+          find "$sdk_root/share/vulkan/icd.d" -maxdepth 1 -iname '*kosmickrisp*.json' -print -quit | grep -q .
+          echo "VULKAN_SDK=$sdk_root" >> "$GITHUB_ENV"
+          echo "SDK_VERSION=$sdk_version" >> "$GITHUB_OUTPUT"
+          echo "Installed Vulkan SDK $sdk_version at $sdk_root"
+
       - name: Configure native ARM64 build
         shell: bash
         run: |
           set -euo pipefail
-          cmake -S . -B _Build/macos-arm64-native -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DKYTY_BUILD_LAUNCHER=OFF -DKYTY_BUILD_ORIGIN=Source
+          cmake -S . -B _Build/macos-arm64-native -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=26.0 \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DKYTY_NATIVE_MACOS_ARM64_KOSMICKRISP=ON \
+            -DKYTY_VULKAN_SDK_ROOT="$VULKAN_SDK" \
+            -DKYTY_BUILD_LAUNCHER=OFF \
+            -DKYTY_BUILD_ORIGIN=Source
 
       - name: Build full emulator and state tests
         shell: bash
