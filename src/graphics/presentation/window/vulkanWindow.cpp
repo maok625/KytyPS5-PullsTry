@@ -916,9 +916,10 @@ void WindowContext::CreateVulkan() {
 			r.required_extensions.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
 		}
 		inst_info.flags |= vk::InstanceCreateFlagBits::eEnumeratePortabilityKHR;
-		LOGF("Vulkan instance: enabled %s\\n", VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+		LOGF("Vulkan instance: enabled %s\n", VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
 	}
-#endif	inst_info.pApplicationInfo        = &app_info;
+#endif
+	inst_info.pApplicationInfo        = &app_info;
 	inst_info.enabledExtensionCount   = static_cast<uint32_t>(r.required_extensions.size());
 	inst_info.ppEnabledExtensionNames = r.required_extensions.data();
 	inst_info.enabledLayerCount =
