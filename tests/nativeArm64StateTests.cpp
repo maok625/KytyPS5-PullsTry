@@ -251,7 +251,7 @@ int main() {
 	const BlockExit unsupported_exit = interpreter.RunBlock(state, memory, 1);
 	CHECK(unsupported_exit.reason == BlockExitReason::UnsupportedInstruction);
 	CHECK(unsupported_exit.guest_rip == 0x1400);
-	CHECK(unsupported_exit.detail == 0x0f);
+	CHECK(unsupported_exit.detail == 0x0f00); // 0F escape opcode plus decoded second byte
 	CHECK(state.rip == 0x1400);
 
 	// Instruction fetch faults report the exact inaccessible guest address.
