@@ -27,12 +27,18 @@ void SymbolDatabase::Add(const SymbolResolve& s, uint64_t vaddr) {
 	r.vaddr = vaddr;
 	m_map.insert_or_assign(r.name, m_symbols.size());
 	m_symbols.push_back(r);
+	if (s.type == SymbolType::Func || s.type == SymbolType::NoType) {
+		m_function_addresses.insert(vaddr);
+	}
 }
 
 void SymbolDatabase::Add(const SymbolResolve& s, uint64_t vaddr, const std::string& dbg_name) {
 	SymbolRecord r {};
 	r.name     = GenerateName(s);
 	r.vaddr    = vaddr;
+	if (s.type == SymbolType::Func || s.type == SymbolType::NoType) {
+		m_function_addresses.insert(vaddr);
+	}
 	r.dbg_name = dbg_name;
 	m_map.insert_or_assign(r.name, m_symbols.size());
 	m_symbols.push_back(r);
