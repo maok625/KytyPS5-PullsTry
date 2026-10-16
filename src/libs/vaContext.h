@@ -2,7 +2,11 @@
 #define EMULATOR_INCLUDE_EMULATOR_LIBS_VACONTEXT_H_
 
 #include <cstddef>
+#include <cstdint>
+
+#if defined(__x86_64__) || defined(_M_X64)
 #include <xmmintrin.h>
+using VaFpRegister = __m128;
 
 // NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
 #define VA_ARGS                                                                                    \
@@ -31,6 +35,14 @@
 	(ctx).va_list.gp_offset         = offsetof(VaRegSave, gp);                                     \
 	(ctx).va_list.fp_offset         = offsetof(VaRegSave, fp);                                     \
 	(ctx).va_list.overflow_arg_area = &overflow_arg_area;
+#elif defined(__aarch64__) || defined(_M_ARM64)
+// Use a portable 128-bit vector type for preserving guest XMM register bits.
+// The native ARM64 wrapper receives these as AArch64 SIMD arguments and builds
+// the x86-64 SysV va_list layout explicitly.
+using VaFpRegister = uint64_t __attribute__((vector_size(16)));
+#else
+#error "Guest variadic printf needs an x86-64 or ARM64 register representation"
+#endif
 
 namespace Libs {
 
@@ -47,7 +59,7 @@ struct VaList {
 
 struct VaRegSave {
 	uint64_t gp[6];
-	__m128   fp[8];
+	VaFpRegister fp[8];
 };
 
 struct VaContext {
