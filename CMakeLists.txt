@@ -1,5 +1,13 @@
 cmake_minimum_required(VERSION 3.19...4.3)
 
+option(KYTY_NATIVE_MACOS_ARM64_KOSMICKRISP
+       "Build the native macOS ARM64 branch against the installed LunarG Vulkan SDK/KosmicKrisp ICD"
+       OFF)
+if(KYTY_NATIVE_MACOS_ARM64_KOSMICKRISP AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
+	# KosmicKrisp uses Metal 4 and requires macOS 26 or newer.
+	set(CMAKE_OSX_DEPLOYMENT_TARGET "26.0" CACHE STRING "Minimum macOS deployment target")
+endif()
+
 if(CMAKE_VERSION VERSION_GREATER_EQUAL 4.0)
 	set(CMAKE_POLICY_VERSION_MINIMUM 3.10 CACHE STRING "Minimum policy version for bundled dependencies")
 endif()
@@ -54,6 +62,41 @@ include("${KYTY_SOURCE_DIR}/utils.cmake")
 include(CTest)
 
 option(KYTY_ENABLE_CLANG_TIDY "Run clang-tidy checks during builds" OFF)
+
+set(KYTY_VULKAN_SDK_ROOT "" CACHE PATH "Installed LunarG Vulkan SDK root (the macOS directory containing include/, lib/, and share/)")
+if(KYTY_NATIVE_MACOS_ARM64_KOSMICKRISP)
+	if(NOT APPLE)
+		message(FATAL_ERROR "KYTY_NATIVE_MACOS_ARM64_KOSMICKRISP is macOS-only; configure on macOS ARM64")
+	endif()
+	if(NOT CMAKE_OSX_ARCHITECTURES STREQUAL "arm64")
+		message(FATAL_ERROR "Native KosmicKrisp builds require -DCMAKE_OSX_ARCHITECTURES=arm64 (no x86_64 or universal build)")
+	endif()
+	if(CMAKE_OSX_DEPLOYMENT_TARGET VERSION_LESS "26.0")
+		message(FATAL_ERROR "KosmicKrisp requires macOS 26 or newer; set CMAKE_OSX_DEPLOYMENT_TARGET=26.0 or newer")
+	endif()
+	if(KYTY_VULKAN_SDK_ROOT STREQUAL "")
+		if(NOT "$ENV{VULKAN_SDK}" STREQUAL "")
+			set(KYTY_VULKAN_SDK_ROOT "$ENV{VULKAN_SDK}" CACHE PATH
+			    "Installed LunarG Vulkan SDK root (the macOS directory containing include/, lib/, and share/)" FORCE)
+		else()
+			message(FATAL_ERROR "Native KosmicKrisp builds require the installed LunarG Vulkan SDK. Set VULKAN_SDK to its macOS directory or pass -DKYTY_VULKAN_SDK_ROOT=/path/to/VulkanSDK/<version>/macOS")
+		endif()
+	endif()
+	if(NOT EXISTS "${KYTY_VULKAN_SDK_ROOT}/include/vulkan/vulkan.h")
+		message(FATAL_ERROR "Vulkan SDK headers were not found under ${KYTY_VULKAN_SDK_ROOT}/include")
+	endif()
+	if(NOT EXISTS "${KYTY_VULKAN_SDK_ROOT}/lib/libvulkan.1.dylib" AND
+	   NOT EXISTS "${KYTY_VULKAN_SDK_ROOT}/lib/libvulkan.dylib")
+		message(FATAL_ERROR "Vulkan SDK loader was not found under ${KYTY_VULKAN_SDK_ROOT}/lib")
+	endif()
+	file(GLOB KYTY_KOSMICKRISP_ICD_MANIFESTS
+		"${KYTY_VULKAN_SDK_ROOT}/share/vulkan/icd.d/*[Kk]osmic[Kk]risp*.json"
+		"${KYTY_VULKAN_SDK_ROOT}/etc/vulkan/icd.d/*[Kk]osmic[Kk]risp*.json")
+	if(NOT KYTY_KOSMICKRISP_ICD_MANIFESTS)
+		message(FATAL_ERROR "The installed Vulkan SDK does not contain a KosmicKrisp ICD manifest under share/vulkan/icd.d. Install a current macOS Vulkan SDK with KosmicKrisp.")
+	endif()
+	message(STATUS "Native macOS ARM64 target: using SDK at ${KYTY_VULKAN_SDK_ROOT}; KosmicKrisp will be loaded at runtime and will not be bundled")
+endif()
 
 set(KYTY_BUILD_ORIGIN "Source" CACHE STRING "Build provenance shown in diagnostics")
 set_property(CACHE KYTY_BUILD_ORIGIN PROPERTY STRINGS Source Official Fork)
@@ -804,6 +847,10 @@ endif()
 # dlopen/dlsym/dladdr for RenderDoc.
 target_link_libraries(kyty_emulator ${CMAKE_DL_LIBS})
 target_include_directories(kyty_emulator PRIVATE ${inc_headers})
+if(KYTY_NATIVE_MACOS_ARM64_KOSMICKRISP)
+	target_include_directories(kyty_emulator PRIVATE "${KYTY_VULKAN_SDK_ROOT}/include")
+	target_compile_definitions(kyty_emulator PRIVATE KYTY_NATIVE_MACOS_ARM64_KOSMICKRISP=1)
+endif()
 
 clang_tidy_check(kyty_emulator "" "${check_headers}" "${inc_headers}")
 
