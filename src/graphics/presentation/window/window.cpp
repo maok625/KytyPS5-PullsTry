@@ -756,19 +756,82 @@ void WindowContext::Run() {
 
 #if defined(__APPLE__) && defined(KYTY_NATIVE_MACOS_ARM64_KOSMICKRISP)
 static void ConfigureNativeKosmicKrispVulkan() {
-	const char* sdk_env = std::getenv("VULKAN_SDK");
-	if (sdk_env == nullptr || sdk_env[0] == '\0') {
-		EXIT("Native macOS ARM64 builds require VULKAN_SDK at runtime. Export VULKAN_SDK to the installed Vulkan SDK's macOS directory, for example ~/VulkanSDK/<version>/macOS, and launch Kyty from that environment. The SDK/KosmicKrisp files are not bundled with Kyty.\n");
+	std::filesystem::path sdk_root;
+	if (const char* sdk_env = std::getenv("VULKAN_SDK");
+	    sdk_env != nullptr && sdk_env[0] != '\0') {
+		sdk_root = sdk_env;
+	} else if (const char* home = std::getenv("HOME"); home != nullptr && home[0] != '\0') {
+		// Finder-launched apps do not inherit shell setup-env.sh exports. Discover
+		// a normal per-user SDK installation when VULKAN_SDK is not supplied.
+		const auto sdk_directory = std::filesystem::path(home) / "VulkanSDK";
+		std::vector<std::filesystem::path> candidates;
+		std::error_code search_error;
+		if (std::filesystem::is_directory(sdk_directory, search_error)) {
+			for (std::filesystem::directory_iterator it(sdk_directory, search_error), end;
+			     !search_error && it != end; it.increment(search_error)) {
+				const auto candidate = it->path() / "macOS";
+				if (std::filesystem::exists(candidate / "include/vulkan/vulkan.h") &&
+				    (std::filesystem::exists(candidate / "lib/libvulkan.1.dylib") ||
+				     std::filesystem::exists(candidate / "lib/libvulkan.dylib")) &&
+				    std::filesystem::exists(candidate /
+			                            "share/vulkan/icd.d/libkosmickrisp_icd.json")) {
+					candidates.push_back(candidate);
+				}
+			}
+		}
+		std::sort(candidates.begin(), candidates.end(), [](const auto& lhs, const auto& rhs) {
+			return lhs.parent_path().filename().string() > rhs.parent_path().filename().string();
+		});
+		if (!candidates.empty()) {
+			sdk_root = candidates.front();
+		}
 	}
+	if (sdk_root.empty()) {
+		EXIT("The native macOS ARM64 build requires an installed LunarG Vulkan SDK that includes KosmicKrisp. Set VULKAN_SDK or install the SDK under ~/VulkanSDK/<version>/macOS. Kyty does not bundle the SDK or driver.\n");
+	}
+	const std::string sdk_root_string = sdk_root.string();
 
-	const std::filesystem::path sdk_root(sdk_env);
 	std::filesystem::path loader_path = sdk_root / "lib/libvulkan.1.dylib";
 	if (!Common::File::IsFileExisting(loader_path)) {
 		loader_path = sdk_root / "lib/libvulkan.dylib";
 	}
 	if (!Common::File::IsFileExisting(loader_path)) {
 		EXIT("The Vulkan loader was not found under VULKAN_SDK=%s/lib. Reinstall or select a valid macOS Vulkan SDK.\n",
-		     sdk_env);
+		     sdk_root_string.c_str());
+	}
+
+	// The renderer currently requires VK_EXT_image_view_min_lod. KosmicKrisp
+	// gates that extension behind this experimental switch; preserve any other
+	// user-selected KosmicKrisp options while ensuring the required feature is enabled.
+	const char* configured_experimental = std::getenv("MESA_KK_EXPERIMENTAL");
+	std::string experimental = configured_experimental != nullptr ? configured_experimental : "";
+	const auto has_experimental_feature = [&](const std::string& feature) {
+		std::size_t start = 0;
+		while (start <= experimental.size()) {
+			const auto end = experimental.find(',', start);
+			const auto token = experimental.substr(start, end == std::string::npos
+			                                                ? std::string::npos
+			                                                : end - start);
+			if (token == "all" || token == feature) {
+				return true;
+			}
+			if (end == std::string::npos) {
+				break;
+			}
+			start = end + 1;
+		}
+		return false;
+	};
+	if (!has_experimental_feature("image_view_min_lod")) {
+		if (!experimental.empty()) {
+			experimental += ',';
+		}
+		experimental += "image_view_min_lod";
+		if (SDL_setenv_unsafe("MESA_KK_EXPERIMENTAL", experimental.c_str(), 1) != 0) {
+			EXIT("Could not enable KosmicKrisp's required image-view-min-LOD feature: %s\\n",
+			     SDL_GetError());
+		}
+		LOGF("KosmicKrisp: enabled experimental VK_EXT_image_view_min_lod support\\n");
 	}
 
 	if (const char* configured_loader = std::getenv("SDL_VULKAN_LIBRARY");
@@ -809,7 +872,7 @@ static void ConfigureNativeKosmicKrispVulkan() {
 		}
 		if (manifest.empty()) {
 			EXIT("KosmicKrisp was not found in %s/share/vulkan/icd.d. Install a current Vulkan SDK that includes KosmicKrisp; Kyty does not bundle the driver.\n",
-			     sdk_env);
+			     sdk_root_string.c_str());
 		}
 		if (SDL_setenv_unsafe("VK_DRIVER_FILES", manifest.string().c_str(), 0) != 0) {
 			EXIT("Could not select the SDK's KosmicKrisp ICD manifest: %s\n", SDL_GetError());
