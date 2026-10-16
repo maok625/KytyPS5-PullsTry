@@ -496,6 +496,251 @@ InstructionStep X64Interpreter::ExecuteOne(GuestCpuState& state, GuestMemory& me
 	const std::uint8_t rex_r = (rex & 0x04) != 0 ? 8 : 0;
 	const std::uint8_t rex_b = (rex & 0x01) != 0 ? 8 : 0;
 
+	// MOV r8, imm8. Without any REX prefix encodings 4..7 are AH/CH/DH/BH;
+	// with a REX prefix they refer to SPL/BPL/SIL/DIL.
+	if (opcode >= 0xb0 && opcode <= 0xb7) {
+		std::uint8_t immediate = 0;
+		if (!ReadLittleEndian(reader, immediate)) {
+			return ReaderFailure(reader);
+		}
+		const std::uint8_t encoded_reg = static_cast<std::uint8_t>(opcode - 0xb0);
+		const auto destination = RegisterIndex(encoded_reg, rex_b);
+		WriteByteRegister(state, destination, encoded_reg, rex_present, immediate);
+		state.rip = reader.Cursor();
+		return {InstructionStepStatus::Continue, instruction_rip, opcode};
+	}
+
+	// Accumulator byte-immediate forms: ADD/OR/AND/SUB/XOR/CMP AL,imm8 and TEST AL,imm8.
+	if (opcode == 0x04 || opcode == 0x0c || opcode == 0x24 ||
+	    opcode == 0x2c || opcode == 0x34 || opcode == 0x3c || opcode == 0xa8) {
+		std::uint8_t immediate = 0;
+		if (!ReadLittleEndian(reader, immediate)) {
+			return ReaderFailure(reader);
+		}
+		const std::uint8_t lhs = ReadByteRegister(state, 0, 0, rex_present);
+		std::uint8_t result = 0;
+		bool write_result = opcode != 0x3c && opcode != 0xa8;
+		bool logical = false;
+		ArithmeticOperation operation = ArithmeticOperation::Add;
+		switch (opcode) {
+			case 0x04: result = static_cast<std::uint8_t>(lhs + immediate); break;
+			case 0x0c: result = static_cast<std::uint8_t>(lhs | immediate); logical = true; break;
+			case 0x24: result = static_cast<std::uint8_t>(lhs & immediate); logical = true; break;
+			case 0x2c: result = static_cast<std::uint8_t>(lhs - immediate); operation = ArithmeticOperation::Subtract; break;
+			case 0x34: result = static_cast<std::uint8_t>(lhs ^ immediate); operation = ArithmeticOperation::Xor; break;
+			case 0x3c: result = static_cast<std::uint8_t>(lhs - immediate); operation = ArithmeticOperation::Subtract; break;
+			case 0xa8: result = static_cast<std::uint8_t>(lhs & immediate); logical = true; break;
+			default: return Unsupported(instruction_rip, opcode);
+		}
+		if (write_result) {
+			WriteByteRegister(state, 0, 0, rex_present, result);
+		}
+		if (logical) {
+			UpdateLogicalFlagsSized(state, result, 8);
+		} else {
+			UpdateArithmeticFlagsSized(state, operation, lhs, immediate, result, 8);
+		}
+		state.rip = reader.Cursor();
+		return {InstructionStepStatus::Continue, instruction_rip, opcode};
+	}
+
+	if (opcode == 0xc6) { // MOV r/m8, imm8 (/0)
+		std::uint8_t modrm = 0;
+		if (!reader.ReadByte(modrm)) {
+			return ReaderFailure(reader);
+		}
+		if (((modrm >> 3) & 0x07) != 0) {
+			return Unsupported(instruction_rip, opcode);
+		}
+		RmOperand destination{};
+		if (!DecodeRmOperand(reader, state, modrm, rex, destination)) {
+			return ReaderFailure(reader);
+		}
+		std::uint8_t immediate = 0;
+		if (!ReadLittleEndian(reader, immediate)) {
+			return ReaderFailure(reader);
+		}
+		std::uint64_t fault_address = 0;
+		if (!WriteRmByte(destination, state, memory, reader.Cursor(), segment_override,
+		                 rex_present, static_cast<std::uint8_t>(modrm & 0x07),
+		                 immediate, fault_address)) {
+			return {InstructionStepStatus::MemoryFault, instruction_rip, fault_address};
+		}
+		state.rip = reader.Cursor();
+		return {InstructionStepStatus::Continue, instruction_rip, opcode};
+	}
+
+	if (opcode == 0xfe) { // INC/DEC r/m8
+		std::uint8_t modrm = 0;
+		if (!reader.ReadByte(modrm)) {
+			return ReaderFailure(reader);
+		}
+		const std::uint8_t group = static_cast<std::uint8_t>((modrm >> 3) & 0x07);
+		if (group != 0 && group != 1) {
+			return Unsupported(instruction_rip, opcode);
+		}
+		RmOperand operand{};
+		if (!DecodeRmOperand(reader, state, modrm, rex, operand)) {
+			return ReaderFailure(reader);
+		}
+		const auto next_rip = reader.Cursor();
+		std::uint8_t value = 0;
+		std::uint64_t fault_address = 0;
+		const auto encoded_rm = static_cast<std::uint8_t>(modrm & 0x07);
+		if (!ReadRmByte(operand, state, memory, next_rip, segment_override, rex_present,
+		                encoded_rm, value, fault_address)) {
+			return {InstructionStepStatus::MemoryFault, instruction_rip, fault_address};
+		}
+		const bool decrement = group == 1;
+		const auto result = static_cast<std::uint8_t>(decrement ? value - 1 : value + 1);
+		if (!WriteRmByte(operand, state, memory, next_rip, segment_override, rex_present,
+		                 encoded_rm, result, fault_address)) {
+			return {InstructionStepStatus::MemoryFault, instruction_rip, fault_address};
+		}
+		const std::uint64_t old_carry = state.rflags & kFlagCarry;
+		UpdateArithmeticFlagsSized(state, decrement ? ArithmeticOperation::Subtract : ArithmeticOperation::Add,
+		                           value, 1, result, 8);
+		state.rflags = (state.rflags & ~kFlagCarry) | old_carry | kRflagsReservedOne;
+		state.rip = next_rip;
+		return {InstructionStepStatus::Continue, instruction_rip, opcode};
+	}
+
+	if (opcode == 0xf6) { // TEST/NOT/NEG r/m8
+		std::uint8_t modrm = 0;
+		if (!reader.ReadByte(modrm)) {
+			return ReaderFailure(reader);
+		}
+		const std::uint8_t group = static_cast<std::uint8_t>((modrm >> 3) & 0x07);
+		if (!(group == 0 || group == 2 || group == 3)) {
+			return Unsupported(instruction_rip, opcode);
+		}
+		RmOperand operand{};
+		if (!DecodeRmOperand(reader, state, modrm, rex, operand)) {
+			return ReaderFailure(reader);
+		}
+		const auto encoded_rm = static_cast<std::uint8_t>(modrm & 0x07);
+		if (group == 0) {
+			std::uint8_t immediate = 0;
+			if (!ReadLittleEndian(reader, immediate)) {
+				return ReaderFailure(reader);
+			}
+			std::uint8_t value = 0;
+			std::uint64_t fault_address = 0;
+			if (!ReadRmByte(operand, state, memory, reader.Cursor(), segment_override,
+			                rex_present, encoded_rm, value, fault_address)) {
+				return {InstructionStepStatus::MemoryFault, instruction_rip, fault_address};
+			}
+			UpdateLogicalFlagsSized(state, static_cast<std::uint8_t>(value & immediate), 8);
+			state.rip = reader.Cursor();
+			return {InstructionStepStatus::Continue, instruction_rip, opcode};
+		}
+		const auto next_rip = reader.Cursor();
+		std::uint8_t value = 0;
+		std::uint64_t fault_address = 0;
+		if (!ReadRmByte(operand, state, memory, next_rip, segment_override, rex_present,
+		                encoded_rm, value, fault_address)) {
+			return {InstructionStepStatus::MemoryFault, instruction_rip, fault_address};
+		}
+		const auto result = static_cast<std::uint8_t>(group == 2 ? ~value : 0U - value);
+		if (!WriteRmByte(operand, state, memory, next_rip, segment_override, rex_present,
+		                 encoded_rm, result, fault_address)) {
+			return {InstructionStepStatus::MemoryFault, instruction_rip, fault_address};
+		}
+		if (group == 3) {
+			UpdateArithmeticFlagsSized(state, ArithmeticOperation::Subtract, 0, value, result, 8);
+		}
+		state.rip = next_rip;
+		return {InstructionStepStatus::Continue, instruction_rip, opcode};
+	}
+
+	// Byte forms of MOV and the common integer ALU instructions. The odd opcode
+	// in each pair writes the ModRM.reg operand; the even form writes r/m.
+	if (opcode == 0x88 || opcode == 0x8a ||
+	    opcode == 0x00 || opcode == 0x02 || opcode == 0x08 || opcode == 0x0a ||
+	    opcode == 0x20 || opcode == 0x22 || opcode == 0x28 || opcode == 0x2a ||
+	    opcode == 0x30 || opcode == 0x32 || opcode == 0x38 || opcode == 0x3a ||
+	    opcode == 0x84) {
+		std::uint8_t modrm = 0;
+		if (!reader.ReadByte(modrm)) {
+			return ReaderFailure(reader);
+		}
+		RmOperand rm{};
+		if (!DecodeRmOperand(reader, state, modrm, rex, rm)) {
+			return ReaderFailure(reader);
+		}
+		const auto next_rip = reader.Cursor();
+		const auto encoded_rm = static_cast<std::uint8_t>(modrm & 0x07);
+		const auto encoded_reg = static_cast<std::uint8_t>((modrm >> 3) & 0x07);
+		const auto reg = RegisterIndex(encoded_reg, rex_r);
+		const bool is_mov_rm_reg = opcode == 0x88;
+		const bool is_mov_reg_rm = opcode == 0x8a;
+
+		if (is_mov_rm_reg) {
+			const auto source = ReadByteRegister(state, reg, encoded_reg, rex_present);
+			std::uint64_t fault_address = 0;
+			if (!WriteRmByte(rm, state, memory, next_rip, segment_override, rex_present,
+			                 encoded_rm, source, fault_address)) {
+				return {InstructionStepStatus::MemoryFault, instruction_rip, fault_address};
+			}
+			state.rip = next_rip;
+			return {InstructionStepStatus::Continue, instruction_rip, opcode};
+		}
+		if (is_mov_reg_rm) {
+			std::uint8_t source = 0;
+			std::uint64_t fault_address = 0;
+			if (!ReadRmByte(rm, state, memory, next_rip, segment_override, rex_present,
+			                encoded_rm, source, fault_address)) {
+				return {InstructionStepStatus::MemoryFault, instruction_rip, fault_address};
+			}
+			WriteByteRegister(state, reg, encoded_reg, rex_present, source);
+			state.rip = next_rip;
+			return {InstructionStepStatus::Continue, instruction_rip, opcode};
+		}
+
+		std::uint8_t rm_value = 0;
+		std::uint64_t fault_address = 0;
+		if (!ReadRmByte(rm, state, memory, next_rip, segment_override, rex_present,
+		                encoded_rm, rm_value, fault_address)) {
+			return {InstructionStepStatus::MemoryFault, instruction_rip, fault_address};
+		}
+		const std::uint8_t reg_value = ReadByteRegister(state, reg, encoded_reg, rex_present);
+		const bool test = opcode == 0x84;
+		const bool rm_is_destination = test || (opcode & 0x02) == 0;
+		const std::uint8_t lhs = rm_is_destination ? rm_value : reg_value;
+		const std::uint8_t rhs = rm_is_destination ? reg_value : rm_value;
+		std::uint8_t result = 0;
+		bool logical = false;
+		bool compare = false;
+		ArithmeticOperation operation = ArithmeticOperation::Add;
+		switch (opcode) {
+			case 0x00: case 0x02: result = static_cast<std::uint8_t>(lhs + rhs); break;
+			case 0x08: case 0x0a: result = static_cast<std::uint8_t>(lhs | rhs); logical = true; break;
+			case 0x20: case 0x22: result = static_cast<std::uint8_t>(lhs & rhs); logical = true; break;
+			case 0x28: case 0x2a: result = static_cast<std::uint8_t>(lhs - rhs); operation = ArithmeticOperation::Subtract; break;
+			case 0x30: case 0x32: result = static_cast<std::uint8_t>(lhs ^ rhs); operation = ArithmeticOperation::Xor; break;
+			case 0x38: case 0x3a: result = static_cast<std::uint8_t>(lhs - rhs); operation = ArithmeticOperation::Subtract; compare = true; break;
+			case 0x84: result = static_cast<std::uint8_t>(lhs & rhs); logical = true; break;
+			default: return Unsupported(instruction_rip, opcode);
+		}
+		if (!compare && !test) {
+			if (rm_is_destination) {
+				if (!WriteRmByte(rm, state, memory, next_rip, segment_override, rex_present,
+				                 encoded_rm, result, fault_address)) {
+					return {InstructionStepStatus::MemoryFault, instruction_rip, fault_address};
+				}
+			} else {
+				WriteByteRegister(state, reg, encoded_reg, rex_present, result);
+			}
+		}
+		if (logical) {
+			UpdateLogicalFlagsSized(state, result, 8);
+		} else {
+			UpdateArithmeticFlagsSized(state, operation, lhs, rhs, result, 8);
+		}
+		state.rip = next_rip;
+		return {InstructionStepStatus::Continue, instruction_rip, opcode};
+	}
+
 	if (opcode == 0x90) { // NOP
 		state.rip = reader.Cursor();
 		return {InstructionStepStatus::Continue, instruction_rip, opcode};
