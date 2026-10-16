@@ -1128,6 +1128,15 @@ InstructionStep X64Interpreter::ExecuteOne(GuestCpuState& state, GuestMemory& me
 			return ReaderFailure(reader);
 		}
 		const std::uint64_t return_address = reader.Cursor();
+		const auto displacement = std::bit_cast<std::int32_t>(encoded);
+		const std::uint64_t target =
+		    return_address + static_cast<std::uint64_t>(static_cast<std::int64_t>(displacement));
+		if (memory.TryDispatchHostCall(target, state, false)) {
+			// A native import is invoked synchronously and returns directly to the
+			// instruction after CALL; the guest RSP is unchanged by the call/ret pair.
+			state.rip = return_address;
+			return {InstructionStepStatus::ControlFlow, instruction_rip, opcode};
+		}
 		const auto old_stack = state.gpr[static_cast<std::size_t>(GuestGpr::Rsp)];
 		const auto new_stack = old_stack - sizeof(return_address);
 		std::uint8_t bytes[sizeof(return_address)]{};
@@ -1137,9 +1146,8 @@ InstructionStep X64Interpreter::ExecuteOne(GuestCpuState& state, GuestMemory& me
 		if (!memory.Write(new_stack, bytes, sizeof(bytes))) {
 			return {InstructionStepStatus::MemoryFault, instruction_rip, new_stack};
 		}
-		const auto displacement = std::bit_cast<std::int32_t>(encoded);
 		state.gpr[static_cast<std::size_t>(GuestGpr::Rsp)] = new_stack;
-		state.rip = return_address + static_cast<std::uint64_t>(static_cast<std::int64_t>(displacement));
+		state.rip = target;
 		return {InstructionStepStatus::ControlFlow, instruction_rip, opcode};
 	}
 
@@ -1315,6 +1323,10 @@ InstructionStep X64Interpreter::ExecuteOne(GuestCpuState& state, GuestMemory& me
 		if (control_flow) {
 			if (group == 0x02) { // CALL r/m64
 				const std::uint64_t return_address = reader.Cursor();
+				if (memory.TryDispatchHostCall(value, state, false)) {
+					state.rip = return_address;
+					return {InstructionStepStatus::ControlFlow, instruction_rip, opcode};
+				}
 				const auto old_stack = state.gpr[static_cast<std::size_t>(GuestGpr::Rsp)];
 				const auto new_stack = old_stack - sizeof(return_address);
 				std::uint8_t bytes[sizeof(return_address)]{};
@@ -1325,6 +1337,15 @@ InstructionStep X64Interpreter::ExecuteOne(GuestCpuState& state, GuestMemory& me
 					return {InstructionStepStatus::MemoryFault, instruction_rip, new_stack};
 				}
 				state.gpr[static_cast<std::size_t>(GuestGpr::Rsp)] = new_stack;
+			} else if (memory.TryDispatchHostCall(value, state, true)) { // JMP r/m64 tail-call thunk
+				const auto stack_pointer = state.gpr[static_cast<std::size_t>(GuestGpr::Rsp)];
+				std::uint8_t bytes[sizeof(std::uint64_t)]{};
+				if (!memory.Read(stack_pointer, bytes, sizeof(bytes))) {
+					return {InstructionStepStatus::MemoryFault, instruction_rip, stack_pointer};
+				}
+				state.gpr[static_cast<std::size_t>(GuestGpr::Rsp)] = stack_pointer + sizeof(bytes);
+				state.rip = ReadLittleEndianU64(bytes);
+				return {InstructionStepStatus::ControlFlow, instruction_rip, opcode};
 			}
 			state.rip = value;
 			return {InstructionStepStatus::ControlFlow, instruction_rip, opcode};
