@@ -908,19 +908,17 @@ void WindowContext::CreateVulkan() {
 
 	vk::InstanceCreateInfo inst_info {};
 	inst_info.pNext                   = (r.enable_validation_layers ? &dbg_create_info : nullptr);
-#if defined(__APPLE__)
-	// MoltenVK requires VK_KHR_portability_enumeration + flag to surface
-	// portability devices. Without this, enumeratePhysicalDevices hides the
-	// MoltenVK adapter on some driver versions.
+#if defined(__APPLE__) && !defined(KYTY_NATIVE_MACOS_ARM64_KOSMICKRISP)
+	// The legacy MoltenVK/Rosetta path needs portability enumeration to expose
+	// the adapter on some versions. KosmicKrisp does not support this extension.
 	if (HasExtension(r.available_extensions, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME)) {
 		if (!HasExtension(r.required_extensions, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME)) {
 			r.required_extensions.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
 		}
 		inst_info.flags |= vk::InstanceCreateFlagBits::eEnumeratePortabilityKHR;
-		LOGF("Vulkan instance: enabled %s\n", VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+		LOGF("Vulkan instance: enabled %s\\n", VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
 	}
-#endif
-	inst_info.pApplicationInfo        = &app_info;
+#endif	inst_info.pApplicationInfo        = &app_info;
 	inst_info.enabledExtensionCount   = static_cast<uint32_t>(r.required_extensions.size());
 	inst_info.ppEnabledExtensionNames = r.required_extensions.data();
 	inst_info.enabledLayerCount =
@@ -960,9 +958,11 @@ void WindowContext::CreateVulkan() {
 
 #if defined(__APPLE__)
 	// MoltenVK lacks VK_EXT_depth_clip_enable and VK_EXT_color_write_enable; the renderer
-	// falls back to default depth clipping and static color-write masks on macOS. It also
-	// requires VK_KHR_portability_subset per the Vulkan portability spec.
+	// falls back to default depth clipping and static color-write masks on macOS.
+	// Only the legacy MoltenVK/Rosetta path needs portability_subset.
+#if !defined(KYTY_NATIVE_MACOS_ARM64_KOSMICKRISP)
 	device_extensions.push_back("VK_KHR_portability_subset");
+#endif
 #else
 	device_extensions.push_back(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
 	device_extensions.push_back(VK_EXT_COLOR_WRITE_ENABLE_EXTENSION_NAME);
