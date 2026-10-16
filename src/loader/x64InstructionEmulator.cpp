@@ -2,6 +2,23 @@
 
 #include "common/common.h"
 
+#if defined(__aarch64__) || defined(_M_ARM64)
+
+// This helper emulates selected x86 instructions when they trap in an x86 host
+// context. A native ARM64 process must never inspect or mutate that context as
+// if it contained x86 registers; native guest instructions belong in the
+// explicit x86-64 -> AArch64 backend instead.
+namespace Loader::X64InstructionEmulator {
+
+bool TryEmulate(void* native_context) {
+	(void)native_context;
+	return false;
+}
+
+} // namespace Loader::X64InstructionEmulator
+
+#else
+
 #include <Zydis/Zydis.h>
 #include <bit>
 #include <cstring>
@@ -823,3 +840,5 @@ bool TryEmulate(void* native_context) {
 }
 
 } // namespace Loader::X64InstructionEmulator
+
+#endif // defined(__aarch64__) || defined(_M_ARM64)
