@@ -25,6 +25,8 @@
 
 #if defined(KYTY_NATIVE_MACOS_ARM64_KOSMICKRISP)
 #include "native_arm64/x64_interpreter.h"
+#include "libs/guestPrintf.h"
+#include "libs/vaContext.h"
 
 #include <array>
 #include <cerrno>
@@ -317,6 +319,53 @@ public:
 		    std::find(host_callbacks_.begin(), host_callbacks_.end(), target) != host_callbacks_.end();
 		if (!registered || target == 0) {
 			return false;
+		}
+
+		// Guest printf is variadic under the x86-64 SysV ABI, whose integer and
+		// XMM argument banks differ from AArch64. Marshal its register image
+		// explicitly rather than treating the function as a flat 16-integer call.
+		if (target == reinterpret_cast<uint64_t>(Libs::GetGuestPrintfStdFunc())) {
+			using GuestPrintfVector = VaFpRegister;
+			using GuestPrintfFunction = int (*)(
+			    uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t,
+			    GuestPrintfVector, GuestPrintfVector, GuestPrintfVector, GuestPrintfVector,
+			    GuestPrintfVector, GuestPrintfVector, GuestPrintfVector, GuestPrintfVector);
+
+			alignas(16) std::array<uint8_t, 256> overflow_args {};
+			const uint64_t guest_rsp =
+			    state.gpr[static_cast<size_t>(Kyty::NativeArm64::GuestGpr::Rsp)];
+			const uint64_t overflow_base = guest_rsp + (tail_call ? sizeof(uint64_t) : 0);
+			bool stack_read_complete = overflow_base >= guest_rsp;
+			for (size_t offset = 0; stack_read_complete && offset < overflow_args.size();
+			     offset += sizeof(uint64_t)) {
+				stack_read_complete =
+				    Read(overflow_base + offset, overflow_args.data() + offset, sizeof(uint64_t));
+			}
+			if (!stack_read_complete && host_call_log_count_ < 64) {
+				LOGF("Native ARM64 printf: guest overflow argument area is partially unreadable "
+				     "at 0x%016" PRIx64 "\n", overflow_base);
+			}
+
+			auto get_xmm = [&state](size_t index) {
+				GuestPrintfVector value {};
+				std::memcpy(&value, state.ymm[index].qword.data(), sizeof(value));
+				return value;
+			};
+			const auto function =
+			    reinterpret_cast<GuestPrintfFunction>(static_cast<uintptr_t>(target));
+			const int result = function(
+			    static_cast<uintptr_t>(state.gpr[static_cast<size_t>(Kyty::NativeArm64::GuestGpr::Rdi)]),
+			    static_cast<uintptr_t>(state.gpr[static_cast<size_t>(Kyty::NativeArm64::GuestGpr::Rsi)]),
+			    static_cast<uintptr_t>(state.gpr[static_cast<size_t>(Kyty::NativeArm64::GuestGpr::Rdx)]),
+			    static_cast<uintptr_t>(state.gpr[static_cast<size_t>(Kyty::NativeArm64::GuestGpr::Rcx)]),
+			    static_cast<uintptr_t>(state.gpr[static_cast<size_t>(Kyty::NativeArm64::GuestGpr::R8)]),
+			    static_cast<uintptr_t>(state.gpr[static_cast<size_t>(Kyty::NativeArm64::GuestGpr::R9)]),
+			    reinterpret_cast<uintptr_t>(overflow_args.data()), get_xmm(0), get_xmm(1),
+			    get_xmm(2), get_xmm(3), get_xmm(4), get_xmm(5), get_xmm(6), get_xmm(7));
+			state.gpr[static_cast<size_t>(Kyty::NativeArm64::GuestGpr::Rax)] =
+			    static_cast<uint32_t>(result);
+			state.rflags |= (1ULL << 1);
+			return true;
 		}
 
 		// x86-64 SysV has six integer argument registers. Convert those plus up to
