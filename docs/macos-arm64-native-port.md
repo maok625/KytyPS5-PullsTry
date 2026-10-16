@@ -10,7 +10,7 @@ Scope this branch to native Apple Silicon macOS only. Do not add Windows or Linu
 
 - **Guest CPU translation:** required to execute PS5 x86-64 instructions on an arm64 host. This needs an x86-64 decoder, an AArch64 code emitter or interpreter, correct guest-register/flags/SIMD state, code-cache invalidation, guest memory fault handling, and explicit exits for syscalls and exceptions.
 - **Host ABI and guest address space:** the current macOS x86-64 path relies on x86-64 guest-address-space linker layout and emits x86-64 trampolines/PLT stubs. These assumptions must be separated from the arm64 host path; changing only the build architecture is not enough.
-- **Graphics:** this branch uses [KosmicKrisp](https://www.lunarg.com/products/kosmickrisp/), LunarG's Mesa Vulkan driver for Apple Silicon, through the Vulkan loader supplied by the installed LunarG Vulkan SDK. KosmicKrisp translates Vulkan to Metal 4; it does **not** translate x86-64 CPU instructions to AArch64. It requires macOS 26 or newer. The native branch never downloads, copies, installs, or bundles the SDK or KosmicKrisp driver into project builds; users must install the Vulkan SDK separately. The SDK's loader and KosmicKrisp ICD manifest are selected at runtime through VULKAN_SDK. The x86-64/Rosetta fallback continues to use MoltenVK.
+- **Graphics:** this branch uses [KosmicKrisp](https://www.lunarg.com/products/kosmickrisp/), LunarG's Mesa Vulkan driver for Apple Silicon, through the Vulkan loader supplied by the installed LunarG Vulkan SDK. KosmicKrisp translates Vulkan to Metal 4; it does **not** translate x86-64 CPU instructions to AArch64. It requires macOS 26 or newer. The native branch never downloads, copies, installs, or bundles the SDK or KosmicKrisp driver into project builds; users must install the Vulkan SDK separately and select its optional KosmicKrisp component (com.lunarg.vulkan.kosmic). The SDK's loader and KosmicKrisp ICD manifest are selected at runtime through VULKAN_SDK, or discovered under ~/VulkanSDK when the app is launched without shell environment variables. Kyty enables KosmicKrisp's experimental image_view_min_lod feature because the current renderer requires VK_EXT_image_view_min_lod. The x86-64/Rosetta fallback continues to use MoltenVK.
 - **Rosetta 2:** must not be a runtime dependency of the native arm64 build. The existing x86-64 build remains available as a fallback during development.
 
 ## Initial code boundary
@@ -36,7 +36,7 @@ The guest state model includes the 16 x86-64 general-purpose registers, RIP/RFLA
 
 Requirements: an Apple Silicon Mac running **macOS 26 or newer**, a compatible current Xcode, CMake, Ninja, Homebrew glslang, and the **installed LunarG Vulkan SDK that includes KosmicKrisp**. The project does not distribute the SDK or KosmicKrisp.
 
-Set VULKAN_SDK to the SDK's macOS directory (the directory containing include/, lib/, and share/):
+Install the Vulkan SDK with its **KosmicKrisp** optional component selected. CMake auto-detects a valid SDK under ~/VulkanSDK/<version>/macOS. For an SDK installed elsewhere, set VULKAN_SDK or pass KYTY_VULKAN_SDK_ROOT. The SDK's macOS directory is the one containing include/, lib/, and share/:
 
 ```sh
 export VULKAN_SDK="$HOME/VulkanSDK/1.4.363.0/macOS"
@@ -55,6 +55,6 @@ ctest --test-dir _Build/macos-arm64-native -R native_arm64_state --output-on-fai
 ./_Build/macos-arm64-native/kyty_emulator --help
 ```
 
-Keep VULKAN_SDK set when launching the native emulator. By default, Kyty loads libvulkan.1.dylib (or libvulkan.dylib) from that SDK and points the Vulkan loader at its KosmicKrisp ICD manifest. Explicit SDL_VULKAN_LIBRARY, VK_DRIVER_FILES, or VK_ICD_FILENAMES choices are respected, except the native branch rejects directly loading libMoltenVK.dylib. No SDK or ICD binaries are copied into the build/install output.
+When VULKAN_SDK is set, Kyty uses that SDK. Otherwise, native startup discovers the newest valid SDK in ~/VulkanSDK/<version>/macOS, so Finder-launched apps do not depend on inheriting shell setup-env.sh variables. Kyty loads libvulkan.1.dylib (or libvulkan.dylib) from the selected SDK and points the Vulkan loader at its KosmicKrisp ICD manifest. Explicit SDL_VULKAN_LIBRARY, VK_DRIVER_FILES, or VK_ICD_FILENAMES choices are respected, except the native branch rejects directly loading libMoltenVK.dylib. No SDK or ICD binaries are copied into the build/install output.
 
 The workflow installs the current LunarG Vulkan SDK on a macOS 26+ runner and runs both interpreter tests and a full emulator build. A successful full build still does not mean the emulator can boot games: the x86-64-to-AArch64 backend is not yet connected to the runtime linker, host-import ABI bridge, or syscall dispatcher. The x86-64/Rosetta fallback remains separate and continues to bundle MoltenVK.
