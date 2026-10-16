@@ -429,10 +429,21 @@ InstructionStep X64Interpreter::ExecuteOne(GuestCpuState& state, GuestMemory& me
 		return {InstructionStepStatus::ControlFlow, instruction_rip, opcode};
 	}
 
-	if (opcode == 0x0f) { // Near conditional branch (0F 80..8F rel32)
+	if (opcode == 0x0f) {
 		std::uint8_t second_opcode = 0;
 		if (!reader.ReadByte(second_opcode)) {
 			return ReaderFailure(reader);
+		}
+		if (second_opcode == 0x05) { // SYSCALL
+			const std::uint64_t next_rip = reader.Cursor();
+			state.gpr[static_cast<std::size_t>(GuestGpr::Rcx)] = next_rip;
+			state.gpr[static_cast<std::size_t>(GuestGpr::R11)] = state.rflags;
+			state.rip = next_rip;
+			return {InstructionStepStatus::SystemCall, instruction_rip,
+			        state.gpr[static_cast<std::size_t>(GuestGpr::Rax)]};
+		}
+		if (second_opcode == 0x0b) { // UD2 -> #UD
+			return {InstructionStepStatus::GuestException, instruction_rip, 6};
 		}
 		if (second_opcode < 0x80 || second_opcode > 0x8f) {
 			return Unsupported(instruction_rip,
@@ -761,6 +772,10 @@ BlockExit X64Interpreter::RunBlock(GuestCpuState& state, GuestMemory& memory,
 				break;
 			case InstructionStepStatus::ControlFlow:
 				return {BlockExitReason::BlockCompleted, state.rip, step.detail};
+			case InstructionStepStatus::SystemCall:
+				return {BlockExitReason::SystemCall, state.rip, step.detail};
+			case InstructionStepStatus::GuestException:
+				return {BlockExitReason::GuestException, step.guest_rip, step.detail};
 			case InstructionStepStatus::MemoryFault:
 				return {BlockExitReason::MemoryFault, step.guest_rip, step.detail};
 			case InstructionStepStatus::UnsupportedInstruction:
