@@ -4,13 +4,13 @@
 
 ## Goal
 
-Build KytyPS5 itself as an arm64 macOS process and execute the PS5's x86-64 guest code without Rosetta 2. Keep Windows, Linux, and the existing x86-64/Rosetta macOS path unchanged while the native backend is developed.
+Scope this branch to native Apple Silicon macOS only. Do not add Windows or Linux support work here. The existing x86-64 macOS/Rosetta 2 build remains a separate compatibility fallback and is maintained independently.
 
 ## Important separation of responsibilities
 
 - **Guest CPU translation:** required to execute PS5 x86-64 instructions on an arm64 host. This needs an x86-64 decoder, an AArch64 code emitter or interpreter, correct guest-register/flags/SIMD state, code-cache invalidation, guest memory fault handling, and explicit exits for syscalls and exceptions.
 - **Host ABI and guest address space:** the current macOS x86-64 path relies on x86-64 guest-address-space linker layout and emits x86-64 trampolines/PLT stubs. These assumptions must be separated from the arm64 host path; changing only the build architecture is not enough.
-- **Graphics:** [KosmicKrisp](https://www.lunarg.com/products/kosmickrisp/) is LunarG's Mesa Vulkan driver for Apple Silicon; it maps Vulkan calls to Metal 4 and is documented for macOS 26+. It is a possible **alternative host Vulkan ICD** to the current MoltenVK path, not a layer that translates CPU instructions. The [crueter-ci/KosmicKrisp repository](https://github.com/crueter-ci/KosmicKrisp) contains build/package scripts for related macOS graphics components. KosmicKrisp does **not** translate x86-64 CPU instructions to AArch64.
+- **Graphics:** this branch uses [KosmicKrisp](https://www.lunarg.com/products/kosmickrisp/), LunarG's Mesa Vulkan driver for Apple Silicon, through the Vulkan loader supplied by the installed LunarG Vulkan SDK. KosmicKrisp translates Vulkan to Metal 4; it does **not** translate x86-64 CPU instructions to AArch64. It requires macOS 26 or newer. The native branch never downloads, copies, installs, or bundles the SDK or KosmicKrisp driver into project builds; users must install the Vulkan SDK separately. The SDK's loader and KosmicKrisp ICD manifest are selected at runtime through VULKAN_SDK. The x86-64/Rosetta fallback continues to use MoltenVK.
 - **Rosetta 2:** must not be a runtime dependency of the native arm64 build. The existing x86-64 build remains available as a fallback during development.
 
 ## Initial code boundary
@@ -30,22 +30,31 @@ The guest state model includes the 16 x86-64 general-purpose registers, RIP/RFLA
 3. **Kernel/loader integration:** route guest code entry points, calls/returns, syscalls, signals, faults, and code writes through the backend. Invalidate translated blocks when executable guest memory changes.
 4. **Native memory model:** separate PS5 guest virtual addresses from host pointers and remove the macOS x86-64-only `-segaddr` / `-image_base` strategy from the arm64 path.
 5. **Graphics:** evaluate KosmicKrisp as an alternative Vulkan ICD to MoltenVK through the Vulkan loader. Compare the Vulkan extensions, formats, synchronization behavior, and limits Kyty actually requires; keep a proven fallback. This work must remain independent from the CPU translator.
-6. **CI and regression testing:** build the native binary on an Apple Silicon runner and run state, instruction, memory, syscall, exception, and existing emulator tests. Keep a separate x86-64 macOS/Rosetta job until parity is demonstrated.
+6. **CI and regression testing:** build the native binary on a macOS 26+ Apple Silicon runner with the Vulkan SDK installed; run state and interpreter tests. Windows/Linux jobs are skipped for this branch. The separate x86-64/Rosetta macOS build remains available and its pinned MoltenVK version is reviewed weekly by an automated upstream watch.
 
 ## Build and run the interpreter smoke test
 
-On macOS with Xcode Command Line Tools, CMake, Ninja, and the project dependencies installed:
+Requirements: an Apple Silicon Mac running **macOS 26 or newer**, a compatible current Xcode, CMake, Ninja, Homebrew glslang, and the **installed LunarG Vulkan SDK that includes KosmicKrisp**. The project does not distribute the SDK or KosmicKrisp.
+
+Set VULKAN_SDK to the SDK's macOS directory (the directory containing include/, lib/, and share/):
 
 ```sh
+export VULKAN_SDK="$HOME/VulkanSDK/1.4.363.0/macOS"
 git submodule update --init --recursive
 cmake -S . -B _Build/macos-arm64-native -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_OSX_ARCHITECTURES=arm64 \
+  -DCMAKE_OSX_DEPLOYMENT_TARGET=26.0 \
   -DCMAKE_C_COMPILER=clang \
   -DCMAKE_CXX_COMPILER=clang++ \
+  -DKYTY_NATIVE_MACOS_ARM64_KOSMICKRISP=ON \
+  -DKYTY_VULKAN_SDK_ROOT="$VULKAN_SDK" \
   -DKYTY_BUILD_LAUNCHER=OFF
-cmake --build _Build/macos-arm64-native --target native_arm64_state_tests --parallel
+cmake --build _Build/macos-arm64-native --target kyty_emulator native_arm64_state_tests --parallel
 ctest --test-dir _Build/macos-arm64-native -R native_arm64_state --output-on-failure
+./_Build/macos-arm64-native/kyty_emulator --help
 ```
 
-The workflow has a fast interpreter-test job and a separate full-emulator ARM64 build job. The interpreter target verifies only this instruction subset; a successful full build would still not mean the emulator can boot games until the runtime-linker, host-import ABI bridge, and syscall dispatcher are connected.
+Keep VULKAN_SDK set when launching the native emulator. By default, Kyty loads libvulkan.1.dylib (or libvulkan.dylib) from that SDK and points the Vulkan loader at its KosmicKrisp ICD manifest. Explicit SDL_VULKAN_LIBRARY, VK_DRIVER_FILES, or VK_ICD_FILENAMES choices are respected, except the native branch rejects directly loading libMoltenVK.dylib. No SDK or ICD binaries are copied into the build/install output.
+
+The workflow installs the current LunarG Vulkan SDK on a macOS 26+ runner and runs both interpreter tests and a full emulator build. A successful full build still does not mean the emulator can boot games: the x86-64-to-AArch64 backend is not yet connected to the runtime linker, host-import ABI bridge, or syscall dispatcher. The x86-64/Rosetta fallback remains separate and continues to bundle MoltenVK.
