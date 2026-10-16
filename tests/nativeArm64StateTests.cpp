@@ -188,6 +188,34 @@ int main() {
 	CHECK(memory.ReadU64(0x1700, stored_value));
 	CHECK(stored_value == 0xdeadbef0);
 
+	// C7 sign-extends imm32 when writing an r/m64 destination.
+	CHECK(memory.Load(0x1f30, {
+	    0x48, 0xb8, 0x18, 0x17, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	    0x48, 0xc7, 0x00, 0xff, 0xff, 0xff, 0xff,
+	    0x48, 0x8b, 0x08,
+	    0xc3,
+	}));
+	CHECK(memory.WriteU64(0x1800, 0x2222));
+	state = GuestCpuState{};
+	state.rip = 0x1f30;
+	state.gpr[static_cast<std::size_t>(GuestGpr::Rsp)] = 0x1800;
+	const BlockExit c7_exit = interpreter.RunBlock(state, memory, 6);
+	CHECK(c7_exit.reason == BlockExitReason::BlockCompleted);
+	CHECK(state.gpr[static_cast<std::size_t>(GuestGpr::Rcx)] == UINT64_MAX);
+	CHECK(memory.ReadU64(0x1718, stored_value));
+	CHECK(stored_value == UINT64_MAX);
+
+	// SIB addressing uses base + index*scale + signed displacement.
+	CHECK(memory.WriteU64(0x1710, 0xabcdef0123456789ULL));
+	CHECK(memory.Load(0x1f50, {0x48, 0x8b, 0x44, 0x88, 0x08}));
+	state = GuestCpuState{};
+	state.rip = 0x1f50;
+	state.gpr[static_cast<std::size_t>(GuestGpr::Rax)] = 0x1700;
+	state.gpr[static_cast<std::size_t>(GuestGpr::Rcx)] = 2;
+	const BlockExit sib_exit = interpreter.RunBlock(state, memory, 1);
+	CHECK(sib_exit.reason == BlockExitReason::InstructionBudget);
+	CHECK(state.gpr[static_cast<std::size_t>(GuestGpr::Rax)] == 0xabcdef0123456789ULL);
+
 	// RIP-relative LEA uses the address after the complete instruction.
 	CHECK(memory.Load(0x1900, {0x48, 0x8d, 0x05, 0x09, 0x00, 0x00, 0x00}));
 	state = GuestCpuState{};
