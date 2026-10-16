@@ -203,6 +203,10 @@ private:
 	application_heap_posix_memalign_func_t m_application_heap_posix_memalign = nullptr;
 };
 
+#if defined(KYTY_NATIVE_MACOS_ARM64_KOSMICKRISP)
+uint64_t RunNativeArm64GuestThread(uint64_t entry, void* arg, void* stack_top);
+#endif
+
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 bool TestMainEntryUsesGuestStack();
 bool TestModuleRelocationUsesWritableHostMapping();
