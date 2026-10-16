@@ -758,7 +758,10 @@ endif()
 # from the full emulator until an x86-64 -> AArch64 execution backend is available.
 if(APPLE AND (CMAKE_OSX_ARCHITECTURES STREQUAL "arm64" OR
 		(NOT CMAKE_OSX_ARCHITECTURES AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)$")))
-	add_executable(native_arm64_state_tests "${KYTY_TESTS_DIR}/nativeArm64StateTests.cpp")
+	add_executable(native_arm64_state_tests
+		"${KYTY_TESTS_DIR}/nativeArm64StateTests.cpp"
+		"${KYTY_SOURCE_DIR}/native_arm64/x64_interpreter.cpp"
+	)
 	target_include_directories(native_arm64_state_tests PRIVATE "${KYTY_SOURCE_DIR}")
 	if(BUILD_TESTING)
 		add_test(NAME native_arm64_state COMMAND $<TARGET_FILE:native_arm64_state_tests>)
