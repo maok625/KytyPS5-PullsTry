@@ -26,13 +26,13 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Select Xcode 27
+      - name: Verify hosted Xcode toolchain
         shell: bash
         run: |
           set -euo pipefail
-          xcode_path="$(ls -d /Applications/Xcode_27*.app | tail -n 1)"
-          test -n "$xcode_path"
-          sudo xcode-select --switch "$xcode_path/Contents/Developer"
+          # macos-26 provides the compatible Xcode as its selected default.
+          # Do not depend on a preview Xcode_27.app installation path.
+          xcode-select -p
           xcodebuild -version
 
       - name: Install build dependencies
