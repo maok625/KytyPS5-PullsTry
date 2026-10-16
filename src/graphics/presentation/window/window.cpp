@@ -828,10 +828,10 @@ static void ConfigureNativeKosmicKrispVulkan() {
 		}
 		experimental += "image_view_min_lod";
 		if (SDL_setenv_unsafe("MESA_KK_EXPERIMENTAL", experimental.c_str(), 1) != 0) {
-			EXIT("Could not enable KosmicKrisp's required image-view-min-LOD feature: %s\\n",
+			EXIT("Could not enable KosmicKrisp's required image-view-min-LOD feature: %s\n",
 			     SDL_GetError());
 		}
-		LOGF("KosmicKrisp: enabled experimental VK_EXT_image_view_min_lod support\\n");
+		LOGF("KosmicKrisp: enabled experimental VK_EXT_image_view_min_lod support\n");
 	}
 
 	if (const char* configured_loader = std::getenv("SDL_VULKAN_LIBRARY");
