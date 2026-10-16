@@ -25,6 +25,8 @@
 #include "loader/systemContent.h"
 
 #include <cstdlib>
+#include <algorithm>
+#include <cctype>
 #include <fmt/format.h>
 #include <memory>
 #include <string>
@@ -752,6 +754,72 @@ void WindowContext::Run() {
 	}
 }
 
+#if defined(__APPLE__) && defined(KYTY_NATIVE_MACOS_ARM64_KOSMICKRISP)
+static void ConfigureNativeKosmicKrispVulkan() {
+	const char* sdk_env = std::getenv("VULKAN_SDK");
+	if (sdk_env == nullptr || sdk_env[0] == '\0') {
+		EXIT("Native macOS ARM64 builds require VULKAN_SDK at runtime. Export VULKAN_SDK to the installed Vulkan SDK's macOS directory, for example ~/VulkanSDK/<version>/macOS, and launch Kyty from that environment. The SDK/KosmicKrisp files are not bundled with Kyty.\n");
+	}
+
+	const std::filesystem::path sdk_root(sdk_env);
+	std::filesystem::path loader_path = sdk_root / "lib/libvulkan.1.dylib";
+	if (!Common::File::IsFileExisting(loader_path)) {
+		loader_path = sdk_root / "lib/libvulkan.dylib";
+	}
+	if (!Common::File::IsFileExisting(loader_path)) {
+		EXIT("The Vulkan loader was not found under VULKAN_SDK=%s/lib. Reinstall or select a valid macOS Vulkan SDK.\n",
+		     sdk_env);
+	}
+
+	if (const char* configured_loader = std::getenv("SDL_VULKAN_LIBRARY");
+	    configured_loader != nullptr && configured_loader[0] != '\0') {
+		std::string loader_name = std::filesystem::path(configured_loader).filename().string();
+		std::transform(loader_name.begin(), loader_name.end(), loader_name.begin(),
+		               [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+		if (loader_name.find("moltenvk") != std::string::npos) {
+			EXIT("The native KosmicKrisp build cannot load libMoltenVK.dylib directly. Unset SDL_VULKAN_LIBRARY or point it to the Vulkan SDK loader (libvulkan.1.dylib).\n");
+		}
+	} else if (SDL_setenv_unsafe("SDL_VULKAN_LIBRARY", loader_path.string().c_str(), 0) != 0) {
+		EXIT("Could not select the Vulkan SDK loader: %s\n", SDL_GetError());
+	}
+
+	// Prefer the SDK's KosmicKrisp ICD by default. Respect an explicit user
+	// driver selection, including VK_DRIVER_FILES, VK_ICD_FILENAMES, or
+	// VK_ADD_DRIVER_FILES, instead of overwriting it.
+	if (std::getenv("VK_DRIVER_FILES") == nullptr &&
+	    std::getenv("VK_ICD_FILENAMES") == nullptr &&
+	    std::getenv("VK_ADD_DRIVER_FILES") == nullptr) {
+		const auto icd_dir = sdk_root / "share/vulkan/icd.d";
+		std::filesystem::path manifest;
+		std::error_code error;
+		if (std::filesystem::is_directory(icd_dir, error)) {
+			for (std::filesystem::directory_iterator it(icd_dir, error), end; !error && it != end;
+			     it.increment(error)) {
+				if (!it->is_regular_file(error) || error || it->path().extension() != ".json") {
+					continue;
+				}
+				std::string filename = it->path().filename().string();
+				std::transform(filename.begin(), filename.end(), filename.begin(),
+				               [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+				if (filename.find("kosmickrisp") != std::string::npos) {
+					manifest = it->path();
+					break;
+				}
+			}
+		}
+		if (manifest.empty()) {
+			EXIT("KosmicKrisp was not found in %s/share/vulkan/icd.d. Install a current Vulkan SDK that includes KosmicKrisp; Kyty does not bundle the driver.\n",
+			     sdk_env);
+		}
+		if (SDL_setenv_unsafe("VK_DRIVER_FILES", manifest.string().c_str(), 0) != 0) {
+			EXIT("Could not select the SDK's KosmicKrisp ICD manifest: %s\n", SDL_GetError());
+		}
+		LOGF("Vulkan ICD: KosmicKrisp from %s\n", manifest.string().c_str());
+	}
+	LOGF("Vulkan loader: %s\n", loader_path.string().c_str());
+}
+#endif
+
 static void WindowCreate(WindowContext& context) {
 	EXIT_IF(context.window != nullptr);
 	EXIT_IF(context.graphic_ctx.screen_width == 0);
@@ -774,9 +842,11 @@ static void WindowCreate(WindowContext& context) {
 
 	uint32_t window_flags = WindowContext::InitialWindowFlags(Config::FullscreenEnabled());
 #if defined(__APPLE__)
-	// SDL loads Vulkan while creating a Vulkan window, so select the bundled
-	// MoltenVK loader before calling SDL_CreateWindow. Keep an explicit user
-	// override, and fall back to SDL's normal loader search when no bundle is present.
+#if defined(KYTY_NATIVE_MACOS_ARM64_KOSMICKRISP)
+	ConfigureNativeKosmicKrispVulkan();
+#else
+	// Legacy x86-64/Rosetta path: use the bundled MoltenVK fallback when present.
+	// Keep explicit user overrides and fall back to SDL's normal loader search.
 	if (std::getenv("SDL_VULKAN_LIBRARY") == nullptr) {
 		if (const char* base_path = SDL_GetBasePath(); base_path != nullptr) {
 			const std::string base_path_str = base_path;
@@ -790,6 +860,7 @@ static void WindowCreate(WindowContext& context) {
 			}
 		}
 	}
+#endif
 
 	// macOS 26 window chrome (CoreUI asset decode, SwiftUI titlebar) has been observed
 	// throwing NSExceptions under Rosetta during the first CATransaction commit. A
