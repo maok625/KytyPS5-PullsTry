@@ -374,6 +374,7 @@ private:
 } // namespace
 
 void CompileSrtWalker(ResourcePlan& program) {
+#if defined(__x86_64__) || defined(_M_X64)
 	if (!program.resource_tracking_complete || !program.srt_plan_complete ||
 	    program.capture_specialization_reads || !program.control_flow.empty() ||
 	    program.srt_reads.empty()) return;
@@ -496,6 +497,11 @@ void CompileSrtWalker(ResourcePlan& program) {
 	code.ret();
 	code.readyRE();
 	EXIT_IF(Xbyak::GetError() != 0);
+#else
+	// SrtWalker has a complete portable evaluator below. Its optional generated
+	// fast path uses x86-64 registers and must not be emitted by an ARM64 host.
+	(void)program;
+#endif
 }
 
 SrtWalker::SrtWalker(const ResourcePlan& program, const SrtRuntime& runtime,
@@ -1155,6 +1161,7 @@ bool SrtWalker::EvaluateDescriptor(uint32_t source, DescriptorValue& result) {
 
 bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 	if (!m_program.srt_plan_complete) return false;
+#if defined(__x86_64__) || defined(_M_X64)
 	if (m_program.srt_code && m_runtime.read_memory == nullptr) {
 		flat.resize(m_program.srt_reads.size());
 		m_program.active_sources.clear();
@@ -1164,6 +1171,7 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		return m_program.srt_code->getCode<Walker>()(m_runtime.user_data.data(), flat.data(),
 		    m_context.values.data(), m_context.generation, m_runtime.user_data.size());
 	}
+#endif
 	const auto refresh = [&](uint32_t slot) {
 		if (slot >= m_program.srt_reads.size()) return false;
 		const auto& read = m_program.srt_reads[slot];
