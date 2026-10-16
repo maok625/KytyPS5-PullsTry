@@ -77,6 +77,18 @@ public:
 		return Write(address, bytes.data(), bytes.size());
 	}
 
+	bool ReadU64(std::uint64_t address, std::uint64_t& value) const noexcept {
+		std::array<std::uint8_t, sizeof(value)> bytes{};
+		if (!Read(address, bytes.data(), bytes.size())) {
+			return false;
+		}
+		value = 0;
+		for (std::size_t i = 0; i < bytes.size(); ++i) {
+			value |= static_cast<std::uint64_t>(bytes[i]) << (i * 8);
+		}
+		return true;
+	}
+
 private:
 	std::vector<std::uint8_t> bytes_;
 };
@@ -151,6 +163,78 @@ int main() {
 	CHECK(state.gpr[static_cast<std::size_t>(GuestGpr::Rax)] == UINT64_MAX);
 	CHECK((state.rflags & (1ULL << 0)) != 0);
 	CHECK((state.rflags & (1ULL << 7)) != 0);
+
+	// Memory MOV and immediate ADD exercise base-register effective addresses.
+	CHECK(memory.Load(0x1600, {
+	    0x48, 0xb8, 0x00, 0x17, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // RAX = 0x1700
+	    0x48, 0xbb, 0xef, 0xbe, 0xad, 0xde, 0x00, 0x00, 0x00, 0x00, // RBX = 0xdeadbeef
+	    0x48, 0x89, 0x18,             // MOV [RAX], RBX
+	    0x48, 0x8b, 0x08,             // MOV RCX, [RAX]
+	    0x48, 0x83, 0x00, 0x01,       // ADD qword [RAX], 1
+	    0x48, 0x8b, 0x10,             // MOV RDX, [RAX]
+	    0xc3,
+	}));
+	CHECK(memory.WriteU64(0x1800, 0x2222));
+	state = GuestCpuState{};
+	state.rip = 0x1600;
+	state.gpr[static_cast<std::size_t>(GuestGpr::Rsp)] = 0x1800;
+	const BlockExit memory_exit = interpreter.RunBlock(state, memory, 10);
+	CHECK(memory_exit.reason == BlockExitReason::BlockCompleted);
+	CHECK(state.gpr[static_cast<std::size_t>(GuestGpr::Rax)] == 0x1700);
+	CHECK(state.gpr[static_cast<std::size_t>(GuestGpr::Rbx)] == 0xdeadbeef);
+	CHECK(state.gpr[static_cast<std::size_t>(GuestGpr::Rcx)] == 0xdeadbeef);
+	CHECK(state.gpr[static_cast<std::size_t>(GuestGpr::Rdx)] == 0xdeadbef0);
+	std::uint64_t stored_value = 0;
+	CHECK(memory.ReadU64(0x1700, stored_value));
+	CHECK(stored_value == 0xdeadbef0);
+
+	// RIP-relative LEA uses the address after the complete instruction.
+	CHECK(memory.Load(0x1900, {0x48, 0x8d, 0x05, 0x09, 0x00, 0x00, 0x00}));
+	state = GuestCpuState{};
+	state.rip = 0x1900;
+	const BlockExit lea_exit = interpreter.RunBlock(state, memory, 1);
+	CHECK(lea_exit.reason == BlockExitReason::InstructionBudget);
+	CHECK(state.gpr[static_cast<std::size_t>(GuestGpr::Rax)] == 0x1910);
+	CHECK(state.rip == 0x1907);
+
+	// XOR EAX,EAX sets ZF; JZ then skips the MOV EAX,1 sequence.
+	CHECK(memory.Load(0x1a00, {
+	    0x31, 0xc0,
+	    0x74, 0x05,
+	    0xb8, 0x01, 0x00, 0x00, 0x00,
+	    0xb8, 0x02, 0x00, 0x00, 0x00,
+	}));
+	state = GuestCpuState{};
+	state.rip = 0x1a00;
+	const BlockExit condition_exit = interpreter.RunBlock(state, memory, 4);
+	CHECK(condition_exit.reason == BlockExitReason::BlockCompleted);
+	CHECK(state.rip == 0x1a09);
+	CHECK(state.gpr[static_cast<std::size_t>(GuestGpr::Rax)] == 0);
+	const BlockExit branch_target_exit = interpreter.RunBlock(state, memory, 1);
+	CHECK(branch_target_exit.reason == BlockExitReason::InstructionBudget);
+	CHECK(state.gpr[static_cast<std::size_t>(GuestGpr::Rax)] == 2);
+
+	// PUSH RAX / POP RBX round-trips a 64-bit value on guest stack memory.
+	CHECK(memory.Load(0x1b00, {0x50, 0x5b}));
+	state = GuestCpuState{};
+	state.rip = 0x1b00;
+	state.gpr[static_cast<std::size_t>(GuestGpr::Rax)] = 0x123456789abcdef0ULL;
+	state.gpr[static_cast<std::size_t>(GuestGpr::Rsp)] = 0x1800;
+	const BlockExit stack_exit = interpreter.RunBlock(state, memory, 2);
+	CHECK(stack_exit.reason == BlockExitReason::InstructionBudget);
+	CHECK(state.gpr[static_cast<std::size_t>(GuestGpr::Rsp)] == 0x1800);
+	CHECK(state.gpr[static_cast<std::size_t>(GuestGpr::Rbx)] == 0x123456789abcdef0ULL);
+
+	// FS segment override is added to the effective address in long mode.
+	CHECK(memory.WriteU64(0x1810, 0xfeedfacecafebeefULL));
+	CHECK(memory.Load(0x1c00, {0x64, 0x48, 0x8b, 0x00})); // MOV RAX, FS:[RAX]
+	state = GuestCpuState{};
+	state.rip = 0x1c00;
+	state.fs_base = 0x110;
+	state.gpr[static_cast<std::size_t>(GuestGpr::Rax)] = 0x1700;
+	const BlockExit fs_exit = interpreter.RunBlock(state, memory, 1);
+	CHECK(fs_exit.reason == BlockExitReason::InstructionBudget);
+	CHECK(state.gpr[static_cast<std::size_t>(GuestGpr::Rax)] == 0xfeedfacecafebeefULL);
 
 	// JMP short has a signed displacement relative to the following instruction.
 	CHECK(memory.Load(0x1300, {0xeb, 0x02, 0x90, 0x90, 0x90}));
