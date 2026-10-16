@@ -357,6 +357,15 @@ static KYTY_SYSV_ABI void RunEntry(uint64_t addr, EntryParams* params, atexit_fu
 	               "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10",
 	               "xmm11", "xmm12", "xmm13", "xmm14", "xmm15");
 #endif
+#elif defined(__aarch64__) || defined(_M_ARM64)
+	// Never cast a PS5 x86-64 entry address to a native function pointer on ARM64.
+	// Until the interpreter/DBT is connected to the loader and host-import ABI
+	// bridge, fail explicitly instead of executing guest bytes as AArch64 code.
+	(void)addr;
+	(void)params;
+	(void)atexit_func;
+	(void)stack_top;
+	EXIT("Native ARM64 guest execution is not integrated: refusing to call an x86-64 entry point directly");
 #else
 	(void)stack_top;
 	reinterpret_cast<entry_func_t>(addr)(params, atexit_func);
