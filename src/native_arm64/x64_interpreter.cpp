@@ -524,6 +524,7 @@ InstructionStep X64Interpreter::ExecuteOne(GuestCpuState& state, GuestMemory& me
 
 	std::uint8_t rex = 0;
 	bool rex_present = false;
+	bool operand_size_override = false;
 	std::uint8_t segment_override = 0;
 	std::uint8_t opcode = 0;
 	for (;;) {
@@ -535,15 +536,21 @@ InstructionStep X64Interpreter::ExecuteOne(GuestCpuState& state, GuestMemory& me
 			rex_present = true;
 			continue;
 		}
+		if (opcode == 0x66) { // Operand-size override (supported 16-bit subset below)
+			operand_size_override = true;
+			rex = 0;
+			rex_present = false;
+			continue;
+		}
 		if (opcode == 0x64 || opcode == 0x65) { // FS / GS segment override
 			segment_override = opcode;
 			rex = 0;
 			rex_present = false; // A legacy prefix after REX makes that REX ineffective.
 			continue;
 		}
-		if (opcode == 0x66 || opcode == 0x67 || opcode == 0xf0 ||
-		    opcode == 0xf2 || opcode == 0xf3 || opcode == 0x26 ||
-		    opcode == 0x2e || opcode == 0x36 || opcode == 0x3e) {
+		if (opcode == 0x67 || opcode == 0xf0 || opcode == 0xf2 ||
+		    opcode == 0xf3 || opcode == 0x26 || opcode == 0x2e ||
+		    opcode == 0x36 || opcode == 0x3e) {
 			return Unsupported(instruction_rip, opcode);
 		}
 		break;
