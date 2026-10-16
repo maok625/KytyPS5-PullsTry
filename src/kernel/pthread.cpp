@@ -929,6 +929,11 @@ static KYTY_SYSV_ABI void* RunOnGuestStack(void* arg, pthread_entry_func_t func,
 	}
 
 	return ret;
+#elif defined(KYTY_NATIVE_MACOS_ARM64_KOSMICKRISP)
+	// Guest pthread entry addresses contain x86-64 code even though this host is
+	// AArch64. Route the entry through the same interpreter as the main thread.
+	return reinterpret_cast<void*>(Loader::RunNativeArm64GuestThread(
+	    reinterpret_cast<uint64_t>(func), arg, stack_top));
 #else
 	(void)stack_top;
 	return func(arg);
