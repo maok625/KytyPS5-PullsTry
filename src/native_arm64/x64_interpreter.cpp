@@ -533,13 +533,31 @@ InstructionStep X64Interpreter::ExecuteOne(GuestCpuState& state, GuestMemory& me
 		return {InstructionStepStatus::Continue, instruction_rip, opcode};
 	}
 
-	if (opcode == 0xc3) { // RET
+	if (opcode == 0xc9) { // LEAVE: RSP = RBP; POP RBP
+		const auto frame_pointer = state.gpr[static_cast<std::size_t>(GuestGpr::Rbp)];
+		std::uint8_t bytes[sizeof(std::uint64_t)]{};
+		if (!memory.Read(frame_pointer, bytes, sizeof(bytes))) {
+			return {InstructionStepStatus::MemoryFault, instruction_rip, frame_pointer};
+		}
+		const std::uint64_t restored_frame = ReadLittleEndianU64(bytes);
+		state.gpr[static_cast<std::size_t>(GuestGpr::Rsp)] = frame_pointer + sizeof(bytes);
+		state.gpr[static_cast<std::size_t>(GuestGpr::Rbp)] = restored_frame;
+		state.rip = reader.Cursor();
+		return {InstructionStepStatus::Continue, instruction_rip, opcode};
+	}
+
+	if (opcode == 0xc2 || opcode == 0xc3) { // RET / RET imm16
+		std::uint16_t stack_adjust = 0;
+		if (opcode == 0xc2 && !ReadLittleEndian(reader, stack_adjust)) {
+			return ReaderFailure(reader);
+		}
 		const auto stack_pointer = state.gpr[static_cast<std::size_t>(GuestGpr::Rsp)];
 		std::uint8_t bytes[sizeof(std::uint64_t)]{};
 		if (!memory.Read(stack_pointer, bytes, sizeof(bytes))) {
 			return {InstructionStepStatus::MemoryFault, instruction_rip, stack_pointer};
 		}
-		state.gpr[static_cast<std::size_t>(GuestGpr::Rsp)] = stack_pointer + sizeof(bytes);
+		state.gpr[static_cast<std::size_t>(GuestGpr::Rsp)] =
+		    stack_pointer + sizeof(bytes) + stack_adjust;
 		state.rip = ReadLittleEndianU64(bytes);
 		return {InstructionStepStatus::ControlFlow, instruction_rip, opcode};
 	}
