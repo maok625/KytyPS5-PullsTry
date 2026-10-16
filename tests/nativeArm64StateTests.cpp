@@ -323,18 +323,18 @@ int main() {
 	CHECK(movsx_byte_exit.reason == BlockExitReason::InstructionBudget);
 	CHECK(state.gpr[static_cast<std::size_t>(GuestGpr::Rax)] == 0xffffffffffffff80ULL);
 
-	// MOVZX AX, byte [RAX] preserves upper register bits on a 16-bit destination.
-	CHECK(memory.Load(0x2070, {0x66, 0x0f, 0xb6, 0x03}));
+	// MOVZX EAX, word [RBX] reads a 16-bit source and zero-extends the 32-bit destination.
+	CHECK(memory.WriteU64(0x1710, 0x8001));
+	CHECK(memory.Load(0x2070, {0x0f, 0xb7, 0x03}));
 	state = GuestCpuState{};
 	state.rip = 0x2070;
 	state.gpr[static_cast<std::size_t>(GuestGpr::Rax)] = 0x1122334455660000ULL;
-	state.gpr[static_cast<std::size_t>(GuestGpr::Rbx)] = 0x1700;
-	const BlockExit movzx_ax_exit = interpreter.RunBlock(state, memory, 1);
-	CHECK(movzx_ax_exit.reason == BlockExitReason::InstructionBudget);
-	CHECK(state.gpr[static_cast<std::size_t>(GuestGpr::Rax)] == 0x1122334455660080ULL);
+	state.gpr[static_cast<std::size_t>(GuestGpr::Rbx)] = 0x1710;
+	const BlockExit movzx_word_exit = interpreter.RunBlock(state, memory, 1);
+	CHECK(movzx_word_exit.reason == BlockExitReason::InstructionBudget);
+	CHECK(state.gpr[static_cast<std::size_t>(GuestGpr::Rax)] == 0x8001ULL);
 
 	// MOVSX EAX, word [RAX] produces signed 32-bit output then zero-extends RAX.
-	CHECK(memory.WriteU64(0x1710, 0x8001));
 	CHECK(memory.Load(0x2078, {0x0f, 0xbf, 0x00}));
 	state = GuestCpuState{};
 	state.rip = 0x2078;
