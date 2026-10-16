@@ -1045,6 +1045,55 @@ InstructionStep X64Interpreter::ExecuteOne(GuestCpuState& state, GuestMemory& me
 		if (!reader.ReadByte(second_opcode)) {
 			return ReaderFailure(reader);
 		}
+		if (second_opcode == 0xb6 || second_opcode == 0xb7 ||
+		    second_opcode == 0xbe || second_opcode == 0xbf) {
+			// MOVZX/MOVSX r16/r32/r64, r/m8/r/m16.
+			const unsigned source_bits = (second_opcode == 0xb6 || second_opcode == 0xbe) ? 8 : 16;
+			const unsigned destination_bits = wide ? 64 : (operand_size_override ? 16 : 32);
+			std::uint8_t modrm = 0;
+			if (!reader.ReadByte(modrm)) {
+				return ReaderFailure(reader);
+			}
+			RmOperand source_operand{};
+			if (!DecodeRmOperand(reader, state, modrm, rex, source_operand)) {
+				return ReaderFailure(reader);
+			}
+			const auto next_rip = reader.Cursor();
+			const auto destination = RegisterIndex(static_cast<std::uint8_t>((modrm >> 3) & 0x07), rex_r);
+			std::uint64_t source = 0;
+			std::uint64_t fault_address = 0;
+			if (source_bits == 8) {
+				std::uint8_t source_byte = 0;
+				if (!ReadRmByte(source_operand, state, memory, next_rip, segment_override,
+				                rex_present, static_cast<std::uint8_t>(modrm & 0x07),
+				                source_byte, fault_address)) {
+					return {InstructionStepStatus::MemoryFault, instruction_rip, fault_address};
+				}
+				source = source_byte;
+			} else if (!ReadRmSized(source_operand, state, memory, 16, next_rip,
+			                        segment_override, source, fault_address)) {
+				return {InstructionStepStatus::MemoryFault, instruction_rip, fault_address};
+			}
+
+			const bool sign_extend = second_opcode == 0xbe || second_opcode == 0xbf;
+			std::uint64_t result = source;
+			if (sign_extend) {
+				if (source_bits == 8) {
+					result = static_cast<std::uint64_t>(
+					    static_cast<std::int64_t>(std::bit_cast<std::int8_t>(
+				        static_cast<std::uint8_t>(source))));
+				} else {
+					result = static_cast<std::uint64_t>(
+					    static_cast<std::int64_t>(std::bit_cast<std::int16_t>(
+				        static_cast<std::uint16_t>(source))));
+				}
+			}
+			WriteGprSized(state, destination, destination_bits, result);
+			state.rip = next_rip;
+			return {InstructionStepStatus::Continue, instruction_rip,
+			        (static_cast<std::uint64_t>(opcode) << 8) | second_opcode};
+		}
+
 		if (second_opcode == 0x05) { // SYSCALL
 			const std::uint64_t next_rip = reader.Cursor();
 			state.gpr[static_cast<std::size_t>(GuestGpr::Rcx)] = next_rip;
