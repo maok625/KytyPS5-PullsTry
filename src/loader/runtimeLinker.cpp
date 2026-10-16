@@ -279,6 +279,28 @@ public:
 
 	bool TryDispatchHostCall(uint64_t target, Kyty::NativeArm64::GuestCpuState& state,
 	                         bool tail_call) noexcept override {
+		// The runtime creates x86-64 TLS helper thunks in guest executable memory.
+		// Their target C functions live on the native host, and their relative call
+		// displacements are not necessarily representable from a high guest address
+		// on Apple Silicon. Intercept those known thunk addresses directly.
+		if (g_tls_main_program != nullptr) {
+			const uint64_t tls_handler = g_tls_main_program->tls.handler_vaddr;
+			if (target == tls_handler && tls_handler != 0) {
+				state.gpr[static_cast<size_t>(Kyty::NativeArm64::GuestGpr::Rax)] =
+				    reinterpret_cast<uint64_t>(TlsMainGetAddr());
+				return true;
+			}
+			for (uint8_t reg = 1; reg < 8; ++reg) {
+				if (reg == 4) {
+					continue;
+				}
+				if (target == tls_handler + Jit::TlsRegStub::GetOffset(reg)) {
+					state.gpr[reg] = reinterpret_cast<uint64_t>(TlsMainGetAddr());
+					return true;
+				}
+			}
+		}
+
 		// Unresolved import thunks live in guest executable memory. Intercept them
 		// before fetching their x86 bytes so they can report the missing symbol.
 		for (size_t i = 0; i < g_stubbed_imports.size(); ++i) {
@@ -402,7 +424,7 @@ static void SetNativeSyscallResult(Kyty::NativeArm64::GuestCpuState& state, int6
 
 static bool DispatchNativeSyscall(NativeArm64GuestMemory& memory,
                                   Kyty::NativeArm64::GuestCpuState& state,
-                                  bool& exit_requested) {
+                                  bool& exit_requested, uint64_t exit_callback) {
 	using Kyty::NativeArm64::GuestGpr;
 	const auto& gpr = state.gpr;
 	const auto get = [&gpr](GuestGpr reg) { return gpr[static_cast<size_t>(reg)]; };
@@ -423,6 +445,11 @@ static bool DispatchNativeSyscall(NativeArm64GuestMemory& memory,
 	switch (number) {
 		case 1: // exit
 			exit_requested = true;
+			// The emulator passes its native module-stop callback as the guest's
+			// second entry argument. Run it on an exit syscall when it is available.
+			if (exit_callback != 0) {
+				(void)memory.TryDispatchHostCall(exit_callback, state, false);
+			}
 			SetNativeSyscallResult(state, static_cast<int64_t>(args[0]));
 			return true;
 
@@ -520,7 +547,8 @@ static bool DispatchNativeSyscall(NativeArm64GuestMemory& memory,
 
 static uint64_t RunNativeArm64Guest(RuntimeLinker& runtime, uint64_t entry,
                                     const std::array<uint64_t, 6>& args, void* stack_top,
-                                    std::vector<uint64_t> host_callbacks, bool* guest_exited) {
+                                    std::vector<uint64_t> host_callbacks, uint64_t exit_callback,
+                                    bool* guest_exited) {
 	using namespace Kyty::NativeArm64;
 	if (entry == 0 || stack_top == nullptr) {
 		EXIT("Native ARM64 guest dispatcher received an invalid entry or stack");
@@ -574,7 +602,7 @@ static uint64_t RunNativeArm64Guest(RuntimeLinker& runtime, uint64_t entry,
 				break;
 			case BlockExitReason::SystemCall: {
 				bool exit_requested = false;
-				if (!DispatchNativeSyscall(memory, state, exit_requested)) {
+				if (!DispatchNativeSyscall(memory, state, exit_requested, exit_callback)) {
 					EXIT("Native ARM64 guest syscall dispatcher failed at RIP=0x%016" PRIx64,
 					     block.guest_rip);
 				}
