@@ -835,16 +835,19 @@ if(LINUX)
     )
 endif()
 
-if(APPLE)
-	# The emulator writes x86-64 trampolines/PLT stubs into memory and executes them, and
-	# runs guest code under Rosetta. That requires the JIT / unsigned-executable-memory
-	# entitlements, so re-sign the binary after every link (an unsigned/relinked binary
-	# reverts to the hardened defaults and aborts when it first executes written code).
+if(APPLE AND (CMAKE_OSX_ARCHITECTURES MATCHES "(^|;)x86_64(;|$)" OR
+		(NOT CMAKE_OSX_ARCHITECTURES AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")))
+	# The x86-64 macOS build emits x86 trampolines/PLT stubs and needs JIT /
+	# unsigned-executable-memory entitlements. Keep signing isolated to that build.
 	add_custom_command(TARGET kyty_emulator POST_BUILD
 		COMMAND codesign -s - --force --options runtime
 			--entitlements "${KYTY_SOURCE_DIR}/macos_jit.entitlements"
 			$<TARGET_FILE:kyty_emulator>
-		COMMENT "Codesign kyty_emulator with JIT entitlements (macOS)")
+		COMMENT "Codesign x86-64 kyty_emulator with JIT entitlements (macOS)")
+elseif(APPLE)
+	# The native ARM64 bring-up currently interprets a small guest subset in C++;
+	# no executable code is generated yet, so do not grant x86-specific JIT entitlements.
+	message(STATUS "Native ARM64 bring-up: skipping x86-64 JIT entitlements")
 endif()
 
 install(TARGETS kyty_emulator DESTINATION .)
