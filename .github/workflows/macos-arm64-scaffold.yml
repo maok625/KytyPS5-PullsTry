@@ -48,8 +48,25 @@ jobs:
       - name: Build full emulator and state tests
         shell: bash
         run: |
-          set -euo pipefail
-          cmake --build _Build/macos-arm64-native --target kyty_emulator native_arm64_state_tests --parallel
+          set -uo pipefail
+          log="_Build/macos-arm64-native/native-build.log"
+          set +e
+          cmake --build _Build/macos-arm64-native --target kyty_emulator native_arm64_state_tests --parallel > "$log" 2>&1
+          status=$?
+          tail -n 160 "$log"
+          if [[ "$status" -ne 0 ]]; then
+            echo "### Native ARM64 compile errors" >> "$GITHUB_STEP_SUMMARY"
+            (grep -E "error:|fatal error:|FAILED:|Error [0-9]" "$log" | tail -n 100 || tail -n 100 "$log") >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit "$status"
+
+      - name: Upload native ARM64 build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-arm64-emulator-build-log
+          path: _Build/macos-arm64-native/native-build.log
+          if-no-files-found: warn
 
       - name: Run native ARM64 interpreter tests
         shell: bash
