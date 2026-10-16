@@ -738,6 +738,17 @@ if(APPLE AND (CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64" OR
 	endif()
 endif()
 
+# The native arm64 bring-up keeps its architectural-state contract test isolated
+# from the full emulator until an x86-64 -> AArch64 execution backend is available.
+if(APPLE AND (CMAKE_OSX_ARCHITECTURES STREQUAL "arm64" OR
+		(NOT CMAKE_OSX_ARCHITECTURES AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)$")))
+	add_executable(native_arm64_state_tests "${KYTY_TESTS_DIR}/nativeArm64StateTests.cpp")
+	target_include_directories(native_arm64_state_tests PRIVATE "${KYTY_SOURCE_DIR}")
+	if(BUILD_TESTING)
+		add_test(NAME native_arm64_state COMMAND $<TARGET_FILE:native_arm64_state_tests>)
+	endif()
+endif()
+
 add_executable(kyty_emulator "${KYTY_SOURCE_DIR}/main.cpp" ${kyty_emulator_src})
 configure_macos_guest_address_space(kyty_emulator)
 
