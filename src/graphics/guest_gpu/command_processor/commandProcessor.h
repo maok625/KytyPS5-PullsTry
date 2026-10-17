@@ -23,6 +23,12 @@ enum class ContextStateOperation : uint32_t {
 	PushClear = 3,
 };
 
+struct IndirectDrawRegisters {
+	uint32_t vertex_offset;
+	uint32_t instance_offset;
+	uint32_t index_offset;
+};
+
 class Pm4Execution {
 public:
 	[[nodiscard]] bool MadeProgress() const noexcept { return m_made_progress; }
@@ -79,10 +85,11 @@ public:
 	void DrawIndex(DrawIndexArgs args);
 	void DrawIndexOffset(uint32_t index_offset, uint32_t index_count);
 	void DrawIndexAuto(DrawAutoArgs args);
-	void DrawIndirect(uint32_t data_offset, uint32_t draw_initiator, bool indexed);
+	void DrawIndirect(uint32_t data_offset, IndirectDrawRegisters registers,
+	                  uint32_t draw_initiator, bool indexed);
 	void DrawIndirectMulti(uint32_t data_offset, uint32_t max_count_or_count,
 	                       const volatile uint32_t* count_addr, uint32_t stride_in_bytes,
-	                       uint32_t draw_initiator, bool indexed);
+	                       IndirectDrawRegisters registers, uint32_t draw_initiator, bool indexed);
 	void WriteAtEndOfPipe32(uint32_t cache_policy, uint32_t event_write_dest,
 	                        uint32_t eop_event_type, uint32_t cache_action, uint32_t event_index,
 	                        uint32_t event_write_source, void* dst_gpu_addr, uint32_t value,
@@ -100,8 +107,9 @@ public:
 	void EmitGlobalBarrier();
 	void TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id);
 	void DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y, uint32_t thread_group_z,
-	                    uint32_t mode);
+	                    uint32_t mode, uint64_t indirect_args_addr = 0);
 	void DispatchIndirect(uint64_t args_addr, uint32_t mode);
+
 	void WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index);
 	void TriggerEvent(uint32_t event_type, uint32_t event_index, uint64_t event_address = 0);
 
@@ -146,8 +154,15 @@ private:
 	                      uint32_t cache_action, uint32_t event_index, uint32_t event_write_source,
 	                      void* dst_gpu_addr, T value, uint32_t interrupt_selector,
 	                      uint32_t interrupt_context_id);
+	void WriteMemory(void* dst, const void* src, uint64_t size);
 	void ProcessPm4(Pm4Execution& execution);
 	void SuspendPm4();
+	[[nodiscard]] uint32_t NumInstances();
+	[[nodiscard]] IndirectDrawResult DrawIndirectOnGpu(uint64_t args_addr, uint32_t max_count,
+	                                                   uint32_t                 stride,
+	                                                   const volatile uint32_t* count_addr,
+	                                                   bool                     indexed);
+	void ReportIndirectFallback(IndirectDrawResult result, uint64_t args_addr, bool indexed);
 	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }
 	CommandBuffer&      CurrentBuffer() { return GetScheduler().Current(); }
 
@@ -165,6 +180,14 @@ private:
 	uint64_t         m_dispatch_indirect_args_base_addr = 0;
 	// Persistent draw state: indirect draws update it for subsequent draws.
 	uint32_t m_num_instances = 1;
+	// Left on the GPU, an indirect draw's instance count is read only if a later draw inherits it.
+	struct PendingInstances {
+		uint64_t                 args_addr  = 0;
+		uint32_t                 max_count  = 0;
+		uint32_t                 stride     = 0;
+		const volatile uint32_t* count_addr = nullptr;
+	};
+	PendingInstances m_pending_instances;
 
 	uint32_t m_de_count    = 0;
 	uint32_t m_ce_count    = 0;

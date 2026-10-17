@@ -1,12 +1,15 @@
 #include "common/assert.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "graphics/shader/recompiler/BufferFormat.h"
 
 #include <fmt/format.h>
+#include <xbyak/xbyak.h>
 #include <map>
 #include <new>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
@@ -98,6 +101,9 @@ bool EquivalentValue(const ResourcePlan& program, Value left, Value right,
 
 } // namespace
 
+ResourcePlan::ResourcePlan() = default;
+ResourcePlan::ResourcePlan(ResourcePlan&&) noexcept = default;
+
 ResourcePlan::~ResourcePlan() {
 	for (auto& inst: value_storage) {
 		inst.Invalidate();
@@ -136,15 +142,15 @@ Program& Program::operator=(Program&& other) noexcept {
 
 CompiledShaderInfo Program::TakeCompiledInfo() && {
 	CompiledShaderInfo result {
-	    .stage           = stage,
-	    .shader_hash     = shader_hash,
-	    .wave_size       = wave_size,
-	    .user_data_base  = user_data_base,
-	    .user_data_count = user_data_count,
-	    .scratch_dwords  = scratch_dwords,
+	    .stage              = stage,
+	    .shader_hash        = shader_hash,
+	    .wave_size          = wave_size,
+	    .user_data_base     = user_data_base,
+	    .user_data_count    = user_data_count,
+	    .scratch_dwords     = scratch_dwords,
 	    .has_address_writes = has_address_writes,
-	    .info            = std::move(info),
-	    .bindings        = std::move(bindings),
+	    .info               = std::move(info),
+	    .bindings           = std::move(bindings),
 	};
 	for (const auto& output: result.info.outputs) {
 		if (output.kind == StageOutputKind::Parameter && output.index < 32) {
@@ -190,6 +196,28 @@ Value ResolveInvariantPhi(const ResourcePlan& program, Value value) {
 	return invariant;
 }
 
+Value ResolveActiveU32(Value value, Value active) {
+	for (uint32_t depth = 0; depth <= 32; ++depth) {
+		value = value.Resolve();
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr || inst->GetOpcode() != ValueOpcode::SelectU32 ||
+		    inst->Arg(0).Resolve() != active)
+			return value;
+		value = inst->Arg(1);
+	}
+	return {};
+}
+
+uint32_t StorageBufferElementBits(const Program& program, const MemoryInfo& memory) {
+	if (!memory.formatted) return memory.data_bits;
+	const auto format = memory.typed
+	                        ? Format::DecodeTBufferFormat(memory.data_format, memory.number_format)
+	                        : program.info.buffers[memory.resource].descriptor_format;
+	const auto info = Format::GetFormatInfo(format);
+	return info.type == Format::ComponentType::Unknown || info.packed_bitfield
+	           ? 32u : info.component_bits[0];
+}
+
 bool HasShaderMemoryWrites(const Program& program) {
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
@@ -206,13 +234,131 @@ bool HasShaderMemoryWrites(const Program& program) {
 	return false;
 }
 
+Value ResolveCyclicPhiEntry(const ResourcePlan& program, Value value,
+                            std::vector<const Inst*>* web_out, CyclicPhiFailure* reject,
+                            CyclicPhiEntryCache* cache) {
+	if (cache != nullptr && cache->program == &program) {
+		const auto* root = value.Resolve().TryInstruction();
+		if (root != nullptr && root->GetOpcode() == ValueOpcode::Phi) {
+			auto found = cache->answers.find(root);
+			if (found == cache->answers.end()) {
+				CyclicPhiEntryCache::Answer answer;
+				answer.entry = ResolveCyclicPhiEntry(program, value, &answer.web, &answer.reject);
+				found        = cache->answers.emplace(root, std::move(answer)).first;
+			}
+			const auto& answer = found->second;
+			if (reject != nullptr) {
+				*reject = answer.reject;
+			}
+			if (web_out != nullptr && !answer.entry.IsEmpty()) {
+				*web_out = answer.web;
+			}
+			return answer.entry;
+		}
+	}
+	const auto fail = [&](CyclicPhiReject reason, Value entry = {}, Value other = {}) {
+		if (reject != nullptr) {
+			*reject = {reason, entry, other};
+		}
+		return Value {};
+	};
+	if (reject != nullptr) {
+		*reject = {};
+	}
+	value            = value.Resolve();
+	const auto* root = value.TryInstruction();
+	if (root == nullptr || root->GetOpcode() != ValueOpcode::Phi) {
+		return {};
+	}
+	std::vector<const Inst*>        web_order {root};
+	std::unordered_set<const Inst*> web {root};
+	for (size_t index = 0; index < web_order.size(); index++) {
+		const auto* inst = web_order[index];
+		for (size_t arg = 0; arg < inst->NumArgs(); arg++) {
+			const auto* operand = inst->Arg(arg).Resolve().TryInstruction();
+			if (operand != nullptr && operand->GetOpcode() == ValueOpcode::Phi &&
+			    web.insert(operand).second) {
+				web_order.push_back(operand);
+			}
+		}
+	}
+
+	// An operand leading back into the web is the value the loop carries; anything else is a
+	// value the loop was entered with.
+	std::unordered_map<const Inst*, bool> reaches;
+	const auto                            ReachesWeb = [&](Value operand) {
+		const auto* start = operand.Resolve().TryInstruction();
+		if (start == nullptr) {
+			return false;
+		}
+		if (const auto found = reaches.find(start); found != reaches.end()) {
+			return found->second;
+		}
+		std::vector<const Inst*>        pending {start};
+		std::unordered_set<const Inst*> seen {start};
+		bool                            found = false;
+		while (!pending.empty() && !found) {
+			const auto* inst = pending.back();
+			pending.pop_back();
+			for (size_t arg = 0; arg < inst->NumArgs(); arg++) {
+				const auto* next = inst->Arg(arg).Resolve().TryInstruction();
+				if (next == nullptr) {
+					continue;
+				}
+				if (web.contains(next)) {
+					found = true;
+					break;
+				}
+				if (seen.insert(next).second) {
+					pending.push_back(next);
+				}
+			}
+		}
+		if (!found) {
+			// The walk ran to completion, so nothing it visited reaches the web either.
+			for (const auto* inst: seen) {
+				reaches.emplace(inst, false);
+			}
+		}
+		reaches[start] = found;
+		return found;
+	};
+
+	Value entry;
+	for (const auto* inst: web_order) {
+		for (size_t arg = 0; arg < inst->NumArgs(); arg++) {
+			const auto  operand = inst->Arg(arg).Resolve();
+			const auto* source  = operand.TryInstruction();
+			if (source != nullptr && web.contains(source)) {
+				continue;
+			}
+			if (ReachesWeb(operand)) {
+				continue;
+			}
+			if (entry.IsEmpty()) {
+				entry = operand;
+			} else if (!EquivalentValue(program, entry, operand)) {
+				// A merge, not a loop: no single host binding stands for it.
+				return fail(CyclicPhiReject::Merge, entry, operand);
+			}
+		}
+	}
+	if (entry.IsEmpty()) {
+		return fail(CyclicPhiReject::NoEntry);
+	}
+	if (web_out != nullptr) {
+		// The web's phis stand or fall together, so a caller must hold them all to one value.
+		*web_out = web_order;
+	}
+	return entry;
+}
+
 void ValidateProgram(const Program& program, bool require_ssa) {
-	if (program.blocks.size() != program.block_info.size() ||
-	    program.blocks.size() != program.block_storage.size()) {
+	if (program.blocks.size() != program.block_storage.size()) {
 		return Fail("value IR block storage is inconsistent");
 	}
 	std::unordered_map<const Block*, size_t>   block_indices;
-	std::unordered_map<uint32_t, const Block*> blocks_by_id;
+	std::unordered_set<uint32_t>               block_ids;
 	std::unordered_map<const Inst*, size_t>    instruction_positions;
 	for (size_t block_index = 0; block_index < program.blocks.size(); block_index++) {
 		const auto* block = program.blocks[block_index];
@@ -223,10 +369,10 @@ void ValidateProgram(const Program& program, bool require_ssa) {
 		if (!block_indices.emplace(block, block_index).second) {
 			return Fail("value IR block pointer is duplicated");
 		}
-		if (program.block_info[block_index].id == UINT32_MAX) {
+		if (block->id == UINT32_MAX) {
 			return Fail("value IR block uses the reserved exit id");
 		}
-		if (!blocks_by_id.emplace(program.block_info[block_index].id, block).second) {
+		if (!block_ids.insert(block->id).second) {
 			return Fail("value IR block id is duplicated");
 		}
 		size_t position = 0;
@@ -271,15 +417,14 @@ void ValidateProgram(const Program& program, bool require_ssa) {
 		}
 
 		std::unordered_set<const Block*> expected_successors;
-		const auto                       add_target = [&](uint32_t id) {
-			const auto found = blocks_by_id.find(id);
-			if (found == blocks_by_id.end()) {
+		const auto                       add_target = [&](const Block* target) {
+			if (!block_indices.contains(target)) {
 				return false;
 			}
-			expected_successors.insert(found->second);
+			expected_successors.insert(target);
 			return true;
 		};
-		const auto& terminator             = program.block_info[block_index].terminator;
+		const auto& terminator             = block->terminator;
 		const auto  validate_control_value = [&](Value value, Type type) {
 			if (value.IsEmpty() || value.GetType() != type) {
 				return false;
@@ -297,33 +442,21 @@ void ValidateProgram(const Program& program, bool require_ssa) {
 				if (!add_target(terminator.true_block) || !add_target(terminator.false_block)) {
 					return Fail("value IR conditional branch target is missing");
 				}
-				if (!validate_control_value(program.block_info[block_index].condition, Type::U1)) {
+				if (!validate_control_value(block->condition, Type::U1)) {
 					return Fail("value IR conditional branch condition is invalid");
 				}
 				break;
 			case CFG::TerminatorKind::IndirectBranch: {
-				if (!validate_control_value(program.block_info[block_index].indirect_target,
-				                            Type::U32)) {
+				if (!validate_control_value(block->indirect_target, Type::U32)) {
 					return Fail("value IR indirect branch selector is invalid");
 				}
-				std::unordered_set<uint32_t> indirect_targets;
-				for (const auto target: terminator.indirect_targets) {
-					if (!indirect_targets.insert(target).second) {
-						return Fail("value IR indirect branch target is duplicated");
+				std::unordered_set<uint32_t> values;
+				for (const auto& branch: terminator.cases) {
+					if (!values.insert(branch.value).second) {
+						return Fail("value IR indirect selector value is duplicated");
 					}
-					if (!add_target(target)) {
+					if (!add_target(branch.target)) {
 						return Fail("value IR indirect branch target is missing");
-					}
-				}
-				if (terminator.indirect_selector_values.size() !=
-				    terminator.indirect_selector_targets.size()) {
-					return Fail("value IR indirect selector table is inconsistent");
-				}
-				for (const auto target: terminator.indirect_selector_targets) {
-					const auto found = blocks_by_id.find(target);
-					if (found == blocks_by_id.end() ||
-					    !expected_successors.contains(found->second)) {
-						return Fail("value IR indirect selector target is not a CFG successor");
 					}
 				}
 				break;
@@ -331,10 +464,10 @@ void ValidateProgram(const Program& program, bool require_ssa) {
 			case CFG::TerminatorKind::Return:
 			case CFG::TerminatorKind::Unsupported: break;
 		}
-		if ((terminator.merge_block != UINT32_MAX &&
-		     !blocks_by_id.contains(terminator.merge_block)) ||
-		    (terminator.continue_block != UINT32_MAX &&
-		     !blocks_by_id.contains(terminator.continue_block))) {
+		if ((terminator.merge_block != nullptr &&
+		     !block_indices.contains(terminator.merge_block)) ||
+		    (terminator.continue_block != nullptr &&
+		     !block_indices.contains(terminator.continue_block))) {
 			return Fail("value IR structured control target is missing");
 		}
 		if (successors != expected_successors) {
@@ -399,7 +532,8 @@ void ValidateProgram(const Program& program, bool require_ssa) {
 					                        ValueOpcodeName(inst.GetOpcode())));
 				}
 				const auto& memory = program.memory_info[memory_index];
-				if (memory.kind != ResourceKind::ScalarBuffer) {
+				if (memory.kind != ResourceKind::ScalarBuffer &&
+				    memory.kind != ResourceKind::IndirectBuffer) {
 					return Fail(fmt::format("{} has an invalid scalar-memory resource kind",
 					                        ValueOpcodeName(inst.GetOpcode())));
 				}
@@ -448,7 +582,7 @@ void ValidateProgram(const Program& program, bool require_ssa) {
 					return Fail(fmt::format("{} has an invalid memory-info index",
 					                        ValueOpcodeName(inst.GetOpcode())));
 				}
-				const auto& memory = program.memory_info[memory_index];
+				const auto& memory        = program.memory_info[memory_index];
 				const bool  vector_buffer = memory.kind == ResourceKind::Buffer ||
 				                            memory.kind == ResourceKind::IndirectBuffer;
 				if (!vector_buffer && memory.kind != ResourceKind::ScalarBuffer) {
@@ -457,7 +591,7 @@ void ValidateProgram(const Program& program, bool require_ssa) {
 				}
 				if (memory.kind == ResourceKind::IndirectBuffer &&
 				    !memory.SupportsIndirectBufferLoad(inst.GetOpcode())) {
-					return Fail("indirect buffer requires a raw DWORD x2/x3/x4 load");
+					return Fail("indirect buffer requires a scalar, raw DWORD x1/x2/x3/x4, or formatted X load");
 				}
 				if (buffer_components > 1u &&
 				    (!vector_buffer || memory.data_bits != 32u ||
@@ -640,7 +774,7 @@ void ValidateProgram(const Program& program, bool require_ssa) {
 				}
 			}
 		}
-		const auto& info = program.block_info[block_index];
+		const auto& info = *program.blocks[block_index];
 		if (!info.condition.IsEmpty() && !control_dominates(info.condition, block)) {
 			return Fail("value IR branch condition definition does not dominate its use");
 		}
@@ -651,9 +785,9 @@ void ValidateProgram(const Program& program, bool require_ssa) {
 }
 
 void ResolveControlFlowIdentities(Program& program) {
-	for (auto& info: program.block_info) {
-		info.condition       = info.condition.Resolve();
-		info.indirect_target = info.indirect_target.Resolve();
+	for (auto* block: program.blocks) {
+		block->condition       = block->condition.Resolve();
+		block->indirect_target = block->indirect_target.Resolve();
 	}
 }
 
@@ -688,9 +822,9 @@ std::string ProgramToString(const Program& program) {
 
 	std::string text;
 	for (size_t block_index = 0; block_index < program.blocks.size(); block_index++) {
-		text += fmt::format("Block ${} pc=0x{:08x}..0x{:08x}\n", block_index,
-		                    program.block_info[block_index].start_pc,
-		                    program.block_info[block_index].end_pc);
+		text +=
+		    fmt::format("Block ${} pc=0x{:08x}..0x{:08x}\n", block_index,
+		                program.blocks[block_index]->start_pc, program.blocks[block_index]->end_pc);
 		for (const auto& inst: *program.blocks[block_index]) {
 			const auto type = inst.GetType();
 			if (type != Type::Void) {

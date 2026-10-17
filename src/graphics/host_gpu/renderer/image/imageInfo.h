@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/gpu_format.h"
+#include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
@@ -12,8 +13,14 @@
 #include <bit>
 #include <cmath>
 #include <cstdint>
+#include <limits>
+#include <string_view>
+#include <vector>
+#include <vulkan/vulkan_format_traits.hpp>
 
 namespace Libs::Graphics {
+
+enum class ColorTransform : uint32_t { None, SwapBgra16, Reverse10_11_11 };
 
 enum class VideoOutCompression : uint8_t { Uncompressed, Dcc256_256_0, Dcc256_64_64, Unsupported };
 
@@ -23,7 +30,7 @@ struct ImageMetadataInfo {
 	GuestRange          range;
 	ImageMetadataKind   kind                 = ImageMetadataKind::None;
 	uint32_t            control              = 0;
-	uint32_t            clear_word           = 0;
+	uint64_t            clear_word           = 0;
 	VideoOutCompression compression          = VideoOutCompression::Uncompressed;
 	bool                stencil_compressed   = false;
 	bool                clear_register_valid = false;
@@ -45,11 +52,19 @@ struct ImageSubresourceRange {
 };
 
 struct ImageMipInfo {
+	// Guest mip chains run backwards within each layer or volume block-slice.
+	// Tail levels share an offset and use tail_x/tail_y within that block.
 	uint64_t offset                                 = 0;
 	uint64_t size                                   = 0;
 	// Padded dimensions in storage elements (compressed blocks for BC formats).
 	uint32_t pitch                                  = 0;
 	uint32_t height                                 = 0;
+	uint64_t linear_offset                          = 0;
+	uint64_t linear_size                            = 0; // Per transfer slice.
+	uint32_t linear_pitch                           = 0; // Storage elements.
+	uint32_t tail_x                                 = 0;
+	uint32_t tail_y                                 = 0;
+	uint32_t surface_z                              = 0;
 	auto     operator<=>(const ImageMipInfo&) const = default;
 };
 
@@ -69,7 +84,28 @@ struct ImageInfo {
 	Prospero::TileMode           tile_mode       = Prospero::TileMode::kLinear;
 	bool                         bgra16          = false;
 	std::array<ImageMipInfo, 16> mip_layout {};
+	TileTextureBlockLayout       tiling;
+	uint64_t                     tiled_slice_stride = 0;
+	// Nonzero for guest-linear and depth-plane transfers; tiled colors are mip-major.
+	uint64_t linear_slice_stride = 0;
+	uint32_t first_tail_level    = 16;
 
+	void                                           UpdateSize();
+	// False where the guest layout has no host tiling; UpdateSize exits there instead.
+	[[nodiscard]] bool                             TryUpdateSize();
+	[[nodiscard]] uint64_t                         LinearSize(uint32_t levels = 0) const;
+	[[nodiscard]] vk::Extent3D                     MipExtent(uint32_t level) const;
+	[[nodiscard]] std::vector<vk::BufferImageCopy> BufferCopies(uint64_t buffer_offset = 0,
+	                                                            uint32_t levels        = 0) const;
+
+	[[nodiscard]] ColorTransform GetColorTransform() const noexcept {
+		if (bgra16) return ColorTransform::SwapBgra16;
+		switch (guest_format) {
+			case Prospero::BufferFormat::k10_11_11Float:
+				return ColorTransform::Reverse10_11_11;
+			default: return ColorTransform::None;
+		}
+	}
 	[[nodiscard]] constexpr bool HasStencil() const noexcept { return !stencil.Empty(); }
 	[[nodiscard]] constexpr bool HasMetadata() const noexcept {
 		return metadata.kind != ImageMetadataKind::None;
@@ -91,7 +127,8 @@ struct ImageInfo {
 	}
 	[[nodiscard]] bool IsCompatible(const ImageInfo& other) const noexcept {
 		return pixel_format == other.pixel_format && samples == other.samples &&
-		       bytes_per_block == other.bytes_per_block;
+		       bytes_per_block == other.bytes_per_block &&
+		       GetColorTransform() == other.GetColorTransform();
 	}
 	[[nodiscard]] int32_t MipOf(const ImageInfo& container) const noexcept {
 		if (container.resources.levels > container.mip_layout.size()) {
@@ -330,8 +367,17 @@ struct VideoOutFormatPolicy {
 };
 
 inline constexpr uint64_t VIDEO_OUT_PIXEL_FORMAT_R10_G10_B10_A2_BT2100_PQ = 0x8100070422000000ull;
+inline constexpr uint64_t VIDEO_OUT_PIXEL_FORMAT_B10_G10_R10_A2_BT2100_PQ = 0x8100070400000000ull;
 
-inline constexpr std::array<VideoOutFormatPolicy, 7> VIDEO_OUT_FORMAT_POLICIES {{
+[[nodiscard]] constexpr bool IsHdrVideoOutPixelFormat(uint64_t format) {
+	switch (format) {
+		case VIDEO_OUT_PIXEL_FORMAT_R10_G10_B10_A2_BT2100_PQ:
+		case VIDEO_OUT_PIXEL_FORMAT_B10_G10_R10_A2_BT2100_PQ: return true;
+		default: return false;
+	}
+}
+
+inline constexpr std::array<VideoOutFormatPolicy, 8> VIDEO_OUT_FORMAT_POLICIES {{
     {0x8000000022000000ull,
      {vk::Format::eR8G8B8A8Srgb, Prospero::BufferFormat::k8_8_8_8Srgb, 4, false}},
     {0x8000000000000000ull,
@@ -342,6 +388,8 @@ inline constexpr std::array<VideoOutFormatPolicy, 7> VIDEO_OUT_FORMAT_POLICIES {
      {vk::Format::eA2R10G10B10UnormPack32, Prospero::BufferFormat::k10_10_10_2UNorm, 4, false}},
     {VIDEO_OUT_PIXEL_FORMAT_R10_G10_B10_A2_BT2100_PQ,
      {vk::Format::eA2B10G10R10UnormPack32, Prospero::BufferFormat::k10_10_10_2UNorm, 4, false}},
+    {VIDEO_OUT_PIXEL_FORMAT_B10_G10_R10_A2_BT2100_PQ,
+     {vk::Format::eA2R10G10B10UnormPack32, Prospero::BufferFormat::k10_10_10_2UNorm, 4, false}},
     {0xc001000622000000ull,
      {vk::Format::eR16G16B16A16Sfloat, Prospero::BufferFormat::k16_16_16_16Float, 8, false}},
     {0xc001000600000000ull,
@@ -371,75 +419,107 @@ inline constexpr std::array<VideoOutFormatPolicy, 7> VIDEO_OUT_FORMAT_POLICIES {
 	return false;
 }
 
-[[nodiscard]] inline bool DecodePackedColorClear(vk::Format format, uint32_t packed,
+// CB_COLOR_CLEAR_WORD1:WORD0 hold one pixel of the target in its own storage layout.
+[[nodiscard]] inline bool DecodePackedColorClear(vk::Format format, uint64_t packed,
                                                  vk::ClearColorValue& clear) {
-	vk::ClearColorValue next {};
-	const auto unorm8 = [](uint32_t value) { return static_cast<float>(value & 0xffu) / 255.0f; };
-	const auto srgb8  = [](uint32_t value) {
-		const auto encoded = static_cast<float>(value & 0xffu) / 255.0f;
-		return encoded <= 0.04045f ? encoded / 12.92f : std::pow((encoded + 0.055f) / 1.055f, 2.4f);
+	const auto components = vk::componentCount(format);
+	if (components == 0 || vk::blockSize(format) > sizeof(packed) ||
+	    std::string_view {vk::compressionScheme(format)} != "" ||
+	    format == vk::Format::eE5B9G9R9UfloatPack32) {
+		return false;
+	}
+	const auto small_float = [](uint64_t value, uint32_t bits, bool has_sign) {
+		const uint32_t mantissa_bits = bits == 16 ? 10u : bits - 5u - (has_sign ? 1u : 0u);
+		const auto     mantissa      = static_cast<uint32_t>(value & ((1u << mantissa_bits) - 1u));
+		const auto     exponent      = static_cast<int>((value >> mantissa_bits) & 0x1fu);
+		const bool     negative      = has_sign && ((value >> (bits - 1u)) & 1u) != 0;
+		float          result        = 0.0f;
+		if (exponent == 31) {
+			result = mantissa != 0 ? std::numeric_limits<float>::quiet_NaN()
+			                       : std::numeric_limits<float>::infinity();
+		} else if (exponent == 0) {
+			result =
+			    std::ldexp(static_cast<float>(mantissa), -14 - static_cast<int>(mantissa_bits));
+		} else {
+			result = std::ldexp(
+			    1.0f + std::ldexp(static_cast<float>(mantissa), -static_cast<int>(mantissa_bits)),
+			    exponent - 15);
+		}
+		return negative ? -result : result;
 	};
-	switch (format) {
-		// A single-plane float target carries its clear as raw float bits, the same encoding the
-		// depth decoder below uses. Without this the clear is discarded and the target keeps stale
-		// contents.
-		case vk::Format::eR32Sfloat: next.float32[0] = std::bit_cast<float>(packed); break;
-		case vk::Format::eR32Uint: next.uint32[0] = packed; break;
-		case vk::Format::eR32Sint: next.int32[0] = static_cast<int32_t>(packed); break;
-		case vk::Format::eR8G8B8A8Srgb:
-			next.float32[0] = srgb8(packed);
-			next.float32[1] = srgb8(packed >> 8u);
-			next.float32[2] = srgb8(packed >> 16u);
-			next.float32[3] = unorm8(packed >> 24u);
-			break;
-		case vk::Format::eB8G8R8A8Srgb:
-			next.float32[0] = srgb8(packed >> 16u);
-			next.float32[1] = srgb8(packed >> 8u);
-			next.float32[2] = srgb8(packed);
-			next.float32[3] = unorm8(packed >> 24u);
-			break;
-		case vk::Format::eR8G8B8A8Unorm:
-			next.float32[0] = unorm8(packed);
-			next.float32[1] = unorm8(packed >> 8u);
-			next.float32[2] = unorm8(packed >> 16u);
-			next.float32[3] = unorm8(packed >> 24u);
-			break;
-		case vk::Format::eB8G8R8A8Unorm:
-			next.float32[0] = unorm8(packed >> 16u);
-			next.float32[1] = unorm8(packed >> 8u);
-			next.float32[2] = unorm8(packed);
-			next.float32[3] = unorm8(packed >> 24u);
-			break;
-		case vk::Format::eA2B10G10R10UnormPack32:
-			next.float32[0] = static_cast<float>(packed & 0x3ffu) / 1023.0f;
-			next.float32[1] = static_cast<float>((packed >> 10u) & 0x3ffu) / 1023.0f;
-			next.float32[2] = static_cast<float>((packed >> 20u) & 0x3ffu) / 1023.0f;
-			next.float32[3] = static_cast<float>((packed >> 30u) & 0x3u) / 3.0f;
-			break;
-		case vk::Format::eA2R10G10B10UnormPack32:
-			next.float32[0] = static_cast<float>((packed >> 20u) & 0x3ffu) / 1023.0f;
-			next.float32[1] = static_cast<float>((packed >> 10u) & 0x3ffu) / 1023.0f;
-			next.float32[2] = static_cast<float>(packed & 0x3ffu) / 1023.0f;
-			next.float32[3] = static_cast<float>((packed >> 30u) & 0x3u) / 3.0f;
-			break;
-		default: return false;
+	vk::ClearColorValue next {};
+	uint32_t            total_bits = 0;
+	for (uint8_t component = 0; component < components; component++) {
+		total_bits += vk::componentBits(format, component);
+	}
+	// Packed formats name their components from the most significant bit down.
+	const bool packed_order = vk::packed(format) != 0;
+	uint32_t   shift        = packed_order ? total_bits : 0u;
+	for (uint8_t component = 0; component < components; component++) {
+		const uint32_t bits = vk::componentBits(format, component);
+		if (bits == 0 || bits > 32) {
+			return false;
+		}
+		if (packed_order) {
+			shift -= bits;
+		}
+		const uint64_t value = (packed >> shift) & ((uint64_t {1} << bits) - 1u);
+		if (!packed_order) {
+			shift += bits;
+		}
+		const std::string_view name    = vk::componentName(format, component);
+		const std::string_view numeric = vk::componentNumericFormat(format, component);
+		const int lane = name == "R" ? 0 : name == "G" ? 1 : name == "B" ? 2 : name == "A" ? 3 : -1;
+		if (lane < 0) {
+			return false;
+		}
+		const auto max_unsigned = static_cast<float>((uint64_t {1} << bits) - 1u);
+		const auto max_signed   = static_cast<float>((uint64_t {1} << (bits - 1u)) - 1u);
+		const auto sign_extended =
+		    static_cast<int64_t>(value << (64u - bits)) >> static_cast<int>(64u - bits);
+		if (numeric == "UNORM" || (numeric == "SRGB" && lane == 3)) {
+			next.float32[lane] = static_cast<float>(value) / max_unsigned;
+		} else if (numeric == "SRGB") {
+			const auto encoded = static_cast<float>(value) / max_unsigned;
+			next.float32[lane] = encoded <= 0.04045f ? encoded / 12.92f
+			                                         : std::pow((encoded + 0.055f) / 1.055f, 2.4f);
+		} else if (numeric == "SNORM") {
+			next.float32[lane] = std::max(static_cast<float>(sign_extended) / max_signed, -1.0f);
+		} else if (numeric == "UINT") {
+			next.uint32[lane] = static_cast<uint32_t>(value);
+		} else if (numeric == "SINT") {
+			next.int32[lane] = static_cast<int32_t>(sign_extended);
+		} else if (numeric == "SFLOAT" && bits == 32) {
+			next.float32[lane] = std::bit_cast<float>(static_cast<uint32_t>(value));
+		} else if (numeric == "SFLOAT" && bits == 16) {
+			next.float32[lane] = small_float(value, bits, true);
+		} else if (numeric == "UFLOAT" && (bits == 10 || bits == 11)) {
+			next.float32[lane] = small_float(value, bits, false);
+		} else {
+			return false;
+		}
 	}
 	clear = next;
 	return true;
 }
 
 // Unlike a register clear, a DWORD fill repeats the same word across the entire pixel.
-// Keep this separate: the first register word alone cannot describe a 64-bit color.
 [[nodiscard]] inline bool DecodeColorDwordFill(vk::Format format, uint32_t packed,
                                                vk::ClearColorValue& clear) {
-	if (format == vk::Format::eR16G16B16A16Sfloat) {
-		if (packed != 0) {
-			return false;
-		}
-		clear = vk::ClearColorValue {};
-		return true;
+	const auto pixel_bytes = vk::blockSize(format);
+	if (pixel_bytes == 0 ||
+	    (pixel_bytes != sizeof(uint64_t) && sizeof(uint32_t) % pixel_bytes != 0)) {
+		return false;
 	}
-	return DecodePackedColorClear(format, packed, clear);
+	if (pixel_bytes < sizeof(uint32_t)) {
+		const uint32_t pixel_mask = (1u << (pixel_bytes * 8u)) - 1u;
+		for (uint32_t shift = pixel_bytes * 8u; shift < 32u; shift += pixel_bytes * 8u) {
+			if (((packed >> shift) & pixel_mask) != (packed & pixel_mask)) {
+				return false;
+			}
+		}
+	}
+	return DecodePackedColorClear(format, packed | (uint64_t {packed} << 32u), clear);
 }
 
 [[nodiscard]] inline bool DecodePackedStencilClear(uint32_t packed, uint8_t& clear) {

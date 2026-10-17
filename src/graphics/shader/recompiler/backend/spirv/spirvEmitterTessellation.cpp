@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 
 #include <algorithm>
+#include <array>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
@@ -16,13 +17,20 @@ uint32_t TessellationPointer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto storage = input ? spv::StorageClassInput : spv::StorageClassOutput;
 	const auto pointer = state.builder.AllocateId();
 	if (kind == Attribute::Factor) {
-		EXIT_NOT_IMPLEMENTED(!inst.Arg(1).IsImmediate());
-		const auto index = inst.Arg(1).U32() / 4u;
-		const auto outer = index < 3u;
-		EXIT_NOT_IMPLEMENTED(index >= 4u);
+		// D3D factor order matches Vulkan's, except an isoline lists detail before density.
+		const uint32_t outer_count = tess.domain == 2u ? 4u : tess.domain == 1u ? 3u : 2u;
+		const uint32_t inner_count = tess.domain == 2u ? 2u : tess.domain == 1u ? 1u : 0u;
+		if (!inst.Arg(1).IsImmediate() || inst.Arg(1).U32() / 4u >= outer_count + inner_count) {
+			return ctx.Refuse(inst, "tessellation factor needs a constant index within the domain");
+		}
+		auto       index = inst.Arg(1).U32() / 4u;
+		const auto outer = index < outer_count;
+		if (tess.domain == 0u) {
+			index ^= 1u;
+		}
 		state.builder.AddFunction(spv::OpAccessChain, TypePointer(state, storage, TypeF32(state)),
 		                          pointer, outer ? variable : state.tess_inner_variable,
-		                          ConstantU32(state, outer ? index : index - 3u));
+		                          ConstantU32(state, outer ? index : index - outer_count));
 		return pointer;
 	}
 	auto address = ctx.Arg(inst, 1);
@@ -70,7 +78,10 @@ void DefineTessellationInterfaces(EmitterState& state) {
 			const auto kind = inst.Arg(0).U32();
 			used.at(kind)   = true;
 			if (kind == static_cast<uint32_t>(Attribute::PatchOutput)) {
-				EXIT_NOT_IMPLEMENTED(!inst.Arg(1).IsImmediate());
+				if (!inst.Arg(1).IsImmediate()) {
+					state.Refuse("patch output needs a constant address", &inst);
+					return;
+				}
 				patch_begin = std::min(patch_begin, inst.Arg(1).U32());
 				patch_end   = std::max(patch_end, inst.Arg(1).U32() + 4u);
 			}
@@ -124,16 +135,31 @@ void DefineTessellationInterfaces(EmitterState& state) {
 
 void DefineTessellationExecutionModes(EmitterState& state) {
 	const auto& tess = state.input_info.vertex->tess;
-	EXIT_NOT_IMPLEMENTED(tess.domain != 1u || tess.partitioning != 2u ||
-	                     tess.output_topology != 2u);
+	// VGT_TF_PARAM encodings; Vulkan has no pow2 spacing, so it falls back to equal.
+	static constexpr std::array domains {spv::ExecutionModeIsolines, spv::ExecutionModeTriangles,
+	                                     spv::ExecutionModeQuads};
+	static constexpr std::array spacings {
+	    spv::ExecutionModeSpacingEqual, spv::ExecutionModeSpacingEqual,
+	    spv::ExecutionModeSpacingFractionalOdd, spv::ExecutionModeSpacingFractionalEven};
+	const bool line_output = tess.output_topology == 1u;
+	if (tess.domain >= domains.size() || tess.partitioning >= spacings.size() ||
+	    tess.output_topology > 3u || line_output != (tess.domain == 0u)) {
+		state.Refuse("unsupported tessellation domain, partitioning or topology");
+	}
 	state.builder.RequireCapability(spv::CapabilityTessellation);
 	if (state.program.stage == ShaderType::TessellationControl) {
 		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeOutputVertices,
 		                               tess.output_control_points);
-	} else {
-		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeTriangles);
-		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeSpacingFractionalOdd);
-		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeVertexOrderCw);
+	} else if (tess.domain < domains.size() && tess.partitioning < spacings.size()) {
+		state.builder.AddExecutionMode(state.main_func, domains[tess.domain]);
+		state.builder.AddExecutionMode(state.main_func, spacings[tess.partitioning]);
+		if (tess.output_topology == 0u) {
+			state.builder.AddExecutionMode(state.main_func, spv::ExecutionModePointMode);
+		} else if (!line_output) {
+			state.builder.AddExecutionMode(state.main_func, tess.output_topology == 2u
+			                                                    ? spv::ExecutionModeVertexOrderCw
+			                                                    : spv::ExecutionModeVertexOrderCcw);
+		}
 	}
 }
 

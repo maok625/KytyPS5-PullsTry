@@ -89,6 +89,10 @@ struct ShaderMeshInputInfo: ShaderWorkgroupInputInfo {
 	uint32_t max_primitives       = 0;
 	uint32_t provoking_vertex     = 0;
 	bool     fast_launch          = false;
+	// SPI_SHADER_PGM_RSRC1_GS.GS_VGPR_COMP_CNT / SPI_SHADER_PGM_RSRC2_GS.ES_VGPR_COMP_CNT: the
+	// index of the last VGPR the SPI pre-loads for each half of the merged ES/GS wave.
+	uint32_t gs_vgpr_component_count = 0;
+	uint32_t es_vgpr_component_count = 0;
 
 	[[nodiscard]] constexpr uint32_t InputPrimitiveSize() const {
 		switch (static_cast<Prospero::PrimitiveType>(input_primitive)) {
@@ -141,20 +145,28 @@ struct ShaderVertexInputInfo {
 	ShaderClipSpaceTransform clip_space;
 	ShaderMeshInputInfo      mesh;
 	ShaderTessellationInputInfo tess;
+	uint32_t                    param_duplicate_mask = 0;
+	uint8_t                     param_duplicate_source[32] {};
 	bool                    fetch_external      = false;
 	bool                    fetch_embedded      = false;
 };
 
 struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
+	bool               async_compute              = false;
 	uint8_t            float_mode                 = 0xc0;
 	uint32_t           dispatch_threads_num[3]    = {0, 0, 0};
+	uint32_t           workgroup_counts[3]        = {0, 0, 0};
 	bool               group_id[3]                = {false, false, false};
 	bool               dispatch_thread_dimensions = false;
+	bool               lds_storage                = false;
 	int                thread_ids_num             = 0;
 	int                workgroup_register         = 0;
 	bool               tg_size_en                 = false;
 	ShaderStageRuntime stage;
 };
+
+enum class ShaderAlphaBlendSource : uint8_t { None, SourceAlpha, SourceAlphaOne, SourceAlphaZero };
+enum class ShaderPixelParameterMode : uint8_t { FirstVertex, LastVertex, Rectangle };
 
 struct ShaderPixelInputInfo {
 	uint32_t                                       interpolator_settings[32]    = {0};
@@ -163,8 +175,10 @@ struct ShaderPixelInputInfo {
 	uint32_t                                       ps_system_input_base         = 0;
 	uint32_t                                       custom_interpolation_mask    = 0;
 	uint32_t                                       ps_perspective_center_vgpr   = UINT32_MAX;
+	uint32_t                                       ps_perspective_sample_vgpr   = UINT32_MAX;
 	uint32_t                                       ps_perspective_centroid_vgpr = UINT32_MAX;
 	uint8_t                                        target_output_mode[8]        = {};
+	uint32_t                                       target_shader_mask           = UINT32_MAX;
 	std::array<Prospero::ColorComponentMapping, 8> target_export_mapping        = {};
 	uint32_t                                       scratch_size_dwords          = 0;
 	bool                                           ps_pos_x                     = false;
@@ -174,13 +188,19 @@ struct ShaderPixelInputInfo {
 	bool                                           ps_front_face                = false;
 	bool                                           ps_ancillary                 = false;
 	bool                                           ps_no_perspective            = false;
+	ShaderPixelParameterMode                       parameter_mode = ShaderPixelParameterMode::FirstVertex;
 	bool                                           ps_pixel_kill_enable         = false;
 	bool                                           ps_depth_export_enable       = false;
 	bool                                           ps_sample_mask_export_enable = false;
+	// DB_SHADER_CONTROL's stencil reference exports. The hardware ignores DB_STENCILREFMASK for
+	// whichever of the two is exported; MRTZ channel 1 carries test value 7:0, op value 15:8.
+	bool                                           ps_stencil_test_val_export_enable = false;
+	bool                                           ps_stencil_op_val_export_enable   = false;
+	uint8_t                                        ps_stencil_bit_pass               = 0;
 	bool                                           ps_sample_shading            = false;
 	bool                                           dual_source_blending         = false;
-	// Export logical alpha through MRT1 for blending after channel swizzling.
-	bool                                           alpha_blend_source_remap     = false;
+	// Export logical alpha or per-channel source factors through MRT1 after channel swizzling.
+	ShaderAlphaBlendSource                         alpha_blend_source = ShaderAlphaBlendSource::None;
 	bool                                           ps_early_z                   = false;
 	bool                                           ps_execute_on_noop           = false;
 	ShaderStageRuntime                             stage;
@@ -208,6 +228,14 @@ uint32_t ShaderPixelParameterLocation(const ShaderPixelInputInfo& info,
                                       std::span<const uint32_t> active_inputs, uint32_t input);
 bool     ShaderPixelParameterIsFlat(const ShaderPixelInputInfo& info, uint32_t input);
 bool     ShaderPixelParameterIsCustom(const ShaderPixelInputInfo& info, uint32_t input);
+bool     ShaderPixelParameterGroupIsFlat(const ShaderPixelInputInfo& info,
+                                         std::span<const uint32_t> active_inputs, uint32_t input);
+bool     ShaderPixelParameterIsDefault(const ShaderPixelInputInfo& info, uint32_t input);
+uint32_t ShaderPixelParameterDefaultComponent(const ShaderPixelInputInfo& info, uint32_t input,
+                                              uint32_t component);
+void     ShaderPixelParameterDuplicates(const ShaderPixelInputInfo& info,
+                                        std::span<const uint32_t> active_inputs, uint32_t& mask,
+                                        uint8_t (&source)[32]);
 
 struct ShaderSharp {
 	uint16_t offset_dw : 15;
@@ -305,6 +333,7 @@ struct ShaderMappedData {
 
 void ShaderInit();
 void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data);
+uint32_t ShaderPixelExportTarget(uint32_t shader_mask, uint32_t export_index);
 
 void     ShaderDbgDumpInputInfo(const ShaderVertexInputInfo& info);
 void     ShaderDbgDumpInputInfo(const ShaderPixelInputInfo& info);

@@ -6,6 +6,7 @@
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/presentation/videoOut.h"
@@ -184,7 +185,6 @@ static HW::RenderControl DecodeRenderControl(uint32_t value) {
 	    KYTY_PM4_GET(value, DB_RENDER_CONTROL, COPY_STENCIL_TO_COLOR) != 0;
 	r.copy_centroid          = KYTY_PM4_GET(value, DB_RENDER_CONTROL, COPY_CENTROID) != 0;
 	r.copy_sample            = KYTY_PM4_GET(value, DB_RENDER_CONTROL, COPY_SAMPLE);
-	EXIT_NOT_IMPLEMENTED(r.copy_depth_to_color || r.copy_stencil_to_color);
 
 	return r;
 }
@@ -1306,6 +1306,9 @@ KYTY_CP_OP_PARSER(CpOpAcquireMem) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0055800 && cmd_id != 0xc0061050);
+	if (GuestSyncOnly()) {
+		cp.EmitGlobalBarrier();
+	}
 	return (cmd_id == 0xc0061050 ? 7 : 6);
 }
 
@@ -1332,6 +1335,7 @@ KYTY_CP_OP_PARSER(CpOpDispatchIndirect) {
 
 	if (cmd_id == 0xc0021600) {
 		cp.DispatchIndirect(buffer[0] | (static_cast<uint64_t>(buffer[1]) << 32u), buffer[2]);
+
 		return 3;
 	}
 
@@ -1642,8 +1646,12 @@ KYTY_CP_OP_PARSER(CpOpDrawIndirect) {
 	const auto data_offset    = buffer[0];
 	const auto draw_initiator = buffer[3];
 	const bool indexed        = (cmd_id == 0xc0032500);
+	// The native indexed packet enables the high-half first-index destination in word 3.
+	const IndirectDrawRegisters registers {
+	    buffer[1] & 0xffffu, buffer[2] & 0xffffu,
+	    indexed && (buffer[2] & (1u << 28u)) != 0 ? buffer[1] >> 16u : Pm4::SH_NOP};
 
-	cp.DrawIndirect(data_offset, draw_initiator, indexed);
+	cp.DrawIndirect(data_offset, registers, draw_initiator, indexed);
 
 	return 4;
 }
@@ -1661,13 +1669,17 @@ KYTY_CP_OP_PARSER(CpOpDrawIndirectMulti) {
 	const auto stride_in_bytes = buffer[7];
 	const auto draw_initiator  = buffer[8];
 	const bool indexed         = (cmd_id == 0xc0083800);
+	// Multi-draw moves the first-index enable to word 4; the destinations stay in 2/3.
+	const IndirectDrawRegisters registers {
+	    buffer[1] & 0xffffu, buffer[2] & 0xffffu,
+	    indexed && (buffer[3] & (1u << 28u)) != 0 ? buffer[1] >> 16u : Pm4::SH_NOP};
 
 	if (count_indirect == 0) {
 		count_addr = nullptr;
 	}
 
 	cp.DrawIndirectMulti(data_offset, max_count_or_count, count_addr, stride_in_bytes,
-	                     draw_initiator, indexed);
+	                     registers, draw_initiator, indexed);
 
 	return 9;
 }
@@ -1927,13 +1939,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectBuffer) {
 
 	auto* indirect_buffer =
 	    reinterpret_cast<const uint32_t*>(buffer[0] | (static_cast<uint64_t>(buffer[1]) << 32u));
-	uint32_t                     indirect_num_dw = control & 0xfffffu;
-	static std::atomic<uint32_t> indirect_log_count {0};
-	if (indirect_log_count.fetch_add(1) < 128) {
-		LOGF("\t indirect buffer: addr=0x%016" PRIx64 ", num_dw=%" PRIu32 ", control=0x%08" PRIx32
-		     "\n",
-		     reinterpret_cast<uint64_t>(indirect_buffer), indirect_num_dw, control);
-	}
+	const uint32_t indirect_num_dw = control & 0xfffffu;
 
 	if (indirect_num_dw == 0) {
 		return 3;
@@ -3148,7 +3154,11 @@ void GraphicsInitJmpTablesCxIndirect() {
 
 	g_hw_ctx_indirect_func[Pm4::DB_SHADER_CONTROL] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
 		HW::DepthShaderControl db_shader_control {};
-		db_shader_control.other_bits = value & 0xFFFF908Eu;
+		db_shader_control.other_bits = value & 0xFFFF9088u;
+		db_shader_control.shader_stencil_test_val_export_enable =
+		    KYTY_PM4_GET(value, DB_SHADER_CONTROL, STENCIL_TEST_VAL_EXPORT_ENABLE) != 0;
+		db_shader_control.shader_stencil_op_val_export_enable =
+		    KYTY_PM4_GET(value, DB_SHADER_CONTROL, STENCIL_OP_VAL_EXPORT_ENABLE) != 0;
 		db_shader_control.conservative_z_export_value =
 		    KYTY_PM4_GET(value, DB_SHADER_CONTROL, CONSERVATIVE_Z_EXPORT);
 		db_shader_control.shader_z_behavior = KYTY_PM4_GET(value, DB_SHADER_CONTROL, Z_ORDER);

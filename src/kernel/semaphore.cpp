@@ -198,12 +198,6 @@ KernelSemaPrivate::Result KernelSemaPrivate::Wait(int need_count, uint32_t* ptr_
 		infinitely = false;
 	}
 
-	uint32_t      elapsed = 0;
-	Common::Timer t;
-	t.Start();
-
-	int id = Common::Thread::GetThreadIdUnique();
-
 	if (m_count >= need_count) {
 		m_count -= need_count;
 		if (ptr_micros != nullptr) {
@@ -215,6 +209,12 @@ KernelSemaPrivate::Result KernelSemaPrivate::Wait(int need_count, uint32_t* ptr_
 	if (!infinitely && micros == 0) {
 		return Result::TimedOut;
 	}
+
+	uint32_t      elapsed = 0;
+	Common::Timer t;
+	t.Start();
+
+	int id = Common::Thread::GetThreadIdUnique();
 
 	WaitingThread waiter {};
 	waiter.id         = id;
@@ -255,9 +255,7 @@ int KYTY_SYSV_ABI KernelCreateSema(KernelSema* sem, const char* name, uint32_t a
                                    int max, void* opt) {
 	PRINT_NAME();
 
-	EXIT_NOT_IMPLEMENTED(sem == nullptr);
-
-	if (name == nullptr || attr > 2 || init < 0 || max <= 0 || init > max) {
+	if (sem == nullptr || name == nullptr || attr > 2 || init < 0 || max <= 0 || init > max) {
 		return KERNEL_ERROR_EINVAL;
 	}
 

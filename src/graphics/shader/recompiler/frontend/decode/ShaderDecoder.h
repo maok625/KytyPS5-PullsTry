@@ -12,7 +12,7 @@ namespace Libs::Graphics::ShaderRecompiler::Decoder {
 
 // PS5 flat stack addresses use these SH_MEM_BASES aperture tags in VA[63:32].
 constexpr uint32_t PrivateApertureHigh = 0x70000000u;
-constexpr uint32_t SharedApertureHigh = 0x80000000u;
+constexpr uint32_t SharedApertureHigh  = 0x80000000u;
 
 enum class Family {
 	Unknown,
@@ -45,11 +45,17 @@ enum class Opcode {
 	S_CMOV_B64,
 	S_MOVK_I32,
 	S_ABS_I32,
+	S_SEXT_I32_I8,
+	S_SEXT_I32_I16,
 	S_ABSDIFF_I32,
 	S_BREV_B32,
 	S_BREV_B64,
+	S_BCNT0_I32_B32,
+	S_BCNT0_I32_B64,
 	S_BCNT1_I32_B32,
 	S_BCNT1_I32_B64,
+	S_FF0_I32_B32,
+	S_FF0_I32_B64,
 	S_FF1_I32_B32,
 	S_FF1_I32_B64,
 	S_FLBIT_I32_B32,
@@ -58,6 +64,7 @@ enum class Opcode {
 	S_QUADMASK_B64,
 	S_GETPC_B64,
 	S_SETPC_B64,
+	S_SWAPPC_B64,
 	S_SUBVECTOR_LOOP_BEGIN,
 	S_SUBVECTOR_LOOP_END,
 	S_AND_SAVEEXEC_B32,
@@ -186,10 +193,14 @@ enum class Opcode {
 	V_RCP_F32,
 	V_RCP_IFLAG_F32,
 	V_FRACT_F32,
+	V_FRACT_F64,
 	V_TRUNC_F32,
+	V_TRUNC_F64,
 	V_CEIL_F32,
+	V_CEIL_F64,
 	V_RNDNE_F32,
 	V_FLOOR_F32,
+	V_FLOOR_F64,
 	V_EXP_F32,
 	V_LOG_F32,
 	V_RSQ_F32,
@@ -220,6 +231,9 @@ enum class Opcode {
 	V_MAC_F32,
 	V_MADMK_F32,
 	V_MADAK_F32,
+	V_FMAC_F32,
+	V_FMAMK_F32,
+	V_FMAAK_F32,
 	V_MIN_F32,
 	V_MAX_F32,
 	V_ADD_F16,
@@ -247,6 +261,8 @@ enum class Opcode {
 	V_FMA_F64,
 	V_ADD_F64,
 	V_MUL_F64,
+	V_MIN_F64,
+	V_MAX_F64,
 	V_FMA_F32,
 	V_FMA_F16,
 	V_PACK_B32_F16,
@@ -259,6 +275,7 @@ enum class Opcode {
 	V_MIN3_I32,
 	V_MIN3_U32,
 	V_MIN3_F16,
+	V_MIN3_U16,
 	V_MAX3_F32,
 	V_MAX3_I32,
 	V_MAX3_U32,
@@ -361,10 +378,38 @@ enum class Opcode {
 	V_CMP_NEQ_F32,
 	V_CMP_NLT_F32,
 	V_CMP_TRU_F32,
+	V_CMP_F_F64,
+	V_CMP_LT_F64,
 	V_CMP_EQ_F64,
 	V_CMP_LE_F64,
+	V_CMP_GT_F64,
+	V_CMP_LG_F64,
+	V_CMP_GE_F64,
+	V_CMP_O_F64,
+	V_CMP_U_F64,
+	V_CMP_NGE_F64,
+	V_CMP_NLG_F64,
+	V_CMP_NGT_F64,
+	V_CMP_NLE_F64,
+	V_CMP_NEQ_F64,
+	V_CMP_NLT_F64,
+	V_CMP_TRU_F64,
+	V_CMPX_F_F64,
+	V_CMPX_LT_F64,
+	V_CMPX_EQ_F64,
 	V_CMPX_LE_F64,
+	V_CMPX_GT_F64,
+	V_CMPX_LG_F64,
 	V_CMPX_GE_F64,
+	V_CMPX_O_F64,
+	V_CMPX_U_F64,
+	V_CMPX_NGE_F64,
+	V_CMPX_NLG_F64,
+	V_CMPX_NGT_F64,
+	V_CMPX_NLE_F64,
+	V_CMPX_NEQ_F64,
+	V_CMPX_NLT_F64,
+	V_CMPX_TRU_F64,
 	V_CMPX_LT_F32,
 	V_CMPX_EQ_F32,
 	V_CMPX_LE_F32,
@@ -372,6 +417,7 @@ enum class Opcode {
 	V_CMPX_LG_F32,
 	V_CMPX_GE_F32,
 	V_CMPX_O_F32,
+	V_CMPX_U_F32,
 	V_CMPX_NGE_F32,
 	V_CMPX_NLG_F32,
 	V_CMPX_NGT_F32,
@@ -388,6 +434,8 @@ enum class Opcode {
 	V_CMP_T_I32,
 	V_CMP_CLASS_F32,
 	V_CMPX_CLASS_F32,
+	V_CMP_CLASS_F16,
+	V_CMPX_CLASS_F16,
 	V_CMP_LT_I16,
 	V_CMP_EQ_I16,
 	V_CMP_LE_I16,
@@ -432,6 +480,7 @@ enum class Opcode {
 	V_CMPX_LT_U16,
 	V_CMPX_EQ_U16,
 	V_CMPX_GT_U16,
+	V_CMPX_NE_U16,
 	V_CMP_NE_U16,
 	V_CMP_GE_U16,
 	V_CMP_F_U32,
@@ -442,18 +491,39 @@ enum class Opcode {
 	V_CMP_NE_U32,
 	V_CMP_GE_U32,
 	V_CMP_T_U32,
-	V_CMP_EQ_I64,
+	// Keep V_CMP_F_I64 to V_CMPX_T_U64 contiguous: VectorAluOps.cpp tests this range.
+	V_CMP_F_I64,
 	V_CMP_LT_I64,
+	V_CMP_EQ_I64,
 	V_CMP_LE_I64,
+	V_CMP_GT_I64,
+	V_CMP_NE_I64,
+	V_CMP_GE_I64,
+	V_CMP_T_I64,
+	V_CMP_F_U64,
 	V_CMP_LT_U64,
 	V_CMP_EQ_U64,
 	V_CMP_LE_U64,
 	V_CMP_GT_U64,
 	V_CMP_NE_U64,
 	V_CMP_GE_U64,
+	V_CMP_T_U64,
+	V_CMPX_F_I64,
+	V_CMPX_LT_I64,
+	V_CMPX_EQ_I64,
+	V_CMPX_LE_I64,
+	V_CMPX_GT_I64,
 	V_CMPX_NE_I64,
+	V_CMPX_GE_I64,
+	V_CMPX_T_I64,
+	V_CMPX_F_U64,
+	V_CMPX_LT_U64,
+	V_CMPX_EQ_U64,
 	V_CMPX_LE_U64,
+	V_CMPX_GT_U64,
 	V_CMPX_NE_U64,
+	V_CMPX_GE_U64,
+	V_CMPX_T_U64,
 	V_CMPX_LT_U32,
 	V_CMPX_EQ_U32,
 	V_CMPX_LE_U32,
@@ -476,14 +546,18 @@ enum class Opcode {
 	BUFFER_LOAD_FORMAT_XY,
 	BUFFER_LOAD_FORMAT_XYZ,
 	BUFFER_LOAD_FORMAT_XYZW,
+	BUFFER_LOAD_FORMAT_D16_X,
 	BUFFER_STORE_FORMAT_X,
 	BUFFER_STORE_FORMAT_XY,
 	BUFFER_STORE_FORMAT_XYZ,
 	BUFFER_STORE_FORMAT_XYZW,
+	BUFFER_STORE_FORMAT_D16_X,
 	BUFFER_LOAD_UBYTE,
 	BUFFER_LOAD_SBYTE,
 	BUFFER_LOAD_USHORT,
 	BUFFER_LOAD_SSHORT,
+	BUFFER_LOAD_SHORT_D16,
+	BUFFER_LOAD_SHORT_D16_HI,
 	BUFFER_LOAD_DWORD,
 	BUFFER_LOAD_DWORDX2,
 	BUFFER_LOAD_DWORDX3,
@@ -522,6 +596,7 @@ enum class Opcode {
 	FLAT_LOAD_SBYTE,
 	FLAT_LOAD_USHORT,
 	FLAT_LOAD_SSHORT,
+	FLAT_LOAD_SHORT_D16,
 	FLAT_LOAD_DWORD,
 	FLAT_LOAD_DWORDX2,
 	FLAT_LOAD_DWORDX3,
@@ -549,6 +624,8 @@ enum class Opcode {
 	DS_MIN_RTN_U32,
 	DS_MAX_U32,
 	DS_MAX_RTN_U32,
+	DS_MAX_RTN_U64,
+	DS_CMPST_RTN_B64,
 	DS_AND_B32,
 	DS_AND_RTN_B32,
 	DS_OR_B32,
@@ -556,13 +633,16 @@ enum class Opcode {
 	DS_OR_RTN_B32,
 	DS_XOR_B32,
 	DS_XOR_RTN_B32,
+	DS_MSKOR_B32,
 	DS_WRXCHG_RTN_B32,
 	DS_MIN_F32,
 	DS_MAX_F32,
 	DS_SWIZZLE_B32,
+	DS_PERMUTE_B32,
 	DS_BPERMUTE_B32,
 	DS_CONSUME,
 	DS_APPEND,
+	DS_ORDERED_COUNT,
 	DS_READ_I8,
 	DS_READ_U8,
 	DS_READ_I16,
@@ -611,20 +691,14 @@ enum class Opcode {
 	IMAGE_ATOMIC_FMIN,
 	IMAGE_ATOMIC_FMAX,
 	IMAGE_SAMPLE,
-	IMAGE_GATHER4_L,
-	IMAGE_GATHER4_LZ,
-	IMAGE_GATHER4_C,
-	IMAGE_GATHER4_C_LZ,
-	IMAGE_GATHER4_LZ_O,
-	IMAGE_GATHER4_C_O,
-	IMAGE_GATHER4_C_LZ_O,
-	IMAGE_GATHER4H,
+	IMAGE_GATHER4,
 	V_INTERP_P1_F32,
 	V_INTERP_P2_F32,
 	V_INTERP_MOV_F32,
 
 	S_NOP,
 	S_WAITCNT,
+	S_WAITCNT_VSCNT,
 	S_WAITCNT_DEPCTR,
 	S_BARRIER,
 	S_BRANCH,
@@ -635,8 +709,11 @@ enum class Opcode {
 	S_CBRANCH_EXECZ,
 	S_CBRANCH_EXECNZ,
 	S_CBRANCH_CDBGSYS,
+	S_CBRANCH_CDBGUSER,
 	S_CBRANCH_CDBGSYS_OR_USER,
+	S_CBRANCH_CDBGSYS_AND_USER,
 	S_SENDMSG,
+	S_GETREG_B32,
 	S_SETREG_B32,
 	S_SLEEP,
 	S_TRAP,
@@ -775,16 +852,17 @@ struct Instruction {
 struct Program {
 	std::span<const uint32_t> code;
 	std::vector<Instruction>  instructions;
+	bool                     has_swap_pc = false;
 };
 
 // Code spans are trusted to contain complete instructions, valid branch targets, and 32-bit PCs.
 Family GetInstructionFamily(uint32_t word);
 // The output object must be freshly initialized.
-void DecodeInstruction(std::span<const uint32_t> code, uint32_t word_index, Instruction& inst);
+void    DecodeInstruction(std::span<const uint32_t> code, uint32_t word_index, Instruction& inst);
 Program DecodeFrontProgram(std::span<const uint32_t> front);
-void DecodeProgram(std::span<const uint32_t> code, Program& program);
-bool IsConditionalBranch(Opcode opcode);
-bool IsDirectBranch(Opcode opcode);
+void    DecodeProgram(std::span<const uint32_t> code, Program& program);
+bool    IsConditionalBranch(Opcode opcode);
+bool    IsDirectBranch(Opcode opcode);
 
 void DecodeScalarSource(uint32_t code, uint32_t pc, Operand& operand);
 void DecodeScalarDestination(uint32_t code, uint32_t pc, Operand& operand);
@@ -795,8 +873,23 @@ void SetRawWords(Instruction& inst, std::span<const uint32_t> code, uint32_t wor
 void SetUnsupported(Instruction& inst, Family family, uint32_t opcode_id, const char* reason);
 std::string OperandToString(const Operand& operand);
 const char* ImageDimensionToString(ImageDimension dimension);
+
+// On an atomic, GLC returns the pre-operation value in VDATA and carries no cache meaning.
+bool        GlcSelectsAtomicReturnValue(Opcode opcode);
 std::string InstructionToString(const Instruction& inst);
 std::string ProgramToString(const Program& program);
+
+class DecodeContextScope {
+public:
+	DecodeContextScope(uint64_t hash, const void* code);
+	~DecodeContextScope();
+	DecodeContextScope(const DecodeContextScope&)            = delete;
+	DecodeContextScope& operator=(const DecodeContextScope&) = delete;
+
+private:
+	uint64_t    m_previous_hash = 0;
+	const void* m_previous_code = nullptr;
+};
 
 } // namespace Libs::Graphics::ShaderRecompiler::Decoder
 

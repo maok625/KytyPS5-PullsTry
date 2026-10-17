@@ -44,15 +44,26 @@ constexpr bool IsConfiguredUserIdValid(int32_t user_id) {
 struct ConfigOptions {
 	uint32_t               screen_width                = 1280;
 	uint32_t               screen_height               = 720;
+	// What the guest is told its display is, which is what it renders for. Zero follows the
+	// window, which is what this always did; setting it larger lets a title render at its own
+	// native resolution and land in a small window, instead of rendering for the window.
+	uint32_t               render_width                = 0;
+	uint32_t               render_height               = 0;
 	std::string            user_name                   = "Kyty";
 	int32_t                user_id                     = DEFAULT_USER_ID;
 	std::string            audio_input_device;
 	std::optional<ControllerColor> controller_color;
+	uint32_t               controller_speaker_volume      = 50;
+	uint32_t               controller_vibration_intensity = 100;
 	PresentMode            present_mode                = PresentMode::Mailbox;
 	int32_t                gpu_index                   = -1;
 	bool                   fullscreen_enabled          = false;
+	bool                   hdr_enabled                 = false;
+	bool                   hide_cursor_enabled         = false;
+	bool                   splash_enabled              = true;
 	bool                   vr_enabled                  = false;
 	bool                   amd_cpu_enabled             = false;
+	bool                   network_connected           = false;
 	uint32_t               vblank_frequency            = 60;
 	uint32_t               console_language            = DEFAULT_CONSOLE_LANGUAGE;
 	bool                   vulkan_validation_enabled   = false;
@@ -69,28 +80,43 @@ struct ConfigOptions {
 	bool                   spirv_debug_printf_enabled  = false;
 	bool                   gpu_assisted_validation_enabled = false;
 	bool                   renderdoc_enabled           = false;
-	bool                   readback_linear_images      = false;
+	// A CPU read of image memory never faults, so this is the only path that returns a
+	// GPU-written linear surface to the guest.
+	bool                   readback_linear_images      = true;
+	bool                   sync_raw_image_buffers      = false;
 	bool                   tessellation_enabled        = false;
+	bool                   trophy_enabled              = true;
+
 	bool                   playgo_hack_enabled         = false;
+	bool                   skip_notice_screen          = false;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	bool red_zone_protection_enabled = false;
 #endif
 	Keymap keymap;
+	// Ordinary boots need a non-null argv[0]; --guest-exec supplies the caller's arguments.
+	std::vector<std::string> guest_arguments {""};
 };
 
 void Load(const ConfigOptions& cfg);
 
 uint32_t GetScreenWidth();
 uint32_t GetScreenHeight();
+uint32_t GetRenderWidth();
+uint32_t GetRenderHeight();
 const std::string& GetUserName();
 int32_t  GetUserId();
 const std::string& GetAudioInputDevice();
 const std::optional<ControllerColor>& GetControllerColor();
+uint32_t GetControllerSpeakerVolume();
+uint32_t GetControllerVibrationIntensity();
 PresentMode GetPresentMode();
 int32_t GetGpuIndex();
 bool     FullscreenEnabled();
+bool     HdrEnabled();
+bool     HideCursorEnabled();
 bool     VrEnabled();
 bool     AmdCpuEnabled();
+bool     IsNetworkConnected();
 uint32_t GetVblankFrequency();
 uint32_t GetConsoleLanguage();
 bool     VulkanValidationEnabled();
@@ -116,13 +142,17 @@ bool GpuAssistedValidationEnabled();
 
 bool RenderDocEnabled();
 bool ReadbackLinearImagesEnabled();
+bool SyncRawImageBuffersEnabled();
 bool TessellationEnabled();
+bool TrophyEnabled();
 bool PlayGoHackEnabled();
+bool SkipNoticeScreen();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled();
 #endif
 
 const Keymap& GetKeymap();
+const std::vector<std::string>& GetGuestArguments();
 
 } // namespace Config
 

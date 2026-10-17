@@ -1,5 +1,7 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 
+#include <cstdlib>
+
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
 uint32_t EmitAndConstant(EmitterState& state, uint32_t value, uint32_t mask) {
@@ -30,9 +32,50 @@ uint32_t EmitSubConstantMinusU32(EmitterState& state, uint32_t constant, uint32_
 	return ret;
 }
 
+static bool FastF16RtzDisabled() {
+	static const bool disabled = [] {
+		const char* text = std::getenv("KYTY_NO_FAST_PKRTZ");
+		return text != nullptr && text[0] != '\0' && text[0] != '0';
+	}();
+	return disabled;
+}
+
+static uint32_t EmitF32ToF16RtzBitsFast(EmitterState& state, uint32_t bits) {
+	const auto magnitude = EmitAndConstant(state, bits, 0x7fffffffu);
+	const auto sign      = EmitAndConstant(state, EmitShiftRightConstant(state, bits, 16), 0x8000u);
+	const auto normal    = EmitShiftRightConstant(
+	    state,
+	    Binary(state, spv::OpISub, TypeU32(state), magnitude, ConstantU32(state, 0x38000000u)), 13);
+	const auto exponent = EmitShiftRightConstant(state, magnitude, 23);
+	const auto shift    = EmitGlsl<GLSLstd450UMin, IR::Type::U32>(
+	    state, EmitSubConstantMinusU32(state, 126, exponent), ConstantU32(state, 31));
+	const auto mantissa  = EmitOrU32(state, EmitAndConstant(state, magnitude, 0x007fffffu),
+	                                 ConstantU32(state, 0x00800000u));
+	const auto subnormal = Binary(state, spv::OpShiftRightLogical, TypeU32(state), mantissa, shift);
+	const auto finite    = EmitSelectValueU32(
+	    state, EmitCompareU32Constant(state, spv::OpULessThan, magnitude, 0x38800000u), subnormal,
+	    normal);
+	const auto nan = EmitOrU32(
+	    state, EmitAndConstant(state, EmitShiftRightConstant(state, magnitude, 13), 0x3ffu),
+	    ConstantU32(state, 0x7e00u));
+	const auto inf_or_max = EmitSelectValueU32(
+	    state, EmitCompareU32Constant(state, spv::OpIEqual, magnitude, 0x7f800000u),
+	    ConstantU32(state, 0x7c00u), ConstantU32(state, 0x7bffu));
+	const auto special = EmitSelectValueU32(
+	    state, EmitCompareU32Constant(state, spv::OpUGreaterThan, magnitude, 0x7f800000u), nan,
+	    inf_or_max);
+	const auto result = EmitSelectValueU32(
+	    state, EmitCompareU32Constant(state, spv::OpUGreaterThanEqual, magnitude, 0x47800000u),
+	    special, finite);
+	return EmitOrU32(state, sign, result);
+}
+
 uint32_t EmitF32ToF16RtzBits(EmitterState& state, uint32_t f32) {
 	const auto bits = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpBitcast, TypeU32(state), bits, f32);
+	if (!FastF16RtzDisabled()) {
+		return EmitF32ToF16RtzBitsFast(state, bits);
+	}
 
 	const auto sign = EmitAndConstant(state, EmitShiftRightConstant(state, bits, 16), 0x8000u);
 	const auto exp  = EmitAndConstant(state, EmitShiftRightConstant(state, bits, 23), 0xffu);
@@ -82,35 +125,12 @@ uint32_t EmitF32ToF16RtzBits(EmitterState& state, uint32_t f32) {
 	return EmitAndConstant(state, EmitSelectValueU32(state, exp_eq_255, special, finite2), 0xffffu);
 }
 
-uint32_t EmitMinMaxU32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value) {
-	const auto cond = state.builder.AllocateId();
-	const auto ret  = state.builder.AllocateId();
-	state.builder.AddFunction(max_value ? spv::OpUGreaterThan : spv::OpULessThan, TypeBool(state),
-	                          cond, lhs, rhs);
-	state.builder.AddFunction(spv::OpSelect, TypeU32(state), ret, cond, lhs, rhs);
-	return ret;
-}
-
-uint32_t EmitMinMaxI32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value) {
-	const auto cond = state.builder.AllocateId();
-	const auto ret  = state.builder.AllocateId();
-	state.builder.AddFunction(max_value ? spv::OpSGreaterThan : spv::OpSLessThan, TypeBool(state),
-	                          cond, lhs, rhs);
-	state.builder.AddFunction(spv::OpSelect, TypeU32(state), ret, cond, lhs, rhs);
-	return ret;
-}
-
 F32Class EmitClassifyF32Bits(EmitterState& state, uint32_t bits) {
 	F32Class cls;
-	cls.bits                 = bits;
-	const auto abs_bits      = EmitAndConstant(state, cls.bits, 0x7fffffffu);
-	const auto exponent_bits = EmitAndConstant(state, abs_bits, 0x7f800000u);
-	const auto mantissa_bits = EmitAndConstant(state, abs_bits, 0x007fffffu);
-	const auto exponent_max =
-	    EmitCompareU32Constant(state, spv::OpIEqual, exponent_bits, 0x7f800000u);
-	const auto mantissa_nonzero = EmitCompareU32Constant(state, spv::OpINotEqual, mantissa_bits, 0);
-	cls.nan  = EmitLogicalAndBool(state, exponent_max, mantissa_nonzero);
-	cls.zero                    = EmitCompareU32Constant(state, spv::OpIEqual, abs_bits, 0);
+	cls.bits            = bits;
+	const auto abs_bits = EmitAndConstant(state, cls.bits, 0x7fffffffu);
+	cls.nan  = EmitCompareU32Constant(state, spv::OpUGreaterThan, abs_bits, 0x7f800000u);
+	cls.zero = EmitCompareU32Constant(state, spv::OpIEqual, abs_bits, 0);
 	return cls;
 }
 
@@ -125,20 +145,23 @@ uint32_t EmitClassMaskBitMatch(EmitterState& state, uint32_t mask, uint32_t bit,
 	return EmitLogicalAndBool(state, selected, class_match);
 }
 
-uint32_t EmitClassMaskF32(EmitterState& state, uint32_t value, uint32_t mask) {
-	const auto bits          = EmitBitcastF32ToU32(state, value);
-	const auto sign_bits     = EmitAndConstant(state, bits, 0x80000000u);
-	const auto abs_bits      = EmitAndConstant(state, bits, 0x7fffffffu);
-	const auto exponent_bits = EmitAndConstant(state, abs_bits, 0x7f800000u);
-	const auto mantissa_bits = EmitAndConstant(state, abs_bits, 0x007fffffu);
-	const auto quiet_bits    = EmitAndConstant(state, mantissa_bits, 0x00400000u);
+static uint32_t EmitClassMaskBits(EmitterState& state, uint32_t bits, uint32_t mask, bool half) {
+	const uint32_t sign_mask     = half ? 0x8000u : 0x80000000u;
+	const uint32_t exponent_mask = half ? 0x7c00u : 0x7f800000u;
+	const uint32_t mantissa_mask = half ? 0x03ffu : 0x007fffffu;
+	const uint32_t quiet_mask    = half ? 0x0200u : 0x00400000u;
+	const auto     sign_bits     = EmitAndConstant(state, bits, sign_mask);
+	const auto     abs_bits      = EmitAndConstant(state, bits, sign_mask - 1u);
+	const auto     exponent_bits = EmitAndConstant(state, abs_bits, exponent_mask);
+	const auto     mantissa_bits = EmitAndConstant(state, abs_bits, mantissa_mask);
+	const auto     quiet_bits    = EmitAndConstant(state, mantissa_bits, quiet_mask);
 
 	const auto sign             = EmitCompareU32Constant(state, spv::OpINotEqual, sign_bits, 0);
 	const auto positive         = EmitLogicalNotBool(state, sign);
 	const auto exponent_zero    = EmitCompareU32Constant(state, spv::OpIEqual, exponent_bits, 0);
 	const auto exponent_nonzero = EmitLogicalNotBool(state, exponent_zero);
 	const auto exponent_inf =
-	    EmitCompareU32Constant(state, spv::OpIEqual, exponent_bits, 0x7f800000u);
+	    EmitCompareU32Constant(state, spv::OpIEqual, exponent_bits, exponent_mask);
 	const auto finite_exponent  = EmitLogicalNotBool(state, exponent_inf);
 	const auto mantissa_zero    = EmitCompareU32Constant(state, spv::OpIEqual, mantissa_bits, 0);
 	const auto mantissa_nonzero = EmitLogicalNotBool(state, mantissa_zero);
@@ -178,7 +201,20 @@ uint32_t EmitClassMaskF32(EmitterState& state, uint32_t value, uint32_t mask) {
 	    EmitClassMaskBitMatch(state, mask, 9, EmitLogicalAndBool(state, inf, positive)));
 }
 
+uint32_t EmitClassMaskF32(EmitterState& state, uint32_t value, uint32_t mask) {
+	return EmitClassMaskBits(state, EmitBitcastF32ToU32(state, value), mask, false);
+}
+
+uint32_t EmitClassMaskF16(EmitterState& state, uint32_t bits, uint32_t mask) {
+	return EmitClassMaskBits(state, bits, mask, true);
+}
+
 uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value) {
+	if (FastF32MinMax()) {
+		auto lhs_operand = EmitMinMaxOperandF32(state, lhs);
+		auto rhs_operand = EmitMinMaxOperandF32(state, rhs);
+		return EmitMinMaxF32Operands(state, lhs_operand, rhs_operand, max_value, false).value;
+	}
 	const auto lhs_class = EmitClassifyF32(state, lhs);
 	const auto rhs_class = EmitClassifyF32(state, rhs);
 
@@ -197,6 +233,56 @@ uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, boo
 	    EmitSelectValueU32(state, rhs_class.nan, lhs_class.bits, numeric_bits);
 	const auto result_bits = EmitSelectValueU32(state, lhs_class.nan, rhs_class.bits, rhs_nan_bits);
 	return EmitBitcastU32ToF32(state, result_bits);
+}
+
+bool FastF32MinMax() {
+	static const bool enabled = [] {
+		const char* text = std::getenv("KYTY_NO_FAST_FMINMAX");
+		return text == nullptr || text[0] == '\0' || text[0] == '0';
+	}();
+	return enabled;
+}
+
+F32MinMaxOperand EmitMinMaxOperandF32(EmitterState& state, uint32_t value) {
+	F32MinMaxOperand operand;
+	operand.value = value;
+	operand.bits  = EmitBitcastF32ToU32(state, value);
+	operand.abs   = EmitAndConstant(state, operand.bits, 0x7fffffffu);
+	operand.nan   = EmitCompareU32Constant(state, spv::OpUGreaterThan, operand.abs, 0x7f800000u);
+	return operand;
+}
+
+F32MinMaxOperand EmitMinMaxF32Operands(EmitterState& state, F32MinMaxOperand& lhs,
+                                       F32MinMaxOperand& rhs, bool max_value, bool nan_free) {
+	const auto ordered_cond =
+	    Binary(state, max_value ? spv::OpFOrdGreaterThanEqual : spv::OpFOrdLessThan,
+	           TypeBool(state), lhs.value, rhs.value);
+	const auto ordered_bits = EmitSelectValueU32(state, ordered_cond, lhs.bits, rhs.bits);
+	uint32_t   zero_bits    = 0;
+	uint32_t   both_zero    = 0;
+	if (max_value) {
+		for (auto* operand: {&lhs, &rhs}) {
+			if (operand->abs == 0) {
+				operand->abs = EmitAndConstant(state, operand->bits, 0x7fffffffu);
+			}
+		}
+		zero_bits = EmitAndU32(state, lhs.bits, rhs.bits);
+		both_zero =
+		    EmitCompareU32Constant(state, spv::OpIEqual, EmitOrU32(state, lhs.abs, rhs.abs), 0);
+	} else {
+		zero_bits = EmitOrU32(state, lhs.bits, rhs.bits);
+		both_zero = EmitCompareU32Constant(state, spv::OpIEqual,
+		                                   EmitAndConstant(state, zero_bits, 0x7fffffffu), 0);
+	}
+	F32MinMaxOperand result;
+	result.bits = EmitSelectValueU32(state, both_zero, zero_bits, ordered_bits);
+	if (!nan_free) {
+		result.bits = EmitSelectValueU32(state, rhs.nan, lhs.bits, result.bits);
+		result.bits = EmitSelectValueU32(state, lhs.nan, rhs.bits, result.bits);
+		result.nan  = EmitLogicalAndBool(state, lhs.nan, rhs.nan);
+	}
+	result.value = EmitBitcastU32ToF32(state, result.bits);
+	return result;
 }
 
 uint32_t EmitFlushF32DenormToSignedZero(EmitterState& state, uint32_t value) {

@@ -10,6 +10,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/bindingEpoch.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
@@ -25,6 +26,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <limits>
+#include <optional>
 
 namespace Libs::Graphics {
 
@@ -105,6 +107,109 @@ static vk::StencilOpState ConvertStencilState(
 	        state.compareMask, state.writeMask, reference};
 }
 
+static bool ConsumesStencilOpValue(uint8_t op) {
+	return static_cast<Prospero::StencilOp>(op) == Prospero::StencilOp::kReplaceOp ||
+	       static_cast<Prospero::StencilOp>(op) == Prospero::StencilOp::kXor;
+}
+
+std::optional<StencilExportReplay>
+PlanStencilExportReplay(const GuestStencilFace& front, const GuestStencilFace& back,
+                        bool depth_test, bool depth_write, vk::CompareOp depth_compare,
+                        bool depth_bounds, const char** refusal) {
+	const auto refuse = [&](const char* reason) -> std::optional<StencilExportReplay> {
+		if (refusal != nullptr) {
+			*refusal = reason;
+		}
+		return std::nullopt;
+	};
+	StencilExportReplay plan;
+	const auto          plan_face = [&](const GuestStencilFace& face,
+	                                    vk::StencilOpState&     out) -> const char* {
+		out = {vk::StencilOp::eKeep, vk::StencilOp::eKeep,
+		       vk::StencilOp::eKeep, static_cast<vk::CompareOp>(face.compare),
+		       face.compare_mask,    0,
+		       face.test_value};
+		if (face.write_mask == 0 || out.compareOp == vk::CompareOp::eNever) {
+			return nullptr;
+		}
+		if (ConsumesStencilOpValue(face.fail) || ConsumesStencilOpValue(face.zfail)) {
+			return "a stencil-fail or depth-fail op consumes the exported value";
+		}
+		if (!ConsumesStencilOpValue(face.zpass)) {
+			return nullptr;
+		}
+		if (out.compareOp != vk::CompareOp::eAlways && (face.compare_mask & face.write_mask) != 0) {
+			return "the stencil compare reads bits the draw rewrites";
+		}
+		out.passOp    = static_cast<Prospero::StencilOp>(face.zpass) == Prospero::StencilOp::kXor
+		                    ? vk::StencilOp::eInvert
+		                    : vk::StencilOp::eReplace;
+		out.writeMask = face.write_mask;
+		return nullptr;
+	};
+	if (const auto* reason = plan_face(front, plan.front)) {
+		return refuse(reason);
+	}
+	if (const auto* reason = plan_face(back, plan.back)) {
+		return refuse(reason);
+	}
+	plan.bits             = static_cast<uint8_t>(plan.front.writeMask | plan.back.writeMask);
+	plan.depth_compare_op = depth_compare;
+	if (plan.bits != 0 && depth_test && depth_write) {
+		if (depth_compare == vk::CompareOp::eNotEqual || depth_bounds) {
+			return refuse("pass 0 rewrites the depth its own test reads");
+		}
+		plan.depth_compare_op = vk::CompareOp::eEqual;
+	}
+	return plan;
+}
+
+vk::StencilOpState StencilExportReplay::BitPass(const vk::StencilOpState& face, uint32_t bit) {
+	auto       state = face;
+	const auto mask  = static_cast<uint32_t>(1u << bit);
+	if ((face.writeMask & mask) == 0) {
+		state.passOp    = vk::StencilOp::eKeep;
+		state.writeMask = 0;
+		return state;
+	}
+	state.writeMask = mask;
+	state.reference = (face.reference & face.compareMask & ~mask) | mask;
+	return state;
+}
+
+void RecordStencilExportReplay(vk::CommandBuffer command, const StencilExportReplay& replay,
+                               std::span<const vk::Pipeline, 8> pipelines,
+                               uint32_t color_attachments, const std::function<void()>& draw) {
+	EXIT_IF(color_attachments > RENDER_COLOR_ATTACHMENTS_MAX);
+	for (uint32_t bit = 0; bit < 8; bit++) {
+		if ((replay.bits & (1u << bit)) == 0) {
+			continue;
+		}
+		EXIT_IF(pipelines[bit] == nullptr);
+		DisturbGraphicsBindings();
+		command.bindPipeline(vk::PipelineBindPoint::eGraphics, pipelines[bit]);
+#if !defined(__APPLE__)
+		if (color_attachments != 0) {
+			const std::array<vk::Bool32, RENDER_COLOR_ATTACHMENTS_MAX> disabled {};
+			command.setColorWriteEnableEXT(color_attachments, disabled.data());
+		}
+#endif
+		command.setDepthWriteEnable(VK_FALSE);
+		command.setDepthCompareOp(replay.depth_compare_op);
+		command.setStencilTestEnable(VK_TRUE);
+		const auto set_face = [&](vk::StencilFaceFlagBits face, const vk::StencilOpState& state) {
+			command.setStencilOp(face, state.failOp, state.passOp, state.depthFailOp,
+			                     state.compareOp);
+			command.setStencilCompareMask(face, state.compareMask);
+			command.setStencilWriteMask(face, state.writeMask);
+			command.setStencilReference(face, state.reference);
+		};
+		set_face(vk::StencilFaceFlagBits::eFront, StencilExportReplay::BitPass(replay.front, bit));
+		set_face(vk::StencilFaceFlagBits::eBack, StencilExportReplay::BitPass(replay.back, bit));
+		draw();
+	}
+}
+
 [[nodiscard]] static vk::Format ResolveHostDepthAttachmentFormat(const CommandBuffer&     buffer,
                                                                  const DepthFormatPolicy& policy,
                                                                  bool     has_stencil,
@@ -160,8 +265,7 @@ static TextureCache::ImageDesc MakeDepthTargetDesc(const CommandBuffer& buffer,
 			           z.depth_view.slice_max);
 	}
 	// EXPCLEAR permits an HTile acceleration state; the host attachment is already expanded.
-	if (z.z_info.partially_resident ||
-	    z.stencil_info.partially_resident || z.z_info.max_mip_level != 0 ||
+	if (z.z_info.max_mip_level != 0 ||
 	    z.depth_view.current_mip_level != 0 || unsupported_shading_rate_encoding ||
 	    depth_address == 0 || (depth_address & 0xffffu) != 0) {
 		DepthFatal("unsupported depth register state");
@@ -240,7 +344,7 @@ static TextureCache::ImageDesc MakeDepthTargetDesc(const CommandBuffer& buffer,
 	desc.info.bytes_per_block = bytes;
 	desc.info.samples         = samples;
 	desc.info.tile_mode       = Prospero::TileMode::kDepth;
-	desc.info.mip_layout[0]   = {0, depth_backing_size, pitch, height};
+	desc.info.UpdateSize();
 	desc.info.metadata.range =
 	    has_htile ? GuestRange {z.htile_data_base_addr, htile_backing_size} : GuestRange {};
 	desc.info.metadata.kind   = has_htile ? ImageMetadataKind::Htile : ImageMetadataKind::None;
@@ -259,8 +363,10 @@ static TextureCache::ImageDesc MakeDepthTargetDesc(const CommandBuffer& buffer,
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
-void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepthInfo& r) {
+void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepthInfo& r,
+                                              uint8_t stencil_export_bits) {
 	KYTY_PROFILER_FUNCTION();
+	r.stencil_export         = {};
 	const auto& hw          = buffer.GetRegisters();
 	const auto& z           = hw.GetDepthRenderTarget();
 	const auto& rc          = hw.GetRenderControl();
@@ -299,12 +405,19 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 		}
 		return;
 	}
-	if (rc.copy_depth_to_color || rc.copy_stencil_to_color || rc.copy_centroid ||
-	    rc.copy_sample != 0 || dc.zfunc > static_cast<uint8_t>(vk::CompareOp::eAlways) ||
+	if (rc.copy_stencil_to_color ||
+	    dc.zfunc > static_cast<uint8_t>(vk::CompareOp::eAlways) ||
 	    (!z.depth_view.depth_write_disable && z.z_write_base_addr != z.z_read_base_addr) ||
 	    (has_stencil && !z.depth_view.stencil_write_disable &&
 	     z.stencil_write_base_addr != z.stencil_read_base_addr)) {
 		DepthFatal("unsupported depth register state");
+	}
+	if (rc.copy_depth_to_color &&
+	    (z.z_info.num_samples != 0 || rc.copy_sample != 0 ||
+	     z.z_info.format != Prospero::DepthFormat::kZ32F ||
+	     dc.z_enable || dc.z_write_enable || dc.depth_bounds_enable || dc.stencil_enable ||
+	     rc.depth_clear_enable || rc.stencil_clear_enable)) {
+		DepthFatal("unsupported depth-to-color copy state");
 	}
 	r.desc = MakeDepthTargetDesc(buffer, z);
 	r.depth_clear_enable      = rc.depth_clear_enable;
@@ -316,8 +429,6 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 	r.depth_compare_op        = static_cast<vk::CompareOp>(dc.zfunc);
 
 	r.depth_bounds_test_enable = dc.depth_bounds_enable;
-	r.depth_min_bounds         = hw.GetDepthBoundsMin();
-	r.depth_max_bounds         = hw.GetDepthBoundsMax();
 
 	r.stencil_clear_enable =
 	    has_stencil && rc.stencil_clear_enable && !z.depth_view.stencil_write_disable;
@@ -333,15 +444,41 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 		     dc.stencilfunc_bf > static_cast<uint8_t>(vk::CompareOp::eAlways))) {
 			DepthFatal("unsupported stencil compare state");
 		}
+		uint8_t front_op_value = sm.stencil_opval;
+		uint8_t back_op_value  = sm.stencil_opval_bf;
+		if (stencil_export_bits != 0) {
+			const GuestStencilFace front {dc.stencilfunc,   sc.stencil_fail, sc.stencil_zpass,
+			                              sc.stencil_zfail, sm.stencil_mask, sm.stencil_testval,
+			                              front_write_mask};
+			const GuestStencilFace back =
+			    dc.backface_enable ? GuestStencilFace {dc.stencilfunc_bf,   sc.stencil_fail_bf,
+			                                           sc.stencil_zpass_bf, sc.stencil_zfail_bf,
+			                                           sm.stencil_mask_bf,  sm.stencil_testval_bf,
+			                                           back_write_mask}
+			                       : front;
+			const auto plan =
+			    PlanStencilExportReplay(front, back, r.depth_test_enable, r.depth_write_enable,
+			                            r.depth_compare_op, r.depth_bounds_test_enable, nullptr);
+			if (plan && (plan->bits & ~stencil_export_bits) == 0) {
+				// The hardware ignores STENCILOPVAL for an exported op value; the replay supplies
+				// it.
+				r.stencil_export = *plan;
+				front_op_value   = 0;
+				back_op_value    = 0;
+			}
+		}
 		r.stencil_front = ConvertStencilState(
-		    dc.stencilfunc, {sc.stencil_fail, sc.stencil_zpass, sc.stencil_zfail},
-		    sm.stencil_opval, {.compareMask = sm.stencil_mask, .writeMask = front_write_mask,
-		                       .reference = sm.stencil_testval});
+		    dc.stencilfunc, {sc.stencil_fail, sc.stencil_zpass, sc.stencil_zfail}, front_op_value,
+		    {.compareMask = sm.stencil_mask,
+		     .writeMask   = front_write_mask,
+		     .reference   = sm.stencil_testval});
 		if (dc.backface_enable) {
 			r.stencil_back = ConvertStencilState(
 			    dc.stencilfunc_bf, {sc.stencil_fail_bf, sc.stencil_zpass_bf, sc.stencil_zfail_bf},
-			    sm.stencil_opval_bf, {.compareMask = sm.stencil_mask_bf, .writeMask = back_write_mask,
-			                          .reference = sm.stencil_testval_bf});
+			    back_op_value,
+			    {.compareMask = sm.stencil_mask_bf,
+			     .writeMask   = back_write_mask,
+			     .reference   = sm.stencil_testval_bf});
 		} else {
 			r.stencil_back = r.stencil_front;
 		}
@@ -351,21 +488,32 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 	BindRenderTarget(r.image_id);
 }
 
-bool RenderExecutor::DepthStencilCopy(CommandBuffer& buffer) {
-	const auto& hw       = buffer.GetRegisters();
+static void DepthStencilCopyPlanes(const HW::Context& hw, bool& depth_copy, bool& stencil_copy) {
 	const auto& z        = hw.GetDepthRenderTarget();
 	const auto& override = hw.GetDepthRenderOverride();
-	if (hw.GetColorControl().mode != 0) {
-		return false;
-	}
-	const bool depth_copy = override.force_z_dirty && override.force_z_valid &&
-	                        z.z_info.format != Prospero::DepthFormat::kInvalid &&
-	                        z.z_read_base_addr != 0 && z.z_write_base_addr != 0 &&
-	                        z.z_read_base_addr != z.z_write_base_addr;
-	const bool stencil_copy = override.force_stencil_dirty && override.force_stencil_valid &&
-	                          z.stencil_info.format != Prospero::StencilFormat::kInvalid &&
-	                          z.stencil_read_base_addr != 0 && z.stencil_write_base_addr != 0 &&
-	                          z.stencil_read_base_addr != z.stencil_write_base_addr;
+	const bool  normal   = hw.GetColorControl().mode == 0;
+	depth_copy = normal && override.force_z_dirty && override.force_z_valid &&
+	             z.z_info.format != Prospero::DepthFormat::kInvalid && z.z_read_base_addr != 0 &&
+	             z.z_write_base_addr != 0 && z.z_read_base_addr != z.z_write_base_addr;
+	stencil_copy = normal && override.force_stencil_dirty && override.force_stencil_valid &&
+	               z.stencil_info.format != Prospero::StencilFormat::kInvalid &&
+	               z.stencil_read_base_addr != 0 && z.stencil_write_base_addr != 0 &&
+	               z.stencil_read_base_addr != z.stencil_write_base_addr;
+}
+
+bool RenderExecutor::IsDepthStencilCopy(const CommandBuffer& buffer) {
+	bool depth_copy   = false;
+	bool stencil_copy = false;
+	DepthStencilCopyPlanes(buffer.GetRegisters(), depth_copy, stencil_copy);
+	return depth_copy || stencil_copy;
+}
+
+bool RenderExecutor::DepthStencilCopy(CommandBuffer& buffer) {
+	const auto& hw           = buffer.GetRegisters();
+	const auto& z            = hw.GetDepthRenderTarget();
+	bool        depth_copy   = false;
+	bool        stencil_copy = false;
+	DepthStencilCopyPlanes(hw, depth_copy, stencil_copy);
 	if (!depth_copy && !stencil_copy) {
 		return false;
 	}
@@ -379,7 +527,7 @@ bool RenderExecutor::DepthStencilCopy(CommandBuffer& buffer) {
 	BindRenderTarget(write_id);
 	cache.UpdateImage(read_id);
 	cache.UpdateImage(write_id);
-	cache.MarkGpuWritten(write_id);
+	cache.MarkGpuWritten(write_id, stencil_copy);
 	auto& source      = cache.GetImage(read_id);
 	auto& destination = cache.GetImage(write_id);
 	EXIT_IF(read_id == write_id || source.backing.format != destination.backing.format);
@@ -460,7 +608,7 @@ vk::ImageAspectFlags RenderDepthInfo::AttachmentWriteAspects() const {
 		       (can_pass && depth_pass && state.passOp != vk::StencilOp::eKeep) ||
 		       (can_pass && depth_fail && state.depthFailOp != vk::StencilOp::eKeep);
 	};
-	if (stencil_clear_enable ||
+	if (stencil_clear_enable || stencil_export.bits != 0 ||
 	    (stencil_test_enable && (face_writes(stencil_front) || face_writes(stencil_back)))) {
 		writes |= vk::ImageAspectFlagBits::eStencil;
 	}

@@ -1,5 +1,6 @@
 #include "common/assert.h"
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
+#include "graphics/shader/recompiler/ir/passes/DeadLaneMasks.h"
 #include "graphics/shader/shader.h"
 
 #include <algorithm>
@@ -121,6 +122,13 @@ Decoder::Operand Translator::PlainOperand(const Decoder::Operand& operand) {
 	result.dpp                = false;
 	result.dpp8               = false;
 	return result;
+}
+
+// A 64-bit guest mask may never claim a lane the emitted module cannot activate: every guest idiom
+// that drains a mask terminates only when the last bit clears, and only a ballot can clear one, so
+// a bit for a lane no ballot can reach hangs the GPU. Applied to EXEC only, never VCC.
+IR::U32 Translator::ClampGhostLanes(IR::U32 high_word) {
+	return program.upper_lane_half_is_ghost ? IR::U32(IR::Value(0u)) : high_word;
 }
 
 std::array<IR::U32, 2> Translator::BallotMask(IR::U1 value) {
@@ -334,7 +342,8 @@ void Translator::WriteRawU32(const Decoder::Operand& operand, IR::U32 value) {
 				value = IR::U32(ir.Emit(IR::ValueOpcode::DppUpdateU32, {value, old, ir.GetExec()},
 				                        DppFlags(operand)));
 			} else {
-				value = ir.Select(ir.GetExec(), value, old);
+				value = IR::U32(ir.Emit(IR::ValueOpcode::SelectU32, {ir.GetExec(), value, old},
+				                        IR::VgprWriteMaskFlag));
 			}
 			ir.SetVectorReg(reg, value);
 			break;
@@ -344,6 +353,8 @@ void Translator::WriteRawU32(const Decoder::Operand& operand, IR::U32 value) {
 			ir.SetVcc(ThreadBit({value, ir.GetVccHi()}));
 			break;
 		case Decoder::OperandKind::VccHi:
+			// NOT clamped, unlike EXEC below: compilers use VCC's halves as ordinary scalar
+			// registers whenever VCC is dead, so zeroing one would corrupt a live value.
 			ir.SetVccHi(IR::U32(value));
 			ir.SetVcc(ThreadBit({ir.GetVccLo(), value}));
 			break;
@@ -352,10 +363,12 @@ void Translator::WriteRawU32(const Decoder::Operand& operand, IR::U32 value) {
 			ir.SetExecLo(IR::U32(value));
 			ir.SetExec(ThreadBit({value, ir.GetExecHi()}));
 			break;
-		case Decoder::OperandKind::ExecHi:
-			ir.SetExecHi(IR::U32(value));
-			ir.SetExec(ThreadBit({ir.GetExecLo(), value}));
+		case Decoder::OperandKind::ExecHi: {
+			const auto clamped = ClampGhostLanes(IR::U32(value));
+			ir.SetExecHi(clamped);
+			ir.SetExec(ThreadBit({ir.GetExecLo(), clamped}));
 			break;
+		}
 		case Decoder::OperandKind::Scc:
 			ir.SetScc(ir.INotEqual(value, IR::U32(IR::Value(0u))));
 			break;
@@ -503,41 +516,11 @@ IR::U64 Translator::ReadU64(const Decoder::Operand& operand) {
 	return IR::U64(ReadOperand(operand, IR::Type::U64));
 }
 
-IR::F32 Translator::ReadF16LaneAsF32(const Decoder::Operand& operand, bool high_lane, bool packed) {
-	if (operand.kind == Decoder::OperandKind::FloatInlineConstant) {
-		const bool use_zero = packed && (high_lane ? operand.op_sel_hi : operand.op_sel);
-		auto       value    = use_zero ? IR::F32(IR::Value::F32(0.0f))
-		                               : ir.BitCastF32(IR::U32(IR::Value(operand.value)));
-		const auto half     = IR::F16(ir.Emit(IR::ValueOpcode::ConvertF16F32, {value}));
-		value               = IR::F32(ir.Emit(IR::ValueOpcode::ConvertF32F16, {half}));
-		if (operand.absolute) {
-			value = IR::F32(ir.Emit(IR::ValueOpcode::FPAbs32, {value}));
-		}
-		if (high_lane ? operand.negate_hi : operand.negate) {
-			value = IR::F32(ir.Emit(IR::ValueOpcode::FPNeg32, {value}));
-		}
-		return value;
-	}
-	auto raw_operand      = operand;
-	raw_operand.sdwa_sel  = 6;
-	raw_operand.sdwa_sext = false;
-	const auto bits       = ApplyBitSourceModifiers(raw_operand, ReadRawU32(operand));
-	uint32_t   offset     = (high_lane ? operand.op_sel_hi : operand.op_sel) ? 16u : 0u;
-	if (operand.sdwa_sel == 4u || operand.sdwa_sel == 5u) {
-		offset = operand.sdwa_sel == 5u ? 16u : 0u;
-	}
-	const auto half_u32 = IR::U32(
-	    ir.Emit(IR::ValueOpcode::BitFieldUExtract, {bits, IR::Value(offset), IR::Value(16u)}));
-	const auto half_u16 = IR::U16(ir.Emit(IR::ValueOpcode::ConvertU16U32, {half_u32}));
+IR::F32 Translator::ReadF16LaneAsF32(const Decoder::Operand& operand, bool high_lane) {
+	const auto bits     = Read16LaneBits(operand, high_lane);
+	const auto half_u16 = IR::U16(ir.Emit(IR::ValueOpcode::ConvertU16U32, {bits}));
 	const auto half     = IR::F16(ir.Emit(IR::ValueOpcode::BitCastF16U16, {half_u16}));
-	auto       value    = IR::F32(ir.Emit(IR::ValueOpcode::ConvertF32F16, {half}));
-	if (operand.absolute) {
-		value = IR::F32(ir.Emit(IR::ValueOpcode::FPAbs32, {value}));
-	}
-	if (high_lane ? operand.negate_hi : operand.negate) {
-		value = IR::F32(ir.Emit(IR::ValueOpcode::FPNeg32, {value}));
-	}
-	return value;
+	return IR::F32(ir.Emit(IR::ValueOpcode::ConvertF32F16, {half}));
 }
 
 IR::F32 Translator::ReadF16AsF32(const Decoder::Operand& operand) {
@@ -555,29 +538,6 @@ IR::F32 Translator::ReadMixF32(const Decoder::Operand& operand) {
 	return IR::F32(ReadOperand(value_operand, IR::Type::F32));
 }
 
-IR::U32 Translator::ReadU16LaneRaw(const Decoder::Operand& operand, bool high_lane) {
-	auto raw_operand      = operand;
-	raw_operand.sdwa_sel  = 6;
-	raw_operand.sdwa_sext = false;
-	const auto bits       = ApplyBitSourceModifiers(raw_operand, ReadRawU32(operand));
-	uint32_t   offset     = (high_lane ? operand.op_sel_hi : operand.op_sel) ? 16u : 0u;
-	uint32_t   width      = 16u;
-	if (operand.sdwa_sel <= 3u) {
-		offset = operand.sdwa_sel * 8u;
-		width  = 8u;
-	} else if (operand.sdwa_sel == 4u || operand.sdwa_sel == 5u) {
-		offset = operand.sdwa_sel == 5u ? 16u : 0u;
-	}
-	if (width == 8u && operand.sdwa_sext) {
-		// Extend the selected byte into the 16-bit operand before halfword modifiers.
-		const auto value = IR::U32(
-		    ir.Emit(IR::ValueOpcode::BitFieldSExtract, {bits, IR::Value(offset), IR::Value(width)}));
-		return ir.BitwiseAnd(value, IR::U32(IR::Value(0xffffu)));
-	}
-	return IR::U32(
-	    ir.Emit(IR::ValueOpcode::BitFieldUExtract, {bits, IR::Value(offset), IR::Value(width)}));
-}
-
 IR::U32 Translator::ReadU16LaneAsU32(const Decoder::Operand& operand, bool high_lane,
                                      bool sign_extend) {
 	auto value = Read16LaneBits(operand, high_lane);
@@ -593,12 +553,36 @@ IR::U32 Translator::ReadU16AsU32(const Decoder::Operand& operand, bool sign_exte
 }
 
 IR::U32 Translator::Read16LaneBits(const Decoder::Operand& operand, bool high_lane) {
-	auto value = ReadU16LaneRaw(operand, high_lane);
+	auto raw_operand      = operand;
+	raw_operand.sdwa_sel  = 6;
+	raw_operand.sdwa_sext = false;
+	auto bits             = ReadRawU32(operand);
+	if (operand.kind == Decoder::OperandKind::FloatInlineConstant) {
+		// Inline floats encode the operand's width before SDWA or OP_SEL selects bits.
+		const auto half      = IR::F16(ir.Emit(IR::ValueOpcode::ConvertF16F32, {ir.BitCastF32(bits)}));
+		const auto half_bits = IR::U16(ir.Emit(IR::ValueOpcode::BitCastU16F16, {half}));
+		bits                = IR::U32(ir.Emit(IR::ValueOpcode::ConvertU32U16, {half_bits}));
+	}
+	bits = ApplyBitSourceModifiers(raw_operand, bits);
+	uint32_t offset = (high_lane ? operand.op_sel_hi : operand.op_sel) ? 16u : 0u;
+	uint32_t width  = 16u;
+	if (operand.sdwa_sel <= 3u) {
+		offset = operand.sdwa_sel * 8u;
+		width  = 8u;
+	} else if (operand.sdwa_sel == 4u || operand.sdwa_sel == 5u) {
+		offset = operand.sdwa_sel == 5u ? 16u : 0u;
+	}
+	const auto extract = width == 8u && operand.sdwa_sext
+	                         ? IR::ValueOpcode::BitFieldSExtract
+	                         : IR::ValueOpcode::BitFieldUExtract;
+	auto value = IR::U32(ir.Emit(extract, {bits, IR::Value(offset), IR::Value(width)}));
+	if (width == 8u && operand.sdwa_sext) {
+		value = ir.BitwiseAnd(value, IR::U32(IR::Value(0xffffu)));
+	}
 	if (operand.absolute) {
 		value = ir.BitwiseAnd(value, IR::U32(IR::Value(0x7fffu)));
 	}
 	if (high_lane ? operand.negate_hi : operand.negate) {
-		// RDNA2 source NEG flips the sign bit, including packed integer operands.
 		value = ir.BitwiseXor(value, IR::U32(IR::Value(0x8000u)));
 	}
 	return value;
@@ -614,12 +598,15 @@ void Translator::WriteU32Pair(const Decoder::Operand&       operand,
 		return;
 	}
 	switch (operand.kind) {
-		case Decoder::OperandKind::ExecLo:
-			ir.SetExec(ThreadBit(value));
-			ir.SetExecLo(value[0]);
-			ir.SetExecHi(value[1]);
+		case Decoder::OperandKind::ExecLo: {
+			const std::array<IR::U32, 2> clamped {value[0], ClampGhostLanes(value[1])};
+			ir.SetExec(ThreadBit(clamped));
+			ir.SetExecLo(clamped[0]);
+			ir.SetExecHi(clamped[1]);
 			return;
+		}
 		case Decoder::OperandKind::VccLo:
+			// Deliberately unclamped; see the VccHi case in WriteRawU32.
 			ir.SetVcc(ThreadBit(value));
 			ir.SetVccLo(value[0]);
 			ir.SetVccHi(value[1]);
@@ -764,7 +751,7 @@ void Translator::WriteCompareResult(const Decoder::Operand& operand, IR::U1 valu
 }
 
 void Translator::AddBranchCondition(const CFG::Graph& graph, const CFG::BasicBlock& source,
-                                    IR::BlockInfo& info) {
+                                    IR::Block& info) {
 	const auto native_condition = [&](CFG::BranchCondition kind) -> IR::U1 {
 		IR::U1 condition;
 		switch (kind) {
@@ -895,25 +882,79 @@ void IncludeInstructionVectorRegisters(const Decoder::Instruction& inst, uint32_
 		case Decoder::Opcode::V_CVT_F64_U32: include_vector(inst.dst, 2u); break;
 		case Decoder::Opcode::V_FMA_F64: include_vector(inst.src2, 2u); [[fallthrough]];
 		case Decoder::Opcode::V_ADD_F64:
+		case Decoder::Opcode::V_MIN_F64:
+		case Decoder::Opcode::V_MAX_F64:
 		case Decoder::Opcode::V_MUL_F64: include_vector(inst.src1, 2u); [[fallthrough]];
-		case Decoder::Opcode::V_RCP_F64: include_vector(inst.dst, 2u); [[fallthrough]];
+		case Decoder::Opcode::V_RCP_F64:
+		case Decoder::Opcode::V_TRUNC_F64:
+		case Decoder::Opcode::V_CEIL_F64:
+		case Decoder::Opcode::V_FLOOR_F64:
+		case Decoder::Opcode::V_FRACT_F64: include_vector(inst.dst, 2u); [[fallthrough]];
 		case Decoder::Opcode::V_CVT_F32_F64: include_vector(inst.src0, 2u); break;
+		case Decoder::Opcode::V_CMP_F_F64:
+		case Decoder::Opcode::V_CMP_LT_F64:
 		case Decoder::Opcode::V_CMP_EQ_F64:
 		case Decoder::Opcode::V_CMP_LE_F64:
+		case Decoder::Opcode::V_CMP_GT_F64:
+		case Decoder::Opcode::V_CMP_LG_F64:
+		case Decoder::Opcode::V_CMP_GE_F64:
+		case Decoder::Opcode::V_CMP_O_F64:
+		case Decoder::Opcode::V_CMP_U_F64:
+		case Decoder::Opcode::V_CMP_NGE_F64:
+		case Decoder::Opcode::V_CMP_NLG_F64:
+		case Decoder::Opcode::V_CMP_NGT_F64:
+		case Decoder::Opcode::V_CMP_NLE_F64:
+		case Decoder::Opcode::V_CMP_NEQ_F64:
+		case Decoder::Opcode::V_CMP_NLT_F64:
+		case Decoder::Opcode::V_CMP_TRU_F64:
+		case Decoder::Opcode::V_CMPX_F_F64:
+		case Decoder::Opcode::V_CMPX_LT_F64:
+		case Decoder::Opcode::V_CMPX_EQ_F64:
 		case Decoder::Opcode::V_CMPX_LE_F64:
+		case Decoder::Opcode::V_CMPX_GT_F64:
+		case Decoder::Opcode::V_CMPX_LG_F64:
 		case Decoder::Opcode::V_CMPX_GE_F64:
-		case Decoder::Opcode::V_CMP_EQ_I64:
+		case Decoder::Opcode::V_CMPX_O_F64:
+		case Decoder::Opcode::V_CMPX_U_F64:
+		case Decoder::Opcode::V_CMPX_NGE_F64:
+		case Decoder::Opcode::V_CMPX_NLG_F64:
+		case Decoder::Opcode::V_CMPX_NGT_F64:
+		case Decoder::Opcode::V_CMPX_NLE_F64:
+		case Decoder::Opcode::V_CMPX_NEQ_F64:
+		case Decoder::Opcode::V_CMPX_NLT_F64:
+		case Decoder::Opcode::V_CMPX_TRU_F64:
+		case Decoder::Opcode::V_CMP_F_I64:
 		case Decoder::Opcode::V_CMP_LT_I64:
+		case Decoder::Opcode::V_CMP_EQ_I64:
 		case Decoder::Opcode::V_CMP_LE_I64:
+		case Decoder::Opcode::V_CMP_GT_I64:
+		case Decoder::Opcode::V_CMP_NE_I64:
+		case Decoder::Opcode::V_CMP_GE_I64:
+		case Decoder::Opcode::V_CMP_T_I64:
+		case Decoder::Opcode::V_CMP_F_U64:
 		case Decoder::Opcode::V_CMP_LT_U64:
 		case Decoder::Opcode::V_CMP_EQ_U64:
 		case Decoder::Opcode::V_CMP_LE_U64:
 		case Decoder::Opcode::V_CMP_GT_U64:
 		case Decoder::Opcode::V_CMP_NE_U64:
 		case Decoder::Opcode::V_CMP_GE_U64:
+		case Decoder::Opcode::V_CMP_T_U64:
+		case Decoder::Opcode::V_CMPX_F_I64:
+		case Decoder::Opcode::V_CMPX_LT_I64:
+		case Decoder::Opcode::V_CMPX_EQ_I64:
+		case Decoder::Opcode::V_CMPX_LE_I64:
+		case Decoder::Opcode::V_CMPX_GT_I64:
 		case Decoder::Opcode::V_CMPX_NE_I64:
+		case Decoder::Opcode::V_CMPX_GE_I64:
+		case Decoder::Opcode::V_CMPX_T_I64:
+		case Decoder::Opcode::V_CMPX_F_U64:
+		case Decoder::Opcode::V_CMPX_LT_U64:
+		case Decoder::Opcode::V_CMPX_EQ_U64:
 		case Decoder::Opcode::V_CMPX_LE_U64:
+		case Decoder::Opcode::V_CMPX_GT_U64:
 		case Decoder::Opcode::V_CMPX_NE_U64:
+		case Decoder::Opcode::V_CMPX_GE_U64:
+		case Decoder::Opcode::V_CMPX_T_U64:
 			include_vector(inst.src0, 2u);
 			include_vector(inst.src1, 2u);
 			break;
@@ -921,6 +962,11 @@ void IncludeInstructionVectorRegisters(const Decoder::Instruction& inst, uint32_
 	}
 	if (inst.family == Decoder::Family::DS) {
 		switch (inst.opcode) {
+			case Decoder::Opcode::DS_CMPST_RTN_B64:
+				include_vector(inst.src1, inst.data_dwords);
+				include_vector(inst.src2, inst.data_dwords);
+				break;
+			case Decoder::Opcode::DS_MAX_RTN_U64:
 			case Decoder::Opcode::DS_ADD_U64:
 			case Decoder::Opcode::DS_OR_B64:
 			case Decoder::Opcode::DS_WRITE_B64:
@@ -992,6 +1038,13 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 	IR::Program result;
 	result.stage               = options.stage;
 	result.wave_size           = options.wave_size;
+	result.host_subgroup_size  = options.host_subgroup_size;
+	result.robust_buffer_access2 = options.robust_buffer_access2;
+	// The backend splits the wave into two halves only for a workgroup stage running wave64 on a
+	// 32-wide subgroup, so elsewhere guest lanes 32..63 do not exist at all.
+	result.upper_lane_half_is_ghost =
+	    options.wave_size == 64u && options.host_subgroup_size == 32u &&
+	    ShaderWorkgroupInput(options.stage, options.input_info) == nullptr;
 	result.shader_hash         = options.shader_hash;
 	result.user_data_base      = options.user_data_base;
 	result.user_data_count     = options.user_data_count;
@@ -1038,45 +1091,67 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 
 	result.block_storage.reserve(cfg.blocks.size() + 1u);
 	result.blocks.reserve(cfg.blocks.size() + 1u);
-	result.block_info.reserve(cfg.blocks.size() + 1u);
 	const auto max_id = std::ranges::max_element(cfg.blocks, {}, [](const CFG::BasicBlock& block) {
 		                    return block.id;
 	                    })->id;
 	if (max_id == UINT32_MAX) {
 		EXIT("cannot allocate a typed entry block id");
 	}
-	CFG::Terminator terminator;
-	terminator.kind       = CFG::TerminatorKind::Branch;
-	terminator.true_block = cfg.blocks.front().id;
 	result.block_storage.push_back(std::make_unique<IR::Block>());
 	result.blocks.push_back(result.block_storage.back().get());
-	result.block_info.push_back({max_id + 1u, cfg.blocks.front().start_pc,
-	                             cfg.blocks.front().start_pc, std::move(terminator)});
+	auto& entry    = *result.blocks.front();
+	entry.id       = max_id + 1u;
+	entry.start_pc = entry.end_pc = cfg.blocks.front().start_pc;
+	entry.terminator.kind         = CFG::TerminatorKind::Branch;
 
-	std::unordered_map<uint32_t, size_t> block_indices;
-	block_indices.reserve(cfg.blocks.size());
-	for (const auto& source_block: cfg.blocks) {
-		if (!block_indices.emplace(source_block.id, result.blocks.size()).second) {
-			EXIT("CFG contains duplicate block id %u", source_block.id);
+	std::unordered_map<uint32_t, IR::Block*> blocks_by_id;
+	blocks_by_id.reserve(cfg.blocks.size());
+	for (const auto& source: cfg.blocks) {
+		auto& block = *result.block_storage.emplace_back(std::make_unique<IR::Block>());
+		if (!blocks_by_id.emplace(source.id, &block).second) {
+			EXIT("CFG contains duplicate block id %u", source.id);
 		}
-		result.block_storage.push_back(std::make_unique<IR::Block>());
-		result.blocks.push_back(result.block_storage.back().get());
-		result.block_info.push_back(
-		    {source_block.id, source_block.start_pc, source_block.end_pc, source_block.terminator});
+		result.blocks.push_back(&block);
+		block.id       = source.id;
+		block.start_pc = source.start_pc;
+		block.end_pc   = source.end_pc;
 	}
-	for (const auto& source_block: cfg.blocks) {
-		const auto source_index = block_indices.at(source_block.id);
-		for (const auto successor: source_block.successors) {
-			const auto target = block_indices.find(successor);
-			if (target == block_indices.end()) {
-				EXIT("CFG block %u has unknown successor %u", source_block.id, successor);
+	const auto target_block = [&](uint32_t id) -> IR::Block* {
+		return id == UINT32_MAX ? nullptr : blocks_by_id.at(id);
+	};
+	entry.terminator.true_block = target_block(cfg.blocks.front().id);
+	for (const auto& source: cfg.blocks) {
+		auto&       block               = *blocks_by_id.at(source.id);
+		const auto& term                = source.terminator;
+		block.terminator.kind           = term.kind;
+		block.terminator.true_block     = target_block(term.true_block);
+		block.terminator.false_block    = target_block(term.false_block);
+		block.terminator.merge_block    = target_block(term.merge_block);
+		block.terminator.continue_block = target_block(term.continue_block);
+		block.terminator.loop_header    = term.loop_header;
+		block.terminator.indexed        = term.indirect_selector_code != UINT32_MAX;
+		const auto& values =
+		    block.terminator.indexed ? term.indirect_selector_values : term.indirect_target_pcs;
+		const auto& targets =
+		    block.terminator.indexed ? term.indirect_selector_targets : term.indirect_targets;
+		if (values.size() != targets.size()) {
+			EXIT("CFG block %u has inconsistent indirect targets", source.id);
+		}
+		block.terminator.cases.reserve(values.size());
+		for (size_t index = 0; index < values.size(); ++index) {
+			block.terminator.cases.push_back({values[index], target_block(targets[index])});
+		}
+		for (const auto successor: source.successors) {
+			const auto target = blocks_by_id.find(successor);
+			if (target == blocks_by_id.end()) {
+				EXIT("CFG block %u has unknown successor %u", source.id, successor);
 			}
-			result.blocks[source_index]->AddBranch(result.blocks[target->second]);
+			block.AddBranch(target->second);
 		}
 	}
 	{
-		result.blocks.front()->AddBranch(result.blocks.at(block_indices.at(cfg.blocks.front().id)));
-		IR::IREmitter entry_ir(result.blocks.front());
+		entry.AddBranch(entry.terminator.true_block);
+		IR::IREmitter entry_ir(&entry);
 		const auto    builtin = [&](IR::StageInputKind kind, uint32_t component = 0u) {
 			return IR::U32(
 			    entry_ir.Emit(IR::ValueOpcode::GetBuiltin,
@@ -1104,11 +1179,19 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				                                  IR::U32(IR::Value(total_threads)));
 			}
 		}
+		// USE_THREAD_DIMENSIONS launches a partial last group with its excess lanes disabled.
+		if (options.stage == ShaderType::Compute &&
+		    options.input_info.compute->dispatch_thread_dimensions) {
+			initial_exec = entry_ir.LogicalAnd(
+			    initial_exec, IR::U1(entry_ir.Emit(IR::ValueOpcode::DispatchThreadInRange)));
+		}
 		entry_ir.SetExec(initial_exec);
 		const auto initial_mask = entry_ir.Emit(IR::ValueOpcode::Ballot, {initial_exec});
-		entry_ir.SetExecLo(entry_ir.CompositeExtract(initial_mask, 0));
-		entry_ir.SetExecHi(options.wave_size == 64u ? entry_ir.CompositeExtract(initial_mask, 1)
-		                                            : IR::U32(IR::Value(0u)));
+		const auto initial_lo = entry_ir.CompositeExtract(initial_mask, 0);
+		const auto initial_hi = options.wave_size == 64u ? entry_ir.CompositeExtract(initial_mask, 1)
+		                                               : IR::U32(IR::Value(0u));
+		entry_ir.SetExecLo(initial_lo);
+		entry_ir.SetExecHi(initial_hi);
 		if (options.stage == ShaderType::Compute) {
 			const auto* cs = options.input_info.compute;
 			const auto  thread_ids =
@@ -1142,7 +1225,8 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			}
 		} else if (options.stage == ShaderType::Mesh) {
 			const auto& mesh = options.input_info.vertex->mesh;
-			EXIT_NOT_IMPLEMENTED(mesh.primitives_per_group == 0u || mesh.vertices_per_group > 64u ||
+			EXIT_NOT_IMPLEMENTED(mesh.primitives_per_group == 0u || mesh.vertices_per_group > 0x1ffu ||
+			                     mesh.primitives_per_group > 0x1ffu ||
 			                     total_threads > 15u * options.wave_size);
 			const auto u32  = [](uint32_t value) { return IR::U32(IR::Value(value)); };
 			const auto draw = [&](uint32_t index) {
@@ -1178,6 +1262,10 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			const auto wave_info = entry_ir.BitwiseOr(entry_ir.ShiftLeftLogical(wave, u32(24)),
 			                                          u32(((total_threads + options.wave_size - 1u) /
 			                                               options.wave_size) << 28u));
+			entry_ir.SetScalarReg(
+			    static_cast<IR::ScalarReg>(2),
+			    entry_ir.BitwiseOr(entry_ir.ShiftLeftLogical(vertices, u32(12)),
+			                       entry_ir.ShiftLeftLogical(primitives, u32(22))));
 			entry_ir.SetScalarReg(
 			    static_cast<IR::ScalarReg>(3),
 			    entry_ir.BitwiseOr(wave_info, entry_ir.BitwiseOr(entry_ir.ShiftLeftLogical(
@@ -1216,6 +1304,16 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				                                         entry_ir.ShiftLeftLogical(second, u32(18))));
 				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(1),
 				                      entry_ir.ShiftLeftLogical(third, u32(2)));
+				// GS_VGPR_COMP_CNT names the last GS VGPR the SPI pre-loads: VGPR0 and VGPR1 carry the
+				// ES vertex offsets, VGPR2 the primitive ID and VGPR3 the GS invocation ID. Supply the
+				// ones this stage was told to expect; the lowering runs one invocation per primitive.
+				if (mesh.gs_vgpr_component_count >= 2u) {
+					entry_ir.SetVectorReg(static_cast<IR::VectorReg>(2),
+					                      entry_ir.IAdd(primitive_chunk, local));
+				}
+				if (mesh.gs_vgpr_component_count >= 3u) {
+					entry_ir.SetVectorReg(static_cast<IR::VectorReg>(3), u32(0));
+				}
 				const auto index_bytes  = draw(3);
 				const auto indexed      = entry_ir.INotEqual(index_bytes, u32(0));
 				const auto index_low    = draw(4);
@@ -1235,6 +1333,10 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				    IR::ValueOpcode::BitFieldUExtract,
 				    {packed_index, entry_ir.IMul(entry_ir.BitwiseAnd(byte_offset, u32(3)), u32(8)),
 				     entry_ir.IMul(index_bytes, u32(8))}));
+				// The ES half of the merged wave always starts at VGPR5 whatever GS_VGPR_COMP_CNT is:
+				// VGPR5 is the vertex index and VGPR8 the instance index. Both are written even when
+				// ES_VGPR_COMP_CNT says the SPI would stop short, so a stage that reads further than
+				// it declared still sees the right values.
 				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(5),
 				                      entry_ir.IAdd(draw(1), entry_ir.Select(indexed, index, input_vertex)));
 				entry_ir.SetVectorReg(
@@ -1286,6 +1388,8 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				}
 			};
 			barycentric_pair(ps->ps_perspective_center_vgpr, IR::StageInputKind::BaryCoordSmooth);
+			barycentric_pair(ps->ps_perspective_sample_vgpr,
+			                 IR::StageInputKind::BaryCoordSmoothSample);
 			barycentric_pair(ps->ps_perspective_centroid_vgpr,
 			                 IR::StageInputKind::BaryCoordSmoothCentroid);
 			uint32_t reg = ps->ps_system_input_base;
@@ -1317,11 +1421,42 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			}
 		} else if (options.stage == ShaderType::Vertex) {
 			// Vulkan owns primitive assembly; each vertex subgroup is one NGG wave.
-			// Keep its full lane extent: mbcnt(-1) uses lane ordinals, not active counts.
+			// ESVertCount describes input vertices, independently of lane ordinals.
+			auto vertex_count = IR::U32(entry_ir.Emit(IR::ValueOpcode::BitCount32, {initial_lo}));
+			if (options.wave_size == 64u) {
+				vertex_count = entry_ir.IAdd(vertex_count, IR::U32(entry_ir.Emit(
+				    IR::ValueOpcode::BitCount32, {initial_hi})));
+			}
 			entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(2),
 			                      IR::U32(IR::Value(options.wave_size << 12u)));
 			entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(3),
-			                      IR::U32(IR::Value((1u << 28u) | options.wave_size)));
+			                      entry_ir.BitwiseOr(vertex_count, IR::U32(IR::Value(1u << 28u))));
+			// Every PS5 vertex stage is the ES half of a merged NGG wave, and SGPR3 is the SPI's
+			// MERGED_WAVE_INFO: bits [7:0] the ES vertex count, bits [15:8] the GS primitive
+			// count. Both fields must be the population count of the entry ballot, never
+			// `wave_size`. The guest rebuilds EXEC from each as `(-1) >> (64 - field)` and then
+			// drains it with `s_andn2_b64 mask, mask, ballot`; a ballot can only set bits for lanes
+			// the host subgroup has, so a field of 64 leaves bits nothing can clear and the
+			// waterfall never terminates. Under-counting only loses vertices.
+			const auto imm = [](uint32_t value) { return IR::U32(IR::Value(value)); };
+			if (options.user_data_base > 3u) {
+				const auto counts = entry_ir.BitwiseOr(
+				    vertex_count, entry_ir.ShiftLeftLogical(vertex_count, imm(8u)));
+				entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(3),
+				                      entry_ir.BitwiseOr(counts, imm(1u << 28u)));
+			}
+			// VGPR0 and VGPR1 carry the ES vertex offsets of this GS lane's primitive as 14-bit
+			// slots at v0[15:2], v0[31:18] and v1[15:2]. One invocation is one vertex, so the only
+			// primitive a lane can name is its own vertex three times; unwritten they read 0 and
+			// every lane would read lane 0's slot.
+			{
+				const auto own_slot = entry_ir.ShiftLeftLogical(
+				    IR::U32(entry_ir.Emit(IR::ValueOpcode::LaneId)), imm(2u));
+				entry_ir.SetVectorReg(
+				    static_cast<IR::VectorReg>(0),
+				    entry_ir.BitwiseOr(own_slot, entry_ir.ShiftLeftLogical(own_slot, imm(16u))));
+				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(1), own_slot);
+			}
 			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(5),
 			                      builtin(IR::StageInputKind::VertexIndex));
 			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(8),
@@ -1329,10 +1464,11 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 		}
 	}
 	const bool flush_f32_inputs = options.stage == ShaderType::Compute &&
-	                             (options.input_info.compute->float_mode & 0x10u) == 0;
+	                              (options.input_info.compute->float_mode & 0x10u) == 0;
 	for (const auto& cfg_block: cfg.blocks) {
-		const auto typed_index = block_indices.at(cfg_block.id);
-		Translator translator(result, result.blocks[typed_index], vector_limit, flush_f32_inputs);
+		auto*      block = blocks_by_id.at(cfg_block.id);
+		Translator translator(result, block, vector_limit, flush_f32_inputs,
+		    options.stage == ShaderType::Compute && !options.input_info.compute->async_compute);
 		for (uint32_t index = cfg_block.inst_begin; index < cfg_block.inst_end; index++) {
 			const auto& instruction = decoded.instructions[index];
 			if (IsCodeTableLoad(cfg, instruction.pc)) {
@@ -1355,7 +1491,7 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			}
 			translator.TranslateInstruction(instruction);
 		}
-		translator.AddBranchCondition(cfg, cfg_block, result.block_info[typed_index]);
+		translator.AddBranchCondition(cfg, cfg_block, *block);
 	}
 	IR::ValidateProgram(result, false);
 	return result;

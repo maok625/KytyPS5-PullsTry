@@ -14,6 +14,7 @@
 #include "kernel/pthread.h"
 #include "kernel/semaphore.h"
 #include "kernel/syncOnAddress.h"
+#include "kernel/umtx.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "libs/network.h"
@@ -1210,8 +1211,14 @@ static KYTY_SYSV_ABI KernelModule KernelLoadStartModule(const char* module_file_
 
 	LOGF("\tmodule_file_name = %s\n", module_file_name);
 
-	EXIT_NOT_IMPLEMENTED(flags != 0);
-	EXIT_NOT_IMPLEMENTED(opt != nullptr);
+	if (flags != 0 || opt != nullptr) {
+		printf("sceKernelLoadStartModule: unsupported flags=0x%08x opt=%p\n", flags,
+		       static_cast<const void*>(opt));
+		if (res != nullptr) {
+			*res = KERNEL_ERROR_EINVAL;
+		}
+		return KERNEL_ERROR_EINVAL;
+	}
 
 	auto* rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
 
@@ -1246,7 +1253,10 @@ static KYTY_SYSV_ABI KernelModule KernelLoadStartModule(const char* module_file_
 
 	LOGF("\tmodule_start() result = %d\n", result);
 
-	EXIT_NOT_IMPLEMENTED(result < 0);
+	// A module whose module_start() fails is the guest's problem to report, not ours to die on.
+	if (result < 0) {
+		printf("sceKernelLoadStartModule: module_start() failed: result = %d\n", result);
+	}
 
 	if (res != nullptr) {
 		*res = result;
@@ -1264,8 +1274,11 @@ static int KYTY_SYSV_ABI KernelStopUnloadModule(KernelModule handle, size_t args
 
 	auto* rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
 
-	EXIT_NOT_IMPLEMENTED(flags != 0);
-	EXIT_NOT_IMPLEMENTED(opt != nullptr);
+	if (flags != 0 || opt != nullptr) {
+		printf("sceKernelStopUnloadModule: unsupported flags=0x%08x opt=%p\n", flags,
+		       static_cast<const void*>(opt));
+		return KERNEL_ERROR_EINVAL;
+	}
 
 	auto* program = rt->FindProgramById(handle);
 
@@ -1293,7 +1306,9 @@ static int KYTY_SYSV_ABI KernelStopUnloadModule(KernelModule handle, size_t args
 
 	LOGF("\tmodule_stop() result = %d\n", result);
 
-	EXIT_NOT_IMPLEMENTED(result < 0);
+	if (result < 0) {
+		printf("sceKernelStopUnloadModule: module_stop() failed: result = %d\n", result);
+	}
 
 	if (res != nullptr) {
 		*res = result;
@@ -1381,7 +1396,10 @@ static void KYTY_SYSV_ABI KernelRtldSetApplicationHeapAPI(void* api[]) {
 static int64_t KYTY_SYSV_ABI write(int d, const char* str, int64_t size) {
 	// PRINT_NAME();
 
-	EXIT_NOT_IMPLEMENTED(d < 0);
+	if (d < 0) {
+		*Posix::GetErrorAddr() = Posix::POSIX_EBADF;
+		return -1;
+	}
 
 	if (Network::Net::IsSocket(d)) {
 		return Network::Net::Send(d, str, static_cast<uint64_t>(size), 0);
@@ -1661,8 +1679,13 @@ static int KYTY_SYSV_ABI KernelGetModuleInfoFromAddr(uint64_t addr, int n, Modul
 	     "\tn = %d\n",
 	     addr, n);
 
-	EXIT_NOT_IMPLEMENTED(n != 2);
-	EXIT_NOT_IMPLEMENTED(r == nullptr);
+	// The only layout this knows is the two-segment ModuleInfo; anything else, and a null
+	// out-parameter, are reported the way a module lookup miss already is.
+	if (n != 2 || r == nullptr) {
+		printf("sceKernelGetModuleInfoFromAddr: unsupported request n=%d r=%p\n", n,
+		       static_cast<void*>(r));
+		return -1;
+	}
 
 	auto* rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
 
@@ -1714,7 +1737,9 @@ static KYTY_SYSV_ABI NewReplace* KernelGetSanitizerNewReplaceExternal() {
 static KYTY_SYSV_ABI int elf_phdr_match_addr(ModuleInfo* m, uint64_t dtor_vaddr) {
 	PRINT_NAME();
 
-	EXIT_NOT_IMPLEMENTED(m == nullptr);
+	if (m == nullptr) {
+		return 0;
+	}
 
 	auto* rt     = Common::Singleton<Loader::RuntimeLinker>::Instance();
 	auto* p      = rt->FindProgramByAddr(dtor_vaddr);
@@ -1768,7 +1793,10 @@ static KYTY_SYSV_ABI void pthread_cxa_finalize(void* /*p*/) {
 void KYTY_SYSV_ABI KernelSetThreadAtexitCount(get_thread_atexit_count_func_t func) {
 	PRINT_NAME();
 
-	EXIT_NOT_IMPLEMENTED(g_get_thread_atexit_count_func != nullptr);
+	if (g_get_thread_atexit_count_func != nullptr) {
+		printf("sceKernelSetThreadAtexitCount: already registered, keeping the first hook\n");
+		return;
+	}
 
 	g_get_thread_atexit_count_func = func;
 }
@@ -1776,7 +1804,10 @@ void KYTY_SYSV_ABI KernelSetThreadAtexitCount(get_thread_atexit_count_func_t fun
 void KYTY_SYSV_ABI KernelSetThreadAtexitReport(thread_atexit_report_func_t func) {
 	PRINT_NAME();
 
-	EXIT_NOT_IMPLEMENTED(g_thread_atexit_report_func != nullptr);
+	if (g_thread_atexit_report_func != nullptr) {
+		printf("sceKernelSetThreadAtexitReport: already registered, keeping the first hook\n");
+		return;
+	}
 
 	g_thread_atexit_report_func = func;
 }
@@ -1974,6 +2005,12 @@ int64_t KYTY_SYSV_ABI fstat(int d, LibKernel::FileSystem::FileStat* sb) {
 	return POSIX_N_CALL(LibKernel::FileSystem::KernelFstat(d, sb));
 }
 
+int KYTY_SYSV_ABI fcntl(int d, int command, int arg) {
+	PRINT_NAME();
+
+	return POSIX_N_CALL(LibKernel::FileSystem::KernelFcntl(d, command, arg));
+}
+
 int KYTY_SYSV_ABI ftruncate(int d, int64_t length) {
 	PRINT_NAME();
 
@@ -2120,37 +2157,45 @@ int KYTY_SYSV_ABI KernelSyncOnAddressWake(volatile void* address, int32_t count)
 	return LibKernel::SyncOnAddress::Wake(address, count);
 }
 
-int KYTY_SYSV_ABI UmtxOp(volatile void* address, int operation, uint64_t value,
-                           void* uaddr, const void* timeout) {
-	constexpr int UMTX_OP_WAIT = 2;
-	constexpr int UMTX_OP_WAKE = 3;
-
-	EXIT_NOT_IMPLEMENTED(uaddr != nullptr);
-
-	switch (operation) {
-		case UMTX_OP_WAIT:
-			if (timeout != nullptr) {
-				LibKernel::KernelTimespec duration {};
-				std::memcpy(&duration, timeout, sizeof(duration));
-				if (duration.tv_sec < 0 || duration.tv_nsec < 0 || duration.tv_nsec >= 1000000000) {
-					*GetErrorAddr() = POSIX_EINVAL;
-					return -1;
-				}
-				const auto max_ns = std::chrono::nanoseconds::max().count();
-				const auto timeout_ns = duration.tv_sec > (max_ns - duration.tv_nsec) / 1000000000
-				                            ? max_ns
-				                            : duration.tv_sec * 1000000000 + duration.tv_nsec;
-				return POSIX_CALL(LibKernel::SyncOnAddress::Wait64(
-				    static_cast<volatile uint64_t*>(address), value, std::chrono::nanoseconds(timeout_ns),
-				    LibKernel::KernelDispatchPendingSignalForCurrentThread));
-			}
-			return POSIX_CALL(LibKernel::SyncOnAddress::Wait64(
-			    static_cast<volatile uint64_t*>(address), value, nullptr,
-			    LibKernel::KernelDispatchPendingSignalForCurrentThread));
-		case UMTX_OP_WAKE:
-			return POSIX_CALL(LibKernel::SyncOnAddress::Wake(address, static_cast<int32_t>(value)));
-		default: EXIT("Unsupported _umtx_op operation: %d\n", operation);
+static bool UmtxClockGettime(int clock_id, int64_t* sec, int64_t* nsec) {
+	LibKernel::KernelTimespec ts {};
+	if (LibKernel::KernelClockGettime(static_cast<LibKernel::KernelClockid>(clock_id), &ts) != OK) {
+		return false;
 	}
+	*sec  = ts.tv_sec;
+	*nsec = ts.tv_nsec;
+	return true;
+}
+
+// The umutex owner word holds a thread id. Guest threads have one; a host worker thread that
+// somehow reaches this path gets a synthetic id so that it can still own a mutex distinctly.
+static uint32_t UmtxCurrentTid() {
+	const int guest_tid = LibKernel::PthreadGetthreadid();
+	if (guest_tid > 0) {
+		return static_cast<uint32_t>(guest_tid);
+	}
+
+	static std::atomic<uint32_t> next_host_tid {0x40000000u};
+	thread_local uint32_t host_tid = next_host_tid.fetch_add(1, std::memory_order_relaxed);
+	return host_tid;
+}
+
+int KYTY_SYSV_ABI UmtxOp(volatile void* address, int operation, uint64_t value, void* uaddr,
+                         void* uaddr2) {
+	static std::once_flag hooks_once;
+	std::call_once(hooks_once, []() {
+		LibKernel::Umtx::SetHooks(UmtxCurrentTid,
+		                          LibKernel::KernelDispatchPendingSignalForCurrentThread,
+		                          UmtxClockGettime);
+	});
+
+	const int error = LibKernel::Umtx::Op(const_cast<void*>(address), operation, value, uaddr,
+	                                      uaddr2);
+	if (error != OK) {
+		*GetErrorAddr() = error;
+		return -1;
+	}
+	return 0;
 }
 
 LIB_DEFINE(InitLibKernel_1_Posix) {
@@ -2163,6 +2208,7 @@ LIB_DEFINE(InitLibKernel_1_Posix) {
 	LIB_FUNC("E6ao34wPw+U", stat);
 	LIB_FUNC("JGMio+21L4c", mkdir);
 	LIB_FUNC("ih4CD9-gghM", Posix::ftruncate);
+	LIB_FUNC("8nY19bKoiZk", Posix::fcntl);
 	LIB_FUNC("pDuPEf3m4fI", Posix::sem_init);
 	LIB_FUNC("cDW233RAwWo", Posix::sem_destroy);
 	LIB_FUNC("YCV5dGGBcCo", Posix::sem_wait);
@@ -2189,6 +2235,7 @@ LIB_DEFINE(InitLibKernel_1_Posix) {
 	LIB_FUNC("wtkt-teR1so", Posix::pthread_attr_init);
 	LIB_FUNC("zHchY8ft5pk", Posix::pthread_attr_destroy);
 	LIB_FUNC("vQm4fDEsWi8", Posix::pthread_attr_getstack);
+	LIB_FUNC("-SrbXpGR1f0", Posix::pthread_attr_setstack);
 	LIB_FUNC("2Q0z6rnBrTE", Posix::pthread_attr_setstacksize);
 	LIB_FUNC("Ucsu-OK+els", Posix::pthread_attr_get_np);
 	LIB_FUNC("RtLRV-pBTTY", Posix::pthread_attr_getschedpolicy);
@@ -2827,8 +2874,11 @@ constexpr int32_t KERNEL_AIO_STATE_SUBMITTED  = 1;
 constexpr int32_t KERNEL_AIO_STATE_PROCESSING = 2;
 constexpr int32_t KERNEL_AIO_STATE_COMPLETED  = 3;
 constexpr int32_t KERNEL_AIO_STATE_ABORTED    = 4;
+constexpr int32_t KERNEL_AIO_STATE_NOTIFIED   = 0x10000;
 constexpr int32_t KERNEL_AIO_MAX_QUEUE        = 512;
 constexpr int32_t KERNEL_AIO_MAX_REQUESTS     = 128;
+constexpr uint32_t KERNEL_AIO_WAIT_AND        = 1;
+constexpr uint32_t KERNEL_AIO_WAIT_OR         = 2;
 
 struct KernelAioResult {
 	int64_t  return_value;
@@ -2931,47 +2981,91 @@ int KYTY_SYSV_ABI KernelAioSubmitWriteCommands(KernelAioRwRequest* req, int32_t 
 	return OK;
 }
 
+static int32_t kernel_aio_get_state(int32_t id, bool notify) {
+	if (!kernel_aio_is_valid_id(id)) {
+		return LibKernel::KERNEL_ERROR_ESRCH;
+	}
+
+	auto current = g_kernel_aio_state[id].load(std::memory_order_acquire);
+	while (notify && (current == KERNEL_AIO_STATE_COMPLETED || current == KERNEL_AIO_STATE_ABORTED)) {
+		if (g_kernel_aio_state[id].compare_exchange_weak(current, current | KERNEL_AIO_STATE_NOTIFIED,
+		                                                std::memory_order_acq_rel)) {
+			break;
+		}
+	}
+	return current == 0 ? LibKernel::KERNEL_ERROR_ESRCH : current;
+}
+
 int KYTY_SYSV_ABI KernelAioPollRequest(int32_t id, int32_t* state) {
 	PRINT_NAME();
 
 	if (state == nullptr) {
 		return LibKernel::KERNEL_ERROR_EFAULT;
 	}
-
-	if (!kernel_aio_is_valid_id(id)) {
-		return LibKernel::KERNEL_ERROR_EINVAL;
-	}
-
-	*state = g_kernel_aio_state[id].load(std::memory_order_acquire);
+	*state = kernel_aio_get_state(id, true);
 	return OK;
 }
 
-int KYTY_SYSV_ABI KernelAioWaitRequest(int32_t id, int32_t* state, uint32_t* usec) {
-	PRINT_NAME();
-
-	if (state == nullptr) {
+int KYTY_SYSV_ABI KernelAioPollRequests(int32_t* ids, int32_t num, int32_t* states) {
+	if (ids == nullptr || states == nullptr) {
 		return LibKernel::KERNEL_ERROR_EFAULT;
 	}
+	if (num <= 0 || num > KERNEL_AIO_MAX_REQUESTS) {
+		return LibKernel::KERNEL_ERROR_EINVAL;
+	}
+	for (int32_t i = 0; i < num; i++) {
+		KernelAioPollRequest(ids[i], &states[i]);
+	}
+	return OK;
+}
 
-	if (!kernel_aio_is_valid_id(id)) {
+int KYTY_SYSV_ABI KernelAioWaitRequests(int32_t* ids, int32_t num, int32_t* states, uint32_t mode,
+                                        uint32_t* usec) {
+	PRINT_NAME();
+
+	if (ids == nullptr || states == nullptr) {
+		return LibKernel::KERNEL_ERROR_EFAULT;
+	}
+	if (num <= 0 || num > KERNEL_AIO_MAX_REQUESTS ||
+	    (num != 1 && mode != KERNEL_AIO_WAIT_AND && mode != KERNEL_AIO_WAIT_OR)) {
 		return LibKernel::KERNEL_ERROR_EINVAL;
 	}
 
-	uint32_t waited  = 0;
-	auto     current = g_kernel_aio_state[id].load(std::memory_order_acquire);
-	while (current == KERNEL_AIO_STATE_PROCESSING) {
-		if (usec != nullptr && *usec != 0 && waited >= *usec) {
-			*state = current;
-			return LibKernel::KERNEL_ERROR_ETIMEDOUT;
+	const auto collect_states = [&](bool notify) {
+		int32_t finished = 0;
+		bool newly_complete = false;
+		for (int32_t i = 0; i < num; i++) {
+			const auto current = kernel_aio_get_state(ids[i], notify);
+			states[i] = current;
+			finished += current != KERNEL_AIO_STATE_PROCESSING;
+			newly_complete |= current == KERNEL_AIO_STATE_COMPLETED || current == KERNEL_AIO_STATE_ABORTED;
 		}
-
+		return finished == num || (mode == KERNEL_AIO_WAIT_OR && newly_complete);
+	};
+	const auto start = std::chrono::steady_clock::now();
+	for (;;) {
+		const bool complete = collect_states(false);
+		const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+		                         std::chrono::steady_clock::now() - start).count();
+		const bool timed_out = usec != nullptr && elapsed >= *usec;
+		if (complete || timed_out) {
+			// A competing waiter can claim the newly completed request after the first scan.
+			if (collect_states(true)) {
+				if (usec != nullptr) {
+					*usec = elapsed < *usec ? *usec - static_cast<uint32_t>(elapsed) : 0;
+				}
+				return OK;
+			}
+			if (timed_out) {
+				return LibKernel::KERNEL_ERROR_ETIMEDOUT;
+			}
+		}
 		Common::Thread::SleepMicro(10);
-		waited += 10;
-		current = g_kernel_aio_state[id].load(std::memory_order_acquire);
 	}
+}
 
-	*state = current;
-	return OK;
+int KYTY_SYSV_ABI KernelAioWaitRequest(int32_t id, int32_t* state, uint32_t* usec) {
+	return KernelAioWaitRequests(&id, 1, state, KERNEL_AIO_WAIT_AND, usec);
 }
 
 int KYTY_SYSV_ABI KernelAioDeleteRequest(int32_t id, int32_t* ret) {
@@ -2982,12 +3076,35 @@ int KYTY_SYSV_ABI KernelAioDeleteRequest(int32_t id, int32_t* ret) {
 	}
 
 	if (!kernel_aio_is_valid_id(id)) {
-		return LibKernel::KERNEL_ERROR_EINVAL;
+		*ret = LibKernel::KERNEL_ERROR_ESRCH;
+		return OK;
 	}
 
-	g_kernel_aio_state[id].store(KERNEL_AIO_STATE_ABORTED, std::memory_order_release);
-	*ret = OK;
+	auto current = g_kernel_aio_state[id].load(std::memory_order_acquire);
+	for (;;) {
+		const auto state = current & ~KERNEL_AIO_STATE_NOTIFIED;
+		if (state != KERNEL_AIO_STATE_COMPLETED && state != KERNEL_AIO_STATE_ABORTED) {
+			*ret = current == 0 ? LibKernel::KERNEL_ERROR_ESRCH : LibKernel::KERNEL_ERROR_EBUSY;
+			break;
+		}
+		if (g_kernel_aio_state[id].compare_exchange_weak(current, 0, std::memory_order_acq_rel)) {
+			*ret = OK;
+			break;
+		}
+	}
+	return OK;
+}
 
+int KYTY_SYSV_ABI KernelAioDeleteRequests(int32_t* ids, int32_t num, int32_t* rets) {
+	if (ids == nullptr || rets == nullptr) {
+		return LibKernel::KERNEL_ERROR_EFAULT;
+	}
+	if (num <= 0 || num > KERNEL_AIO_MAX_REQUESTS) {
+		return LibKernel::KERNEL_ERROR_EINVAL;
+	}
+	for (int32_t i = 0; i < num; i++) {
+		KernelAioDeleteRequest(ids[i], &rets[i]);
+	}
 	return OK;
 }
 
@@ -3039,6 +3156,7 @@ LIB_DEFINE(InitLibKernel_1_FS) {
 	LIB_FUNC("mBd4AfLP+u8", FileSystem::KernelPwritev);
 	LIB_FUNC("eV9wAD2riIA", FileSystem::KernelStat);
 	LIB_FUNC("kBwCPsYX-m4", FileSystem::KernelFstat);
+	LIB_FUNC("VW3TVZiM4-E", FileSystem::KernelFtruncate);
 	LIB_FUNC("AUXVxWeJU-A", FileSystem::KernelUnlink);
 	LIB_FUNC("52NcYU9+lEo", FileSystem::KernelRename);
 	LIB_FUNC("taRWhTJFTgE", FileSystem::KernelGetdirentries);
@@ -3103,6 +3221,7 @@ LIB_DEFINE(InitLibKernel_1_Equeue) {
 	LIB_FUNC("WDszmSbWuDk", EventQueue::KernelAddUserEventEdge);
 	LIB_FUNC("F6e0kwo4cnk", EventQueue::KernelTriggerUserEvent);
 	LIB_FUNC("LJDwdSNTnDg", EventQueue::KernelDeleteUserEvent);
+	LIB_FUNC("57ZK+ODEXWY", EventQueue::KernelAddTimerEvent);
 	LIB_FUNC("R74tt43xP6k", EventQueue::KernelAddHRTimerEvent);
 	LIB_FUNC("J+LF6LwObXU", EventQueue::KernelDeleteHRTimerEvent);
 	LIB_FUNC("bBfz7kMF2Ho", EventQueue::KernelAddAmprEvent);
@@ -3325,9 +3444,12 @@ LIB_DEFINE(InitLibKernel_1) {
 	LIB_FUNC("kbw4UHHSYy0", LibKernel::pthread_cxa_finalize);
 	LIB_FUNC("lLMT9vJAck0", LibKernel::clock_gettime);
 	LIB_FUNC("5TgME6AYty4", KernelAioDeleteRequest);
+	LIB_FUNC("Ft3EtsZzAoY", KernelAioDeleteRequests);
 	LIB_FUNC("HgX7+AORI58", KernelAioSubmitReadCommands);
 	LIB_FUNC("2pOuoWoCxdk", KernelAioPollRequest);
+	LIB_FUNC("o7O4z3jwKzo", KernelAioPollRequests);
 	LIB_FUNC("KOF-oJbQVvc", KernelAioWaitRequest);
+	LIB_FUNC("lgK+oIWkJyA", KernelAioWaitRequests);
 	LIB_FUNC("XQ8C8y+de+E", KernelAioSubmitWriteCommands);
 	LIB_FUNC("nu4a0-arQis", KernelAioInitializeParam);
 	LIB_FUNC("il03nluKfMk", LibKernel::KernelRaiseException);

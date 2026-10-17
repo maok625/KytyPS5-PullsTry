@@ -93,6 +93,7 @@ bool HasSideEffects(ValueOpcode opcode) {
 		case ValueOpcode::SetAttribute:
 		case ValueOpcode::SetTessellationAttribute:
 		case ValueOpcode::MeshAllocate:
+		case ValueOpcode::StoreCompletion:
 		case ValueOpcode::Barrier: return true;
 		default: return false;
 	}
@@ -174,10 +175,13 @@ SharedAccess SharedAccessOf(ValueOpcode opcode) {
 		case ValueOpcode::SharedAtomicUMin32:
 		case ValueOpcode::SharedAtomicSMax32:
 		case ValueOpcode::SharedAtomicUMax32:
+		case ValueOpcode::SharedAtomicUMax64:
+		case ValueOpcode::SharedAtomicCmpSwap64:
 		case ValueOpcode::SharedAtomicAnd32:
 		case ValueOpcode::SharedAtomicOr32:
 		case ValueOpcode::SharedAtomicOr64:
-		case ValueOpcode::SharedAtomicXor32: return SharedAccess::Atomic;
+		case ValueOpcode::SharedAtomicXor32:
+		case ValueOpcode::SharedAtomicMaskedOr32: return SharedAccess::Atomic;
 		case ValueOpcode::DataAppend: return SharedAccess::Append;
 		case ValueOpcode::DataConsume: return SharedAccess::Consume;
 		default: return SharedAccess::None;
@@ -189,7 +193,9 @@ uint32_t SharedComponentCount(ValueOpcode opcode) {
 		case ValueOpcode::SharedAtomicIAdd64:
 		case ValueOpcode::SharedAtomicOr64:
 		case ValueOpcode::LoadSharedU32x2:
-		case ValueOpcode::WriteSharedU32x2: return 2u;
+		case ValueOpcode::WriteSharedU32x2:
+		case ValueOpcode::SharedAtomicUMax64:
+		case ValueOpcode::SharedAtomicCmpSwap64: return 2u;
 		case ValueOpcode::LoadSharedU32x3:
 		case ValueOpcode::WriteSharedU32x3: return 3u;
 		case ValueOpcode::LoadSharedU32x4:
@@ -222,14 +228,21 @@ ImageOpcodeInfo ImageOpcodeInfoOf(ValueOpcode opcode) {
 			return {ImageAccess::Write, ImageResourceClass::Storage, false};
 		case ValueOpcode::ImageAtomicCompareSwap32:
 		case ValueOpcode::ImageAtomicSwap32:
+		case ValueOpcode::ImageAtomicSwap64:
 		case ValueOpcode::ImageAtomicIAdd32:
+		case ValueOpcode::ImageAtomicIAdd64:
 		case ValueOpcode::ImageAtomicSMin32:
 		case ValueOpcode::ImageAtomicUMin32:
+		case ValueOpcode::ImageAtomicUMin64:
 		case ValueOpcode::ImageAtomicSMax32:
 		case ValueOpcode::ImageAtomicUMax32:
+		case ValueOpcode::ImageAtomicUMax64:
 		case ValueOpcode::ImageAtomicAnd32:
+		case ValueOpcode::ImageAtomicAnd64:
 		case ValueOpcode::ImageAtomicOr32:
+		case ValueOpcode::ImageAtomicOr64:
 		case ValueOpcode::ImageAtomicXor32:
+		case ValueOpcode::ImageAtomicXor64:
 		case ValueOpcode::ImageAtomicFMin32:
 		case ValueOpcode::ImageAtomicFMax32:
 			return {ImageAccess::Atomic, ImageResourceClass::Storage, false};

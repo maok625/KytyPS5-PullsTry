@@ -9,10 +9,14 @@
 
 #include <algorithm>
 #include <bit>
+#include <cinttypes>
 #include <fmt/format.h>
 
 namespace Libs::Graphics::ShaderRecompiler::Decoder {
 namespace {
+
+thread_local uint64_t    t_decode_hash = 0;
+thread_local const void* t_decode_code = nullptr;
 
 bool HasLiteral(const Instruction& inst) {
 	return inst.src0.kind == OperandKind::LiteralConstant ||
@@ -77,8 +81,8 @@ std::string FormatMemory(const Instruction& inst) {
 	                    inst.offset, inst.secondary_offset, inst.data_dwords, inst.data_bits,
 	                    inst.data_format, inst.number_format, inst.data_signed ? 1u : 0u,
 	                    inst.typed ? 1u : 0u, inst.formatted ? 1u : 0u, inst.memory_segment,
-	                    inst.glc ? 1u : 0u, inst.dlc ? 1u : 0u, inst.slc ? 1u : 0u, inst.idxen ? 1u : 0u,
-	                    inst.offen ? 1u : 0u);
+	                    inst.glc ? 1u : 0u, inst.dlc ? 1u : 0u, inst.slc ? 1u : 0u,
+	                    inst.idxen ? 1u : 0u, inst.offen ? 1u : 0u);
 	return text;
 }
 
@@ -123,10 +127,16 @@ std::string ImageSampleFlagsToString(uint32_t flags) {
 }
 
 std::string FormatMimg(const Instruction& inst) {
-	const char* sample_name =
-	    inst.opcode == Opcode::IMAGE_SAMPLE ? MimgSampleOpcodeName(inst.opcode_id) : nullptr;
+	// The three encoding spaces are disjoint, so a plain first-hit lookup is unambiguous.
+	const char* mimg_name = MimgSampleOpcodeName(inst.opcode_id);
+	if (mimg_name == nullptr) {
+		mimg_name = MimgGatherOpcodeName(inst.opcode_id);
+	}
+	if (mimg_name == nullptr) {
+		mimg_name = MimgBvhOpcodeName(inst.opcode_id);
+	}
 	const std::string_view name =
-	    sample_name != nullptr ? sample_name : magic_enum::enum_name(inst.opcode);
+	    mimg_name != nullptr ? mimg_name : magic_enum::enum_name(inst.opcode);
 	std::string text =
 	    fmt::format("0x{:08x}: {} {}, {}, {}, {} ; dmask=0x{:x} image_dim={}", inst.pc, name,
 	                OperandToString(inst.dst).c_str(), OperandToString(inst.src0).c_str(),
@@ -140,14 +150,8 @@ std::string FormatMimg(const Instruction& inst) {
 	}
 	switch (inst.opcode) {
 		case Opcode::IMAGE_SAMPLE:
-		case Opcode::IMAGE_GATHER4_L:
-		case Opcode::IMAGE_GATHER4_LZ:
-		case Opcode::IMAGE_GATHER4_C:
-		case Opcode::IMAGE_GATHER4_C_LZ:
-		case Opcode::IMAGE_GATHER4_LZ_O:
-		case Opcode::IMAGE_GATHER4_C_O:
-		case Opcode::IMAGE_GATHER4_C_LZ_O:
-		case Opcode::IMAGE_GATHER4H:
+		case Opcode::IMAGE_GATHER4:
+		case Opcode::IMAGE_BVH_INTERSECT_RAY:
 			text += fmt::format(" sample_flags={} addr_components={}",
 			                    ImageSampleFlagsToString(inst.image_sample_flags).c_str(),
 			                    inst.image_address_components);
@@ -186,7 +190,9 @@ bool IsConditionalBranch(Opcode opcode) {
 	switch (opcode) {
 		// Conditional shader debugging is disabled.
 		case Opcode::S_CBRANCH_CDBGSYS:
-		case Opcode::S_CBRANCH_CDBGSYS_OR_USER: return false;
+		case Opcode::S_CBRANCH_CDBGUSER:
+		case Opcode::S_CBRANCH_CDBGSYS_OR_USER:
+		case Opcode::S_CBRANCH_CDBGSYS_AND_USER: return false;
 		case Opcode::S_CBRANCH_SCC0:
 		case Opcode::S_CBRANCH_SCC1:
 		case Opcode::S_CBRANCH_VCCZ:
@@ -258,14 +264,17 @@ void DecodeScalarSource(uint32_t code, uint32_t pc, Operand& operand) {
 		case 237u: operand.kind = OperandKind::PrivateBase; return;
 		case 239u: operand.kind = OperandKind::PopsExitingWaveId; return;
 		case 248u:
-			operand.kind      = OperandKind::FloatInlineConstant;
+			operand.kind  = OperandKind::FloatInlineConstant;
 			operand.value = std::bit_cast<uint32_t>(0.15915494309189535f);
 			return;
 		case 251u: operand.kind = OperandKind::VccZ; return;
 		case 252u: operand.kind = OperandKind::ExecZ; return;
 		case 253u: operand.kind = OperandKind::Scc; return;
 		case 255u: operand.kind = OperandKind::LiteralConstant; return;
-		default: EXIT("unsupported scalar source operand 0x%08x at pc 0x%08x", code, pc);
+		default:
+			EXIT("unsupported scalar source operand 0x%08x at pc 0x%08x, shader hash 0x%016" PRIx64
+			     " code 0x%016" PRIx64,
+			     code, pc, t_decode_hash, reinterpret_cast<uint64_t>(t_decode_code));
 	}
 }
 
@@ -285,7 +294,10 @@ void DecodeScalarDestination(uint32_t code, uint32_t pc, Operand& operand) {
 		case 125u: operand.kind = OperandKind::Null; return;
 		case 126u: operand.kind = OperandKind::ExecLo; return;
 		case 127u: operand.kind = OperandKind::ExecHi; return;
-		default: EXIT("unsupported scalar destination operand 0x%08x at pc 0x%08x", code, pc);
+		default:
+			EXIT("unsupported scalar destination operand 0x%08x at pc 0x%08x, shader hash "
+			     "0x%016" PRIx64 " code 0x%016" PRIx64,
+			     code, pc, t_decode_hash, reinterpret_cast<uint64_t>(t_decode_code));
 	}
 }
 
@@ -379,7 +391,14 @@ void DecodeInstruction(std::span<const uint32_t> code, uint32_t word_index, Inst
 		case Family::MIMG: DecodeMimg(pc, code, word_index, inst); return;
 		case Family::EXP: DecodeExp(pc, code, word_index, inst); return;
 		default:
-			EXIT("unknown RDNA2 instruction family at pc 0x%08x, raw=0x%08x", pc, code[word_index]);
+			// Not fatal: an encoding family this decoder does not model is reported the way an
+			// unimplemented opcode inside a known family already is. BuildGraph refuses any program
+			// holding an UNSUPPORTED instruction, so the shader is skipped and named instead of
+			// taking the process down with it.
+			SetRawWords(inst, code, word_index, 1);
+			SetUnsupported(inst, Family::Unknown, code[word_index] >> 26u,
+			               "RDNA2 instruction family is not implemented");
+			return;
 	}
 }
 
@@ -389,6 +408,7 @@ Program DecodeFrontProgram(std::span<const uint32_t> front) {
 	while (front_words < front.size()) {
 		auto& inst = result.instructions.emplace_back();
 		DecodeInstruction(front, front_words, inst);
+		result.has_swap_pc |= inst.opcode == Opcode::S_SWAPPC_B64;
 		front_words += inst.word_count;
 		if (inst.opcode == Opcode::S_SETPC_B64) {
 			EXIT_NOT_IMPLEMENTED(inst.src0.kind != OperandKind::Sgpr || inst.src0.reg != 6u);
@@ -406,13 +426,22 @@ void DecodeProgram(std::span<const uint32_t> code, Program& program) {
 	program.instructions.clear();
 	program.instructions.reserve(code.size());
 	program.code = code;
+	program.has_swap_pc = false;
 
 	std::vector<bool> branch_targets;
 	for (uint32_t word_index = 0; word_index < code.size();) {
 		program.instructions.emplace_back();
 		DecodeInstruction(code, word_index, program.instructions.back());
 
-		const auto& inst = program.instructions.back();
+		auto& inst = program.instructions.back();
+		if (inst.word_count == 0) {
+			// A zero-width instruction would advance nothing and spin here forever, appending a
+			// decode every pass. Refuse the shader and name it instead.
+			SetRawWords(inst, code, word_index, 1);
+			SetUnsupported(inst, Family::Unknown, code[word_index] >> 26u,
+			               "decoder produced a zero-length instruction");
+		}
+		program.has_swap_pc |= inst.opcode == Opcode::S_SWAPPC_B64;
 		word_index += inst.word_count;
 
 		if (IsDirectBranch(inst.opcode)) {
@@ -428,7 +457,9 @@ void DecodeProgram(std::span<const uint32_t> code, Program& program) {
 		}
 	}
 
-	EXIT("shader decode reached the code boundary before S_ENDPGM");
+	EXIT("shader decode reached the code boundary before S_ENDPGM, shader hash 0x%016" PRIx64
+	     " code 0x%016" PRIx64,
+	     t_decode_hash, reinterpret_cast<uint64_t>(t_decode_code));
 }
 
 std::string OperandToString(const Operand& operand) {
@@ -503,8 +534,14 @@ std::string InstructionToString(const Instruction& inst) {
 			                                               OperandToString(inst.dst).c_str(),
 			                                               OperandToString(inst.src0).c_str()));
 		case Opcode::S_ABS_I32:
+		case Opcode::S_SEXT_I32_I8:
+		case Opcode::S_SEXT_I32_I16:
 		case Opcode::S_BREV_B32:
 		case Opcode::S_BREV_B64:
+		case Opcode::S_BCNT0_I32_B32:
+		case Opcode::S_BCNT0_I32_B64:
+		case Opcode::S_FF0_I32_B32:
+		case Opcode::S_FF0_I32_B64:
 		case Opcode::S_BCNT1_I32_B32:
 		case Opcode::S_FLBIT_I32_B32:
 		case Opcode::S_FF1_I32_B32:
@@ -531,10 +568,19 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::S_SETPC_B64:
 			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: s_setpc_b64 {}", inst.pc,
 			                                               OperandToString(inst.src0).c_str()));
+		case Opcode::S_SWAPPC_B64:
+			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: s_swappc_b64 {}, {}", inst.pc,
+			                                               OperandToString(inst.dst).c_str(),
+			                                               OperandToString(inst.src0).c_str()));
 		case Opcode::S_SETREG_B32:
 			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: s_setreg_b32 {}, {}", inst.pc,
 			                                               OperandToString(inst.src0).c_str(),
 			                                               OperandToString(inst.src1).c_str()));
+		case Opcode::S_WAITCNT_VSCNT:
+			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: {} {}, {}", inst.pc,
+			                                               magic_enum::enum_name(inst.opcode),
+			                                               OperandToString(inst.src0),
+			                                               OperandToString(inst.src1)));
 		case Opcode::S_NOP:
 		case Opcode::S_WAITCNT:
 		case Opcode::S_WAITCNT_DEPCTR:
@@ -561,15 +607,18 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::S_CBRANCH_EXECZ:
 		case Opcode::S_CBRANCH_EXECNZ:
 		case Opcode::S_CBRANCH_CDBGSYS:
+		case Opcode::S_CBRANCH_CDBGUSER:
 		case Opcode::S_CBRANCH_CDBGSYS_OR_USER:
+		case Opcode::S_CBRANCH_CDBGSYS_AND_USER:
 			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: {} 0x{:08x}", inst.pc,
 			                                               magic_enum::enum_name(inst.opcode),
 			                                               inst.branch_target));
 		case Opcode::S_SUBVECTOR_LOOP_BEGIN:
 		case Opcode::S_SUBVECTOR_LOOP_END:
-			return WithUnsupportedReason(inst, fmt::format(
-			    "0x{:08x}: {} {}, 0x{:08x}", inst.pc, magic_enum::enum_name(inst.opcode),
-			    OperandToString(inst.dst), inst.branch_target));
+			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: {} {}, 0x{:08x}", inst.pc,
+			                                               magic_enum::enum_name(inst.opcode),
+			                                               OperandToString(inst.dst),
+			                                               inst.branch_target));
 		case Opcode::EXP: return WithUnsupportedReason(inst, FormatExp(inst));
 		case Opcode::IMAGE_SAMPLE:
 		case Opcode::IMAGE_STORE:
@@ -590,14 +639,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::IMAGE_LOAD_MIP:
 		case Opcode::IMAGE_GET_RESINFO:
 		case Opcode::IMAGE_GET_LOD:
-		case Opcode::IMAGE_GATHER4_L:
-		case Opcode::IMAGE_GATHER4_LZ:
-		case Opcode::IMAGE_GATHER4_C:
-		case Opcode::IMAGE_GATHER4_C_LZ:
-		case Opcode::IMAGE_GATHER4_LZ_O:
-		case Opcode::IMAGE_GATHER4_C_O:
-		case Opcode::IMAGE_GATHER4_C_LZ_O:
-		case Opcode::IMAGE_GATHER4H: return WithUnsupportedReason(inst, FormatMimg(inst));
+		case Opcode::IMAGE_GATHER4: return WithUnsupportedReason(inst, FormatMimg(inst));
 		case Opcode::S_LOAD_DWORD:
 		case Opcode::S_LOAD_DWORDX2:
 		case Opcode::S_LOAD_DWORDX4:
@@ -612,12 +654,16 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::BUFFER_LOAD_FORMAT_XY:
 		case Opcode::BUFFER_LOAD_FORMAT_XYZ:
 		case Opcode::BUFFER_LOAD_FORMAT_XYZW:
+		case Opcode::BUFFER_LOAD_FORMAT_D16_X:
 		case Opcode::BUFFER_STORE_FORMAT_X:
 		case Opcode::BUFFER_STORE_FORMAT_XY:
 		case Opcode::BUFFER_STORE_FORMAT_XYZ:
 		case Opcode::BUFFER_STORE_FORMAT_XYZW:
+		case Opcode::BUFFER_STORE_FORMAT_D16_X:
 		case Opcode::BUFFER_LOAD_UBYTE:
 		case Opcode::BUFFER_LOAD_USHORT:
+		case Opcode::BUFFER_LOAD_SHORT_D16:
+		case Opcode::BUFFER_LOAD_SHORT_D16_HI:
 		case Opcode::BUFFER_LOAD_DWORD:
 		case Opcode::BUFFER_LOAD_DWORDX2:
 		case Opcode::BUFFER_LOAD_DWORDX3:
@@ -658,6 +704,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::FLAT_LOAD_SBYTE:
 		case Opcode::FLAT_LOAD_USHORT:
 		case Opcode::FLAT_LOAD_SSHORT:
+		case Opcode::FLAT_LOAD_SHORT_D16:
 		case Opcode::FLAT_LOAD_DWORD:
 		case Opcode::FLAT_LOAD_DWORDX2:
 		case Opcode::FLAT_LOAD_DWORDX3:
@@ -685,6 +732,8 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::DS_MIN_RTN_U32:
 		case Opcode::DS_MAX_U32:
 		case Opcode::DS_MAX_RTN_U32:
+		case Opcode::DS_MAX_RTN_U64:
+		case Opcode::DS_CMPST_RTN_B64:
 		case Opcode::DS_AND_B32:
 		case Opcode::DS_AND_RTN_B32:
 		case Opcode::DS_OR_B32:
@@ -692,10 +741,12 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::DS_OR_RTN_B32:
 		case Opcode::DS_XOR_B32:
 		case Opcode::DS_XOR_RTN_B32:
+		case Opcode::DS_MSKOR_B32:
 		case Opcode::DS_WRXCHG_RTN_B32:
 		case Opcode::DS_MIN_F32:
 		case Opcode::DS_MAX_F32:
 		case Opcode::DS_SWIZZLE_B32:
+		case Opcode::DS_PERMUTE_B32:
 		case Opcode::DS_BPERMUTE_B32:
 		case Opcode::DS_READ_I8:
 		case Opcode::DS_READ_U8:
@@ -725,6 +776,17 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::DS_READ_ADDTID_B32: return WithUnsupportedReason(inst, FormatMemory(inst));
 		default: return WithUnsupportedReason(inst, FormatBinary(inst));
 	}
+}
+
+DecodeContextScope::DecodeContextScope(uint64_t hash, const void* code)
+    : m_previous_hash(t_decode_hash), m_previous_code(t_decode_code) {
+	t_decode_hash = hash;
+	t_decode_code = code;
+}
+
+DecodeContextScope::~DecodeContextScope() {
+	t_decode_hash = m_previous_hash;
+	t_decode_code = m_previous_code;
 }
 
 std::string ProgramToString(const Program& program) {

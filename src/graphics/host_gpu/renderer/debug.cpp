@@ -294,8 +294,9 @@ static void RtCheck(const HW::RenderTarget& rt) {
 		EXIT_NOT_IMPLEMENTED(rt.dcc.overwrite_combiner_disable != false);
 		// EXIT_NOT_IMPLEMENTED(rt.dcc.data_write_on_dcc_clear_to_reg != false);
 		EXIT_NOT_IMPLEMENTED(rt.dcc.dcc_clear_key_enable != false);
-		if (rt.cmask.addr != 0x0000000000000000 || rt.fmask.addr != 0x0000000000000000 ||
-		    rt.dcc_addr.addr != 0x0000000000000000) {
+		// DCC and single-sample CMASK are consumed as clear metadata; FMASK is never read.
+		if ((rt.cmask.addr != 0 && !rt.info.cmask_fast_clear_enable) || rt.fmask.addr != 0 ||
+		    (rt.dcc_addr.addr != 0 && !rt.info.dcc_compression_enable)) {
 			static bool logged = false;
 			if (!logged) {
 				LOGF("RenderTarget: temporary: ignoring PS5 metadata addresses cmask=0x%016" PRIx64
@@ -394,24 +395,18 @@ static void RcPrint(const char* func, const HW::RenderControl& c) {
 
 	LOGF("\t depth_clear_enable       = %s\n"
 	     "\t stencil_clear_enable     = %s\n"
+	     "\t copy_depth_to_color      = %s\n"
+	     "\t copy_stencil_to_color    = %s\n"
 	     "\t resummarize_enable       = %s\n"
 	     "\t stencil_compress_disable = %s\n"
 	     "\t depth_compress_disable   = %s\n"
 	     "\t copy_centroid            = %s\n"
 	     "\t copy_sample              = %" PRIu8 "\n",
 	     c.depth_clear_enable ? "true" : "false", c.stencil_clear_enable ? "true" : "false",
+	     c.copy_depth_to_color ? "true" : "false", c.copy_stencil_to_color ? "true" : "false",
 	     c.resummarize_enable ? "true" : "false", c.stencil_compress_disable ? "true" : "false",
 	     c.depth_compress_disable ? "true" : "false", c.copy_centroid ? "true" : "false",
 	     c.copy_sample);
-}
-
-static void RcCheck(const HW::RenderControl& c) {
-	// EXIT_NOT_IMPLEMENTED(c.depth_clear_enable != false);
-	// EXIT_NOT_IMPLEMENTED(c.stencil_clear_enable != false);
-	// EXIT_NOT_IMPLEMENTED(c.stencil_compress_disable != false);
-	// EXIT_NOT_IMPLEMENTED(c.depth_compress_disable != false);
-	EXIT_NOT_IMPLEMENTED(c.copy_centroid != false);
-	EXIT_NOT_IMPLEMENTED(c.copy_sample != 0);
 }
 
 static void McPrint(const char* func, const HW::ModeControl& c) {
@@ -440,15 +435,6 @@ static void McCheck(const HW::ModeControl& c) {
 	// EXIT_NOT_IMPLEMENTED(c.cull_front != false);
 	// EXIT_NOT_IMPLEMENTED(c.cull_back != false);
 	// EXIT_NOT_IMPLEMENTED(c.face != false);
-	if (c.vtx_window_offset_enable) {
-		static bool logged = false;
-		if (!logged) {
-			LOGF("\t temporary: PA_SU_SC_MODE_CNTL.VTX_WINDOW_OFFSET_ENABLE is not fully "
-			     "implemented; continuing without vertex window "
-			     "offset adjustment\n");
-			logged = true;
-		}
-	}
 	EXIT_NOT_IMPLEMENTED(c.persp_corr_dis != false);
 }
 
@@ -475,15 +461,7 @@ static void BcPrint(const char* func, const HW::BlendControl& c, const HW::Blend
 	     color.red, color.green, color.blue, color.alpha, cc.mode, cc.op);
 }
 
-static void BcCheck(const HW::BlendColor& color, const HW::ColorControl& cc) {
-	if (color.red != 0.0f || color.green != 0.0f || color.blue != 0.0f || color.alpha != 0.0f) {
-		static bool logged = false;
-		if (!logged) {
-			LOGF("BlendControl: temporary: accepting nonzero blend constants (%f, %f, %f, %f)\n",
-			     color.red, color.green, color.blue, color.alpha);
-			logged = true;
-		}
-	}
+static void BcCheck(const HW::ColorControl& cc) {
 	if (cc.mode != 1 && cc.mode != 0 && cc.mode != 2 && cc.mode != 3 && cc.mode != 5 &&
 	    cc.mode != 6) {
 		static bool logged = false;
@@ -843,7 +821,6 @@ void hw_check(const CommandBuffer& buffer) {
 	const auto& hw      = buffer.GetRegisters();
 	const auto  rt_slot = render_target_first_bound_slot(buffer);
 	const auto& rt      = hw.GetRenderTarget(rt_slot);
-	const auto& bclr    = hw.GetBlendColor();
 	const auto& vp      = hw.GetScreenViewport();
 	const auto& c       = hw.GetClipControl();
 	const auto& rc      = hw.GetRenderControl();
@@ -869,13 +846,10 @@ void hw_check(const CommandBuffer& buffer) {
 	VpCheck(vp, smc);
 	log_phase("clip");
 	ClipCheck(c);
-	log_phase("rc");
-	RcCheck(rc);
-	log_phase("depth");
 	log_phase("mode");
 	McCheck(mc);
 	log_phase("blend");
-	BcCheck(bclr, cc);
+	BcCheck(cc);
 	log_phase("eqaa");
 	EqaaCheck(eqaa, ac);
 	log_phase("aa");

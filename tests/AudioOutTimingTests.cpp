@@ -5,8 +5,11 @@
 #include <SDL3/SDL.h>
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <limits>
 #include <memory>
 #include <vector>
 
@@ -22,6 +25,7 @@ struct Stream {
 	SDL_AudioSpec spec;
 	uint64_t      frames = 0; // Millionths of a frame retain exact simulated consumption.
 	uint64_t      updated;
+	std::vector<uint8_t> pcm;
 };
 
 uint64_t                             now       = 1000000;
@@ -31,7 +35,9 @@ std::vector<std::unique_ptr<Stream>> streams;
 bool                                 fail_open = false, fail_put = false, stalled = false;
 bool                                 pad_connected = false, pad_bluetooth = false;
 uint64_t                             pad_queue_us = 0;
+const float*                         queued_pad_gains = nullptr;
 int                                  clears = 0;
+int                                  device_channels = 0; // 0: format unknown
 
 Stream& GetStream(SDL_AudioStream* stream) {
 	return *reinterpret_cast<Stream*>(stream);
@@ -61,7 +67,7 @@ SDL_AudioStream* OpenAudioDeviceStream(SDL_AudioDeviceID, const SDL_AudioSpec* s
 		return nullptr;
 	}
 
-	streams.push_back(std::make_unique<Stream>(Stream {*spec, 0, now}));
+	streams.push_back(std::make_unique<Stream>(Stream {*spec, 0, now, {}}));
 	return reinterpret_cast<SDL_AudioStream*>(streams.back().get());
 }
 
@@ -80,15 +86,26 @@ int GetAudioStreamQueued(SDL_AudioStream* stream) {
 	                        state.spec.channels);
 }
 
-bool PutAudioStreamData(SDL_AudioStream* stream, const void*, int bytes) {
+bool PutAudioStreamData(SDL_AudioStream* stream, const void* data, int bytes) {
 	now += processing;
 	if (fail_put) {
 		return false;
 	}
 	auto& state = GetStream(stream);
+	const auto* pcm = static_cast<const uint8_t*>(data);
+	state.pcm.assign(pcm, pcm + bytes);
 	Drain(state);
 	state.frames += static_cast<uint64_t>(bytes) * 1000000 /
 	                (SDL_AUDIO_BYTESIZE(state.spec.format) * state.spec.channels);
+	return true;
+}
+
+bool GetAudioDeviceFormat(SDL_AudioDeviceID, SDL_AudioSpec* spec, int* frames) {
+	if (device_channels == 0) {
+		return false;
+	}
+	*spec   = SDL_AudioSpec {SDL_AUDIO_F32, device_channels, 48000};
+	*frames = 480;
 	return true;
 }
 
@@ -120,6 +137,7 @@ public:
 #define SDL_GetAudioStreamQueued    Fake::GetAudioStreamQueued
 #define SDL_PutAudioStreamData      Fake::PutAudioStreamData
 #define SDL_ClearAudioStream        Fake::ClearAudioStream
+#define SDL_GetAudioDeviceFormat    Fake::GetAudioDeviceFormat
 #include "libs/audio.cpp"
 #undef Thread
 #undef SDL_InitSubSystem
@@ -130,6 +148,7 @@ public:
 #undef SDL_GetAudioStreamQueued
 #undef SDL_PutAudioStreamData
 #undef SDL_ClearAudioStream
+#undef SDL_GetAudioDeviceFormat
 
 namespace Libs::Controller {
 int GetActiveControllerId() {
@@ -148,7 +167,8 @@ void     Close(Stream*) {}
 bool UsesBluetooth(const Stream* stream) {
 	return stream != nullptr && pad_bluetooth;
 }
-uint64_t Queue(Stream* stream, int, const void*, uint32_t, uint32_t, bool, const int*, float) {
+uint64_t Queue(Stream* stream, int, const void*, uint32_t, uint32_t, bool, const int*, float, const float* gains) {
+	queued_pad_gains = gains;
 	return stream != nullptr ? pad_queue_us : 0;
 }
 } // namespace DualSenseHaptics
@@ -178,9 +198,11 @@ struct Fixture {
 		now        = 1000000;
 		processing = oversleep = 0;
 		clears                 = 0;
+		device_channels        = 0;
 		fail_open = fail_put = stalled = false;
 		pad_connected = pad_bluetooth = false;
 		pad_queue_us = 0;
+		queued_pad_gains = nullptr;
 		sleeps.clear();
 	}
 
@@ -386,6 +408,246 @@ void TestZeroOutputFrequency() {
 	      "internal output open accepted zero frequency");
 	Check(f.Open().ToInt() == 1, "rejected output port occupied a handle");
 }
+
+template <typename T>
+void CheckOutputSamples(std::initializer_list<T> expected, const char* message) {
+	const auto& pcm = streams.back()->pcm;
+	Check(pcm.size() == expected.size() * sizeof(T) &&
+	          std::memcmp(pcm.data(), expected.begin(), pcm.size()) == 0, message);
+}
+
+void TestChannelGains() {
+	Fixture f;
+	const std::array pcm {0.25f, -0.5f, 0.75f, -1.0f};
+	const auto stereo = f.audio.AudioOutOpen(0, 2, 48000, Audio::Format::FloatStereo);
+	std::array gains {2.0f, 0.5f};
+	Audio::OutputParam output {stereo, pcm.data(), gains.data()};
+	for (int push = 0; push < 2; push++) {
+		f.audio.AudioOutOutputs(&output, 1, false);
+		CheckOutputSamples({0.5f, -0.25f, 1.5f, -0.5f}, "float channel gains were not applied independently");
+	}
+	const int volume[] {16384, 32768};
+	f.audio.AudioOutSetVolume(stereo, 3, volume);
+	f.audio.AudioOutOutputs(&output, 1, false);
+	CheckOutputSamples({0.25f, -0.25f, 0.75f, -0.5f}, "channel gain did not combine with port volume");
+	gains = {0.0f, 0.0f};
+	f.audio.AudioOutOutputs(&output, 1, false);
+	CheckOutputSamples({0.0f, -0.0f, 0.0f, -0.0f}, "zero channel gains did not mute");
+	output.gains = nullptr;
+	f.audio.AudioOutOutputs(&output, 1, false);
+	CheckOutputSamples({0.125f, -0.5f, 0.375f, -1.0f}, "channel scaling changed original float PCM");
+
+	const std::array<int16_t, 2> integer_pcm {20000, -20000};
+	const auto integer = f.audio.AudioOutOpen(0, 1, 48000, Audio::Format::Signed16bitStereo);
+	output = {integer, integer_pcm.data(), gains.data()};
+	for (const auto gain: {2.0f, std::numeric_limits<float>::max()}) {
+		gains = {gain, gain};
+		f.audio.AudioOutOutputs(&output, 1, false);
+		CheckOutputSamples<int16_t>({32767, -32768}, "integer gain overflowed instead of saturating");
+	}
+	gains = {0.5f, 0.25f};
+	f.audio.AudioOutOutputs(&output, 1, false);
+	CheckOutputSamples<int16_t>({10000, -5000}, "integer channel gains changed original PCM");
+
+	const std::array surround_pcm {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f, 9.0f, 10.0f, 11.0f, 12.0f};
+	for (const auto format: {Audio::Format::Float8Ch, Audio::Format::Float12Ch}) {
+		const auto surround = f.audio.AudioOutOpen(0, 1, 48000, format);
+		output = {surround, surround_pcm.data(), surround_pcm.data()};
+		f.audio.AudioOutOutputs(&output, 1, false);
+		if (format == Audio::Format::Float8Ch) {
+			CheckOutputSamples({1.0f, 4.0f, 9.0f, 16.0f, 49.0f, 64.0f, 25.0f, 36.0f},
+			                   "channel reordering used destination channel gains");
+		} else {
+			CheckOutputSamples({82.0f, 104.0f, 9.0f, 16.0f, 170.0f, 208.0f, 25.0f, 36.0f},
+			                   "height downmix lost per-channel gains");
+		}
+	}
+	pad_connected = true;
+	const auto speaker = f.Open(2, 4);
+	gains = {0.75f, 0.25f};
+	output = {speaker, pcm.data(), gains.data()};
+	f.audio.AudioOutOutputs(&output, 1, false);
+	Check(queued_pad_gains != nullptr && queued_pad_gains[0] == gains[0] && queued_pad_gains[1] == gains[1],
+	      "connected controller did not receive channel gains");
+}
+template <typename T>
+std::vector<T> LastOutput() {
+	const auto&    pcm = streams.back()->pcm;
+	std::vector<T> samples(pcm.size() / sizeof(T));
+	std::memcpy(samples.data(), pcm.data(), pcm.size());
+	return samples;
+}
+
+// Pushes 480-frame (10 ms) cushioned grains every `interval` us; returns the final queue in frames.
+uint64_t RunCushionedStream(Fixture& f, Audio::Id port, uint32_t grains, uint64_t interval, float level) {
+	std::fill(f.pcm.begin(), f.pcm.end(), level);
+	Audio::OutputParam output {port, f.pcm.data()};
+	for (uint32_t i = 0; i < grains; i++) {
+		f.audio.AudioOutOutputs(&output, 1, false, true);
+		now += interval;
+	}
+	Drain(*streams.back());
+	return streams.back()->frames / 1000000;
+}
+
+void TestCushionLatencyStaysOnTarget() {
+	{
+		// A producer 0.15% fast (the old 10666 us grain clock was 0.006%) must not build up delay.
+		Fixture    f;
+		const auto port   = f.Open(480);
+		const auto queued = RunCushionedStream(f, port, 6000, 9985, 0.25f);
+		Check(queued >= 480 && queued <= 5 * 480, "a slightly fast producer accumulated latency");
+		f.audio.AudioOutClose(port);
+	}
+	{
+		// A hiccup burst of 8 late grains on top of the cushion drains back near target.
+		Fixture    f;
+		const auto port = f.Open(480);
+		RunCushionedStream(f, port, 100, 10000, 0.0f);
+		RunCushionedStream(f, port, 8, 0, 0.0f);
+		const auto silent = RunCushionedStream(f, port, 300, 10000, 0.0f);
+		Check(silent <= 5 * 480, "silent excess latency was not dropped");
+		RunCushionedStream(f, port, 8, 0, 0.25f);
+		const auto loud = RunCushionedStream(f, port, 6000, 10000, 0.25f);
+		Check(loud >= 480 && loud <= 5 * 480, "audible excess latency was not trimmed");
+		f.audio.AudioOutClose(port);
+	}
+	{
+		// The trim compresses audio by at most 0.4% and keeps the grain's end samples.
+		Fixture    f;
+		const auto port = f.Open(512);
+		RunCushionedStream(f, port, 100, 10667, 0.25f);
+		RunCushionedStream(f, port, 6, 0, 0.25f);
+		for (size_t i = 0; i < f.pcm.size(); i++) {
+			f.pcm[i] = static_cast<float>(i / 2) / 1024.0f;
+		}
+		Audio::OutputParam output {port, f.pcm.data()};
+		bool trimmed = false;
+		for (int i = 0; i < 200 && !trimmed; i++) {
+			f.audio.AudioOutOutputs(&output, 1, false, true);
+			now += 10667;
+			const auto& pcm = streams.back()->pcm;
+			if (pcm.size() == 510 * 2 * sizeof(float)) {
+				float first = 0.0f;
+				float last  = 0.0f;
+				std::memcpy(&first, pcm.data(), sizeof(first));
+				std::memcpy(&last, pcm.data() + pcm.size() - sizeof(last), sizeof(last));
+				Check(first == 0.0f && last == 511.0f / 1024.0f, "trimmed grain lost its end samples");
+				trimmed = true;
+			} else {
+				Check(pcm.size() == 512 * 2 * sizeof(float), "grain trimmed by more than 0.4%");
+			}
+		}
+		Check(trimmed, "excess audible latency was never trimmed");
+		f.audio.AudioOutClose(port);
+	}
+}
+
+void TestAsyncJitterCushion() {
+	Fixture            f;
+	const auto         port = f.Open();
+	Audio::OutputParam output {port, f.pcm.data()};
+	f.audio.AudioOutOutputs(&output, 1, false, true);
+	Drain(*streams.back());
+	Check(streams.back()->frames == uint64_t {8 * 256} * 1000000,
+	      "starved asynchronous stream was not given a 40 ms cushion");
+	f.audio.AudioOutOutputs(&output, 1, false, true);
+	Drain(*streams.back());
+	Check(streams.back()->frames == uint64_t {9 * 256} * 1000000,
+	      "a fed asynchronous stream received another cushion");
+	now += 1000000;
+	f.audio.AudioOutOutputs(&output, 1, false, true);
+	Drain(*streams.back());
+	Check(streams.back()->frames == uint64_t {8 * 256} * 1000000,
+	      "an underrun asynchronous stream was not re-cushioned");
+	f.audio.AudioOutOutputs(&output, 1, false, false);
+	Check(sleeps.empty(), "asynchronous output slept");
+	f.audio.AudioOutClose(port);
+}
+
+void TestStereoDeviceDownmix() {
+	Fixture f;
+	device_channels = 2;
+	// Guest non-STD 7.1 order: FL FR FC LFE SL SR BL BR.
+	const std::array<float, 16> pcm {0.1f, 0.2f, 0.3f, 0.4f, 0.05f, 0.06f, 0.07f, 0.08f,
+	                                 0.5f, 0.0f, 0.0f, 0.0f, 0.0f,  0.0f,  0.0f,  0.0f};
+	const auto port = f.audio.AudioOutOpen(0, 2, 48000, Audio::Format::Float8Ch);
+	Check(streams.back()->spec.channels == 2, "surround port did not open a stereo stream");
+	Audio::OutputParam output {port, pcm.data()};
+	f.audio.AudioOutOutputs(&output, 1, false);
+	auto samples = LastOutput<float>();
+	Check(samples.size() == 4, "downmix wrote the wrong frame size");
+	Check(std::abs(samples[0] - (0.1f + 0.70710678f * (0.3f + 0.05f + 0.07f))) < 1e-6f &&
+	          std::abs(samples[1] - (0.2f + 0.70710678f * (0.3f + 0.06f + 0.08f))) < 1e-6f,
+	      "surround channels were not folded with ITU coefficients");
+	Check(samples[2] == 0.5f && samples[3] == 0.0f, "front-only content was attenuated");
+
+	const std::array<int16_t, 8> loud {32767, 0, 32767, 32767, 0, 0, 0, 0};
+	const auto integer = f.audio.AudioOutOpen(0, 1, 48000, Audio::Format::Signed16bit8ChStd);
+	output             = {integer, loud.data()};
+	f.audio.AudioOutOutputs(&output, 1, false);
+	const auto clipped = LastOutput<int16_t>();
+	Check(clipped.size() == 2 && clipped[0] == 32767 && clipped[1] >= 23169 && clipped[1] <= 23170,
+	      "integer downmix overflowed or kept LFE");
+
+	const auto stereo = f.audio.AudioOutOpen(0, 2, 48000, Audio::Format::FloatStereo);
+	Check(streams.back()->spec.channels == 2, "stereo port changed channel count");
+	device_channels = 8;
+	const auto passthrough = f.audio.AudioOutOpen(0, 2, 48000, Audio::Format::Float8Ch);
+	Check(streams.back()->spec.channels == 8, "surround device did not receive surround PCM");
+	for (const auto handle: {port, integer, stereo, passthrough}) {
+		f.audio.AudioOutClose(handle);
+	}
+}
+
+// RE3's Wwise bed is a 0x880 port: STD 7.1 float, FL FR FC LFE BL BR SL SR, with an 8-float gain.
+void TestGlobalOutputGain() {
+	Fixture                    f;
+	const auto                 port = f.audio.AudioOutOpen(0, 1, 48000, Audio::Format::FloatStereo);
+	const std::array<float, 2> pcm {0.25f, 0.6f};
+	Audio::OutputParam         output {port, pcm.data()};
+	Libs::Audio::g_audio_output_gain = 2.0;
+	f.audio.AudioOutOutputs(&output, 1, false);
+	auto samples = LastOutput<float>();
+	Check(std::abs(samples[0] - 0.5f) < 1e-6f, "global output gain was not applied");
+	Check(samples[1] > 0.9f && samples[1] < 1.0f, "boosted output was not soft-limited");
+	Libs::Audio::g_audio_output_gain = 1.0;
+	f.audio.AudioOutOutputs(&output, 1, false);
+	samples = LastOutput<float>();
+	Check(samples[0] == 0.25f && samples[1] == 0.6f, "unity output gain changed the PCM");
+	f.audio.AudioOutClose(port);
+}
+
+void TestStereoDeviceBedFold() {
+	Fixture f;
+	device_channels = 2;
+	const auto bed  = f.audio.AudioOutOpen(0, 1, 48000, Audio::Format::Float8ChStd);
+	Check(streams.back()->spec.channels == 2, "7.1 bed did not open a stereo stream");
+	const std::array<float, 8> frame {0.2f, 0.1f, 0.4f, 0.8f, 0.3f, 0.0f, 0.0f, 0.2f};
+	const std::array<float, 8> gains {1.0f, 1.0f, 0.5f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
+	Audio::OutputParam         output {bed, frame.data(), gains.data()};
+	f.audio.AudioOutOutputs(&output, 1, false);
+	auto samples = LastOutput<float>();
+	Check(std::abs(samples[0] - (0.2f + 0.70710678f * (0.2f + 0.3f))) < 1e-6f &&
+	          std::abs(samples[1] - (0.1f + 0.70710678f * (0.2f + 0.2f))) < 1e-6f,
+	      "bed gains or surround fold were wrong");
+
+	Libs::Audio::g_audio_lfe_mix = 0.31622776601683794;
+	f.audio.AudioOutOutputs(&output, 1, false);
+	samples = LastOutput<float>();
+	Check(std::abs(samples[0] - (0.2f + 0.70710678f * 0.5f + 0.31622777f * 0.8f)) < 1e-6f,
+	      "LFE was not folded at -10 dB when enabled");
+	Libs::Audio::g_audio_lfe_mix = 0.0;
+
+	// A loud full-surround frame bends under a soft knee instead of hard clipping.
+	const std::array<float, 8> loud {0.95f, 0.5f, 1.0f, 0.0f, 0.5f, 0.0f, 0.5f, 0.0f};
+	output = {bed, loud.data()};
+	f.audio.AudioOutOutputs(&output, 1, false);
+	samples = LastOutput<float>();
+	Check(samples[0] > 0.99f && samples[0] <= 1.0f, "loud fold was not limited to full scale");
+	Check(samples[1] > 0.9f && samples[1] < 0.5f + 0.70710678f, "fold knee did not engage above 0.9");
+	f.audio.AudioOutClose(bed);
+}
 } // namespace
 
 int main() {
@@ -399,6 +661,12 @@ int main() {
 	TestControllerSpeakerPacing();
 	TestInvalidBatchSize();
 	TestZeroOutputFrequency();
+	TestChannelGains();
+	TestStereoDeviceDownmix();
+	TestStereoDeviceBedFold();
+	TestGlobalOutputGain();
+	TestAsyncJitterCushion();
+	TestCushionLatencyStaysOnTarget();
 	Check(streams.empty(), "output stream leaked");
 	std::puts("AudioOutTimingTests: all cases passed");
 }

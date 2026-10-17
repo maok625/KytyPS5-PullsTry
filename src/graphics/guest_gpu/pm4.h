@@ -19,6 +19,10 @@ class File;
 
 namespace Libs::Graphics::Pm4 {
 
+constexpr uint32_t PacketSizeDw(uint32_t header) {
+	return (header & 0x3fffff00u) == 0x3fff1000u ? 1u : KYTY_PM4_LEN(header);
+}
+
 constexpr uint32_t IT_NOP                       = 0x10;
 constexpr uint32_t IT_SET_BASE                  = 0x11;
 constexpr uint32_t IT_CLEAR_STATE               = 0x12;
@@ -423,6 +427,12 @@ constexpr uint32_t DB_EQAA_STATIC_ANCHOR_ASSOCIATIONS_MASK  = 0x1;
 constexpr uint32_t DB_SHADER_CONTROL                             = 0x203;
 constexpr uint32_t DB_SHADER_CONTROL_Z_EXPORT_ENABLE_SHIFT       = 0;
 constexpr uint32_t DB_SHADER_CONTROL_Z_EXPORT_ENABLE_MASK        = 0x1;
+// The pixel shader exports the stencil reference through MRTZ channel 1 instead of taking it from
+// DB_STENCILREFMASK: test value in bits 7:0, op value in bits 15:8.
+constexpr uint32_t DB_SHADER_CONTROL_STENCIL_TEST_VAL_EXPORT_ENABLE_SHIFT = 1;
+constexpr uint32_t DB_SHADER_CONTROL_STENCIL_TEST_VAL_EXPORT_ENABLE_MASK  = 0x1;
+constexpr uint32_t DB_SHADER_CONTROL_STENCIL_OP_VAL_EXPORT_ENABLE_SHIFT   = 2;
+constexpr uint32_t DB_SHADER_CONTROL_STENCIL_OP_VAL_EXPORT_ENABLE_MASK    = 0x1;
 constexpr uint32_t DB_SHADER_CONTROL_Z_ORDER_SHIFT               = 4;
 constexpr uint32_t DB_SHADER_CONTROL_Z_ORDER_MASK                = 0x3;
 constexpr uint32_t DB_SHADER_CONTROL_KILL_ENABLE_SHIFT           = 6;
@@ -912,6 +922,7 @@ constexpr uint32_t COMPUTE_PGM_RSRC1_WGP_MODE_MASK    = 0x1;
 constexpr uint32_t COMPUTE_PGM_RSRC1_FWD_PROGRESS_SHIFT = 31;
 constexpr uint32_t COMPUTE_PGM_RSRC1_FWD_PROGRESS_MASK  = 0x1;
 
+constexpr uint32_t COMPUTE_DISPATCH_INITIATOR_ORDERED_APPEND_ENBL   = 1u << 3u;
 constexpr uint32_t COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS = 1u << 5u;
 constexpr uint32_t COMPUTE_DISPATCH_INITIATOR_CS_W32_EN_SHIFT = 15;
 constexpr uint32_t COMPUTE_DISPATCH_INITIATOR_CS_W32_EN_MASK  = 0x1;

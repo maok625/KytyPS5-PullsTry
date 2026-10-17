@@ -70,6 +70,7 @@ struct File {
 	std::atomic_bool                    writable;
 	std::atomic_bool                    append;
 	std::atomic_bool                    sync_writes;
+	std::atomic_bool                    close_on_exec;
 	SpecialFile                         special;
 	Common::Mutex                       mutex;
 	std::vector<uint8_t>                dirents;
@@ -333,17 +334,31 @@ static bool HasWindowsForbiddenFilenameCharacter(const std::string& relative_pat
 }
 #endif
 
+// The guest kernel treats a run of slashes as one, and RE9 opens "//app0/icon0_savedata.png".
+static std::string CollapseSlashes(std::string_view text) {
+	std::string out;
+	out.reserve(text.size());
+	for (const char c: text) {
+		if (c == '/' && !out.empty() && out.back() == '/') {
+			continue;
+		}
+		out.push_back(c);
+	}
+	return out;
+}
+
 std::filesystem::path MountPoints::ResolvePath(const std::string& mounted_name) {
 	Common::LockGuard lock(m_mutex);
 
+	const auto guest_path = CollapseSlashes(Common::FixFilenameSlash(mounted_name));
 	// Match the entire guest path so a mount root works with or without a trailing slash.
-	const auto mounted_path = Common::FixDirectorySlash(mounted_name);
+	const auto mounted_path = Common::FixDirectorySlash(guest_path);
 	const auto it           = std::find_if(
 	    m_mount_pairs.begin(), m_mount_pairs.end(),
 	    [&mounted_path](const MountPair& p) { return mounted_path.starts_with(p.point); });
 	if (it != m_mount_pairs.end()) {
 		const auto& p = *it;
-		auto rel_path = Common::RemoveFirst(Common::FixFilenameSlash(mounted_name), p.point.size());
+		auto        rel_path = Common::RemoveFirst(guest_path, p.point.size());
 		while (rel_path.starts_with('/')) {
 			rel_path = Common::RemoveFirst(rel_path, 1);
 		}
@@ -449,11 +464,12 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 
 	EXIT_IF(file == nullptr || file->opened || file->directory);
 
-	file->name        = path;
-	file->readable    = rw_mode != Common::File::Mode::Write;
-	file->writable    = rw_mode != Common::File::Mode::Read;
-	file->append      = append;
-	file->sync_writes = fsync || sync || dsync;
+	file->name          = path;
+	file->readable      = rw_mode != Common::File::Mode::Write;
+	file->writable      = rw_mode != Common::File::Mode::Read;
+	file->append        = append;
+	file->sync_writes   = fsync || sync || dsync;
+	file->close_on_exec = (static_cast<uint32_t>(flags) & 0x00100000u) != 0;
 
 	if (!directory && IsRandomDevice(file->name)) {
 		file->real_name = file->name;
@@ -583,6 +599,27 @@ int KYTY_SYSV_ABI KernelClose(int d) {
 	g_files->DeleteDescriptor(d);
 
 	return OK;
+}
+
+int KYTY_SYSV_ABI KernelFcntl(int d, int command, int arg) {
+	PRINT_NAME();
+
+	if (d < DESCRIPTOR_MIN) {
+		return KERNEL_ERROR_EBADF;
+	}
+
+	auto* file = g_files->GetFile(d);
+	if (file == nullptr || !file->opened) {
+		return KERNEL_ERROR_EBADF;
+	}
+
+	switch (command) {
+		case 1: return file->close_on_exec.load(std::memory_order_relaxed); // F_GETFD
+		case 2: // F_SETFD, FD_CLOEXEC
+			file->close_on_exec.store((arg & 1) != 0, std::memory_order_relaxed);
+			return OK;
+		default: return KERNEL_ERROR_EINVAL;
+	}
 }
 
 int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
@@ -1138,19 +1175,11 @@ int KYTY_SYSV_ABI KernelFstat(int d, FileStat* sb) {
 	auto wt = at;
 
 	if (file->special != SpecialFile::None) {
+		stat.st_mode    = 0020644u;
 		stat.st_size    = 0;
 		stat.st_blksize = 512;
 		stat.st_blocks  = 0;
-		SecToTimespec(&stat.st_atim, at.ToUnix());
-		SecToTimespec(&stat.st_mtim, wt.ToUnix());
-		stat.st_ctim     = stat.st_atim;
-		stat.st_birthtim = stat.st_mtim;
-		*sb              = stat;
-
-		return OK;
-	}
-
-	if (!file->directory) {
+	} else if (!file->directory) {
 		file->mutex.Lock();
 
 		bool is_invalid = file->f.IsInvalid();

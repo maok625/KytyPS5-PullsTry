@@ -2,10 +2,12 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
+#include <cstdlib>
 #include <cstring>
 #include <numeric>
 #include <vk_mem_alloc.h>
@@ -56,9 +58,10 @@ constexpr size_t WATCHES_RESERVE_CHUNK   = 0x1000;
 } // namespace
 
 Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
-               uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size)
+               uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size,
+               bool sparse_residency)
     : m_graphics(&graphics), m_scheduler(&scheduler), m_usage(usage), m_cpu_address(cpu_address),
-      m_size(size) {
+      m_size(size), m_sparse(sparse_residency) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(graphics.allocator == nullptr || size == 0);
 
@@ -66,9 +69,27 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	buffer_info.size        = size;
 	buffer_info.usage       = flags;
 
+	if (sparse_residency) {
+		EXIT_IF(!graphics.sparse_residency_buffer_enabled || usage != MemoryUsage::DeviceLocal);
+		buffer_info.flags =
+		    vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseResidency;
+		EXIT_NOT_IMPLEMENTED(graphics.device.createBuffer(&buffer_info, nullptr, &m_buffer) !=
+		                     vk::Result::eSuccess);
+		if (flags & vk::BufferUsageFlagBits::eShaderDeviceAddress) {
+			vk::BufferDeviceAddressInfo address_info {};
+			address_info.buffer = m_buffer;
+			m_device_address    = graphics.device.getBufferAddress(address_info);
+		}
+		return;
+	}
+
+	static const bool dedicated_bda = [] {
+		const char* text = std::getenv("KYTY_DEDICATED_BDA_BUFFERS");
+		return text != nullptr && std::strcmp(text, "0") != 0;
+	}();
 	const bool with_bda = bool(flags & vk::BufferUsageFlagBits::eShaderDeviceAddress);
 	const VmaAllocationCreateFlags bda_flag =
-	    with_bda ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : 0;
+	    with_bda && dedicated_bda ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : 0;
 	VmaAllocationCreateInfo allocation_info {};
 	allocation_info.flags =
 	    VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | bda_flag | AllocationFlags(usage);
@@ -79,13 +100,45 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 
 	VmaAllocationInfo allocation_result {};
 	VkBuffer          native_buffer = VK_NULL_HANDLE;
-	const auto        result        = static_cast<vk::Result>(vmaCreateBuffer(
-	    graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info), &allocation_info,
-	    &native_buffer, &m_allocation, &allocation_result));
+
+	const auto attempt = [&](bool drop_within_budget, VmaMemoryUsage memory_usage) {
+		auto info = allocation_info;
+		if (drop_within_budget) {
+			info.flags &= ~static_cast<VmaAllocationCreateFlags>(
+			    VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT);
+		}
+		info.usage = memory_usage;
+		const auto result = static_cast<vk::Result>(vmaCreateBuffer(
+		    graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info), &info,
+		    &native_buffer, &m_allocation, &allocation_result));
+		if (result != vk::Result::eSuccess) {
+			native_buffer = VK_NULL_HANDLE;
+			m_allocation  = nullptr;
+		}
+		return result;
+	};
+
+	auto result = attempt(false, AllocationUsage(usage));
 	if (result != vk::Result::eSuccess) {
-		graphics.LogMemoryBudget();
+		// WITHIN_BUDGET makes VMA refuse an allocation the driver would still have served, so the
+		// first retry simply asks the driver.
+		result = attempt(true, AllocationUsage(usage));
+		if (result != vk::Result::eSuccess && usage == MemoryUsage::DeviceLocal) {
+			result = attempt(true, VMA_MEMORY_USAGE_AUTO);
+		}
 	}
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	if (result != vk::Result::eSuccess) {
+		const auto budget = graphics.GetMemoryBudget();
+		graphics.LogMemoryBudget();
+		EXIT("out of device memory for a buffer: size=%llu usage=%u flags=0x%llx result=%s; "
+		     "device usage=%llu budget=%llu heap=%llu (budget %s)\n",
+		     static_cast<unsigned long long>(size), static_cast<unsigned>(usage),
+		     static_cast<unsigned long long>(static_cast<vk::BufferUsageFlags::MaskType>(flags)),
+		     vk::to_string(result).c_str(), static_cast<unsigned long long>(budget.usage),
+		     static_cast<unsigned long long>(budget.budget),
+		     static_cast<unsigned long long>(budget.heap_size),
+		     budget.reported ? "reported" : "unknown");
+	}
 
 	m_buffer = native_buffer;
 	if (with_bda) {
@@ -105,7 +158,9 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 }
 
 Buffer::~Buffer() {
-	if (m_buffer != nullptr) {
+	if (m_buffer != nullptr && m_sparse) {
+		m_graphics->device.destroyBuffer(m_buffer, nullptr);
+	} else if (m_buffer != nullptr) {
 		vmaDestroyBuffer(m_graphics->allocator, m_buffer, m_allocation);
 	}
 }
@@ -218,7 +273,32 @@ void Buffer::Fill(uint64_t offset, uint64_t size, uint32_t value) {
 StreamBuffer::StreamBuffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
                            uint64_t size)
     : Buffer(graphics, scheduler, usage, 0, AllFlags, size),
-      m_current_watches(WATCHES_INITIAL_RESERVE), m_previous_watches(WATCHES_INITIAL_RESERVE) {}
+      m_current_watches(WATCHES_INITIAL_RESERVE), m_previous_watches(WATCHES_INITIAL_RESERVE) {
+	Scheduler().RegisterStreamBuffer(this);
+}
+
+StreamBuffer::~StreamBuffer() {
+	Scheduler().UnregisterStreamBuffer(this);
+}
+
+// Commit charges a reservation to the tick that was recording when the CPU wrote the bytes, but
+// the GPU reads it from the command buffer that records the consumer. Move the charge forward;
+// ticks only increase here, so a region is held longer, never released sooner.
+void StreamBuffer::RetagWatches(uint64_t submitted_tick, uint64_t new_tick) {
+	if (submitted_tick == 0 || new_tick <= submitted_tick) {
+		return;
+	}
+	const auto retag_run = [submitted_tick, new_tick](std::vector<Watch>& watches, size_t limit) {
+		while (limit != 0 && limit <= watches.size() &&
+		       watches[limit - 1].tick == submitted_tick && !watches[limit - 1].sealed) {
+			watches[--limit].tick = new_tick;
+		}
+	};
+	retag_run(m_current_watches, m_current_watch_cursor);
+	if (m_invalidation_mark.has_value()) {
+		retag_run(m_previous_watches, *m_invalidation_mark);
+	}
+}
 
 bool StreamBuffer::NormalizeReservation(bool coherent, uint64_t atom, uint64_t& size,
                                         uint64_t& alignment) {
@@ -289,7 +369,8 @@ void StreamBuffer::Commit() {
 
 	m_offset += m_mapped_size;
 	const auto tick = Scheduler().CurrentTick();
-	if (m_current_watch_cursor != 0 && m_current_watches[m_current_watch_cursor - 1].tick == tick) {
+	if (m_current_watch_cursor != 0 && m_current_watches[m_current_watch_cursor - 1].tick == tick &&
+	    !m_current_watches[m_current_watch_cursor - 1].sealed) {
 		m_current_watches[m_current_watch_cursor - 1].upper_bound = m_offset;
 		return;
 	}
@@ -299,6 +380,32 @@ void StreamBuffer::Commit() {
 	auto& watch       = m_current_watches[m_current_watch_cursor++];
 	watch.upper_bound = m_offset;
 	watch.tick        = tick;
+	watch.sealed = m_hold_depth == 0;
+	if (watch.sealed && !m_unscoped_reported) {
+		m_unscoped_reported = true;
+		LOGF("StreamBuffer: reservation committed with no hold, usage=%u\n",
+		     static_cast<unsigned>(Usage()));
+	}
+}
+
+void StreamBuffer::EndHold() {
+	EXIT_IF(m_hold_depth == 0);
+	if (--m_hold_depth != 0) {
+		return;
+	}
+	SealFloatingWatches();
+}
+
+void StreamBuffer::SealFloatingWatches() {
+	const auto seal_run = [](std::vector<Watch>& watches, size_t limit) {
+		while (limit != 0 && limit <= watches.size() && !watches[limit - 1].sealed) {
+			watches[--limit].sealed = true;
+		}
+	};
+	seal_run(m_current_watches, m_current_watch_cursor);
+	if (m_invalidation_mark.has_value()) {
+		seal_run(m_previous_watches, *m_invalidation_mark);
+	}
 }
 
 uint64_t StreamBuffer::Copy(const void* source, uint64_t size, uint64_t alignment) {

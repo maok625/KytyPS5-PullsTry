@@ -32,14 +32,14 @@ public:
 	static Value F16(uint16_t bits);
 	static Value F32(float value);
 
-	[[nodiscard]] bool IsEmpty() const;
-	[[nodiscard]] bool IsImmediate() const;
+	[[nodiscard]] bool IsEmpty() const { return type == Type::Void; }
+	[[nodiscard]] bool IsImmediate() const { return type != Type::Opaque; }
 	[[nodiscard]] bool IsIdentity() const;
 	[[nodiscard]] bool IsPhi() const;
 	[[nodiscard]] Type GetType() const;
 
 	[[nodiscard]] Inst*     Instruction() const;
-	[[nodiscard]] Inst*     TryInstruction() const;
+	[[nodiscard]] Inst*     TryInstruction() const { return type == Type::Opaque ? inst : nullptr; }
 	[[nodiscard]] Inst*     ResolveInstruction() const;
 	[[nodiscard]] Value     Resolve() const;
 	[[nodiscard]] ScalarReg ScalarRegister() const;
@@ -111,14 +111,22 @@ public:
 	Inst(Inst&&)                 = delete;
 	Inst& operator=(Inst&&)      = delete;
 
-	[[nodiscard]] ValueOpcode             GetOpcode() const;
+	[[nodiscard]] ValueOpcode             GetOpcode() const { return opcode; }
 	[[nodiscard]] Type                    GetType() const;
 	[[nodiscard]] bool                    MayHaveSideEffects() const;
 	[[nodiscard]] bool                    HasUses() const;
 	[[nodiscard]] size_t                  UseCount() const;
-	[[nodiscard]] size_t                  NumArgs() const;
+	[[nodiscard]] size_t                  NumArgs() const {
+		return num_args == PhiArity ? phi_args.size() : num_args;
+	}
 	[[nodiscard]] size_t                  NumPhiBlocks() const;
-	[[nodiscard]] Value                   Arg(size_t index) const;
+	[[nodiscard]] Value                   Arg(size_t index) const {
+		EXIT_IF(index >= NumArgs());
+		if (num_args <= InlineArity) {
+			return fixed_args[index];
+		}
+		return num_args == PhiArity ? phi_args[index].second : large_args[index];
+	}
 	[[nodiscard]] Block*                  PhiBlock(size_t index) const;
 	[[nodiscard]] Block*                  Parent() const;
 	[[nodiscard]] const std::vector<Use>& Uses() const;
@@ -129,6 +137,12 @@ public:
 		}
 		return evaluation_index;
 	}
+	// Backend definitions belong to one emission. Wave64 emulation needs one per half.
+	[[nodiscard]] uint32_t Definition(uint32_t half) const { return definitions[half]; }
+	void SetDefinition(uint32_t half, uint32_t definition) const {
+		definitions[half] = definition;
+	}
+	void ResetDefinitions() const { definitions = {}; }
 
 	void SetParent(Block* block);
 	void SetArg(size_t index, Value value);
@@ -165,6 +179,7 @@ private:
 	uint8_t             num_args;
 	bool                live = false;
 	mutable uint32_t    evaluation_index = UINT32_MAX;
+	mutable std::array<uint32_t, 2> definitions {};
 	uint64_t            flags;
 	Block*              parent = nullptr;
 	union {
@@ -175,6 +190,14 @@ private:
 	std::vector<Use>    uses;
 };
 
-static_assert(sizeof(Inst) <= 112, "Inst operand storage unintentionally increased");
+static_assert(sizeof(Inst) <= 120, "Inst operand and backend storage unintentionally increased");
+
+inline bool Value::IsIdentity() const {
+	return type == Type::Opaque && inst->GetOpcode() == ValueOpcode::Identity;
+}
+
+inline Value Value::Resolve() const {
+	return IsIdentity() ? inst->Arg(0).Resolve() : *this;
+}
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

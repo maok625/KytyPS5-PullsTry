@@ -1,12 +1,16 @@
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/pageManager.h"
 
+#include <barrier>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -167,6 +171,7 @@ struct ProtectionCall {
   uint64_t size;
 };
 std::vector<ProtectionCall> g_protection_ranges;
+std::mutex g_protection_log_mutex;
 
 bool ProtectAddressSpace(uint64_t vaddr, uint64_t size,
                          Common::VirtualMemory::Mode mode) {
@@ -177,8 +182,11 @@ bool ProtectAddressSpace(uint64_t vaddr, uint64_t size,
     protection = PAGE_READWRITE;
   }
   DWORD old_protection = 0;
-  g_protection_calls++;
-  g_protection_ranges.push_back({vaddr, size});
+  {
+    std::lock_guard lock(g_protection_log_mutex);
+    g_protection_calls++;
+    g_protection_ranges.push_back({vaddr, size});
+  }
   return VirtualProtect(reinterpret_cast<void *>(vaddr), size, protection,
                         &old_protection) != 0;
 }
@@ -254,6 +262,41 @@ void TestSharedWatcherCounts() {
         "first unwatch released a shared watcher");
   manager.UpdatePageWatchers<false>(address + 128, 64);
   Check(IsWritable(memory), "last unwatch did not restore access");
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+}
+
+// RESIDENT EVIL 2 kept more than 127 cached images on one guest page, each with
+// its own write watch.
+void TestManyWriteWatchersOnOnePage() {
+  PageManager manager;
+  const auto page_size = manager.GetPageSize();
+  auto *memory = Allocate(page_size * 2);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  constexpr uint32_t watchers = 1000;
+  const auto range = [&](uint32_t index) {
+    const auto offset = (index * 16u) % page_size;
+    const auto size = (index & 1u) != 0 ? page_size : 16;
+    return std::pair<uint64_t, uint64_t>{address + offset, size};
+  };
+
+  g_protection_calls = 0;
+  for (uint32_t index = 0; index < watchers; index++) {
+    const auto [begin, size] = range(index);
+    manager.UpdatePageWatchers<true>(begin, size);
+  }
+  Check(g_protection_calls == 2 && Protection(memory) == PAGE_READONLY &&
+            Protection(memory + page_size) == PAGE_READONLY,
+        "many watchers on one page did not protect it exactly once");
+
+  for (uint32_t index = 1; index < watchers; index++) {
+    const auto [begin, size] = range(index);
+    manager.UpdatePageWatchers<false>(begin, size);
+  }
+  Check(Protection(memory) == PAGE_READONLY && IsWritable(memory + page_size),
+        "unwatching all but one watcher released the page");
+  const auto [begin, size] = range(0);
+  manager.UpdatePageWatchers<false>(begin, size);
+  Check(IsWritable(memory), "last of many unwatches did not restore access");
   Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
@@ -547,6 +590,34 @@ void TestReadWriteWatcherInteractions() {
   Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
+void TestConcurrentSharedWatchers() {
+  constexpr size_t worker_count = 8;
+  PageManager manager;
+  auto *memory = Allocate(TRACKER_PAGE_SIZE);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  bool watched = false;
+  std::barrier phase(worker_count, [&]() noexcept {
+    watched = !watched;
+    Check(Protection(memory) == (watched ? PAGE_READONLY : PAGE_READWRITE),
+          "concurrent watchers lost protection or failed to restore writes");
+  });
+  std::vector<std::jthread> workers;
+  for (size_t i = 0; i < worker_count; i++) {
+    workers.emplace_back([&] {
+      for (size_t round = 0; round < 100; round++) {
+        manager.UpdatePageWatchers<true>(address, TRACKER_PAGE_SIZE);
+        phase.arrive_and_wait();
+        manager.UpdatePageWatchers<false>(address, TRACKER_PAGE_SIZE);
+        phase.arrive_and_wait();
+      }
+    });
+  }
+  for (auto &worker : workers) {
+    worker.join();
+  }
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+}
+
 [[noreturn]] void RunDeathCase(const char *name) {
   PageManager manager;
   const auto page_size = manager.GetPageSize();
@@ -578,7 +649,7 @@ void TestReadWriteWatcherInteractions() {
   } else if (std::strcmp(name, "write-overflow") == 0) {
     auto *memory = Allocate(page_size);
     const auto address = reinterpret_cast<uint64_t>(memory);
-    for (uint32_t count = 0; count < 128; count++) {
+    for (uint32_t count = 0; count <= PageManager::MaxWriteWatchers; count++) {
       manager.UpdatePageWatchers<true>(address, page_size);
     }
   }
@@ -638,6 +709,40 @@ void CheckDeathCase(const char *name) {
 #endif
 }
 
+// A guest mprotect replaces the whole host protection, dropping the watch it knows nothing about.
+void TestReapplyProtectionAfterGuestProtect() {
+  PageManager manager;
+  const auto page_size = manager.GetPageSize();
+  auto *memory = Allocate(page_size * 2);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+
+  manager.UpdatePageWatchers<true>(address, page_size);
+  Check(Protection(memory) == PAGE_READONLY, "write watch did not protect the page");
+
+  DWORD previous = 0;
+  Check(VirtualProtect(memory, page_size * 2, PAGE_READWRITE, &previous) != 0,
+        "guest protection change failed");
+  Check(IsWritable(memory), "guest protection change did not take effect");
+
+  manager.ReapplyProtection(address, page_size * 2,
+                            Common::VirtualMemory::Mode::ReadWrite);
+  Check(Protection(memory) == PAGE_READONLY,
+        "watched page stayed writable after a guest protection change");
+  Check(IsWritable(memory + page_size),
+        "unwatched page was protected by the reapply");
+
+  // The guest asked for less than the watch needs, so its intent must survive.
+  Check(VirtualProtect(memory, page_size, PAGE_NOACCESS, &previous) != 0,
+        "guest no-access change failed");
+  manager.ReapplyProtection(address, page_size,
+                            Common::VirtualMemory::Mode::NoAccess);
+  Check(Protection(memory) == PAGE_NOACCESS,
+        "reapply weakened a guest no-access range to the watch protection");
+
+  manager.UpdatePageWatchers<false>(address, page_size);
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+}
+
 void TestFatalPaths() {
   for (const char *name :
        {"invalid-range", "unknown-untrack", "destructor-watch",
@@ -664,11 +769,14 @@ int main(int argc, char **argv) {
   TestWatchAndUnwatch();
   TestWatchAndUnwatch(Libs::LibKernel::Memory::kExtendedMemoryBase);
   TestSharedWatcherCounts();
+  TestManyWriteWatchersOnOnePage();
   TestCrossRegionRange();
   TestBatchedWatcherRanges();
   TestRegionMaskWatcherRanges();
   TestRegionEndpointBatching();
   TestReadWriteWatcherInteractions();
+  TestReapplyProtectionAfterGuestProtect();
+  TestConcurrentSharedWatchers();
   TestFatalPaths();
   std::puts("PageManagerTests: all cases passed");
   return 0;

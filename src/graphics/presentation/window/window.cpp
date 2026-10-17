@@ -306,20 +306,39 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 
 	if (f.added) {
 		auto* pad = SDL_OpenGamepad(f.id);
-		EXIT_NOT_IMPLEMENTED(pad == nullptr);
+		if (pad == nullptr) {
+			LOGF("Controller: ignoring gamepad %d that could not be opened: %s\n", f.id,
+			     SDL_GetError());
+			return;
+		}
 		int id = SDL_GetJoystickID(SDL_GetGamepadJoystick(pad));
 		Controller::Connect(id);
 	}
 
 	if (f.removed) {
-		Controller::Disconnect(f.id);
-		SDL_CloseGamepad(SDL_GetGamepadFromID(f.id));
+		if (auto* pad = SDL_GetGamepadFromID(f.id); pad != nullptr) {
+			Controller::Disconnect(f.id);
+			SDL_CloseGamepad(pad);
+		}
 	}
 
 	if (f.down || f.up) {
 		const auto button = ControllerButtonToPadButton(f.button);
 		if (button != 0) {
 			Controller::SetButton(f.id, button, f.down);
+		} else if (f.button == SDL_GAMEPAD_BUTTON_BACK) {
+			// Pads without a touchpad (Switch, Xbox, ...) have no way to click it, which
+			// blocks games that require it. Use their Back/Select button as a centered click.
+			auto* pad = SDL_GetGamepadFromID(f.id);
+			if (pad != nullptr && SDL_GetNumGamepadTouchpads(pad) == 0) {
+				if (f.down) {
+					Controller::SetTouchPad(f.id, 0, true, 0.5f, 0.5f);
+				}
+				Controller::SetButton(f.id, Controller::PAD_BUTTON_TOUCH_PAD, f.down);
+				if (f.up) {
+					Controller::SetTouchPad(f.id, 0, false, 0.5f, 0.5f);
+				}
+			}
 		}
 	}
 
@@ -356,11 +375,13 @@ static void GameEventDidEnterForeground(WindowLoopState& game) {
 	SetPause(game, false);
 }
 
-void WindowContext::Resize(uint32_t new_width, uint32_t new_height) {
-	EXIT_IF(new_width == 0 || new_height == 0);
+void WindowContext::Resize(int new_width, int new_height) {
+	if (new_width <= 0 || new_height <= 0) {
+		return;
+	}
 	Common::LockGuard lock(mutex);
-	graphic_ctx.screen_width  = new_width;
-	graphic_ctx.screen_height = new_height;
+	graphic_ctx.screen_width  = static_cast<uint32_t>(new_width);
+	graphic_ctx.screen_height = static_cast<uint32_t>(new_height);
 }
 
 void WindowContext::ProcessWindowEvent(const SDL_WindowEvent& event) {
@@ -714,6 +735,10 @@ void WindowContext::Run() {
 	loop.need_exit = false;
 	loop.paused.store(false, std::memory_order_release);
 
+	constexpr uint64_t title_interval_ms = 1000;
+	auto               title_time        = SDL_GetTicks();
+	auto               title_frames      = loop.presented_frames.load(std::memory_order_relaxed);
+
 	while (!loop.need_exit) {
 		if (loop.paused.load(std::memory_order_acquire)) {
 			if (!timer.IsPaused()) {
@@ -723,7 +748,20 @@ void WindowContext::Run() {
 			timer.Resume();
 		}
 
-		if (!HostInputWaitEvent(&loop.event)) {
+		// Refresh the title on the main thread without making presentation wait for it.
+		const auto now     = SDL_GetTicks();
+		const auto elapsed = now - title_time;
+		if (elapsed >= title_interval_ms) {
+			const auto frames = loop.presented_frames.load(std::memory_order_relaxed);
+			if (frames != 0) {
+				UpdateTitle(frames, static_cast<double>(frames - title_frames) * 1000.0 /
+				                        static_cast<double>(elapsed));
+			}
+			title_time   = now;
+			title_frames = frames;
+		}
+		const auto wait_ms = static_cast<int>(title_interval_ms - (now - title_time));
+		if (!HostInputWaitEvent(&loop.event, wait_ms)) {
 			continue;
 		}
 		ProcessEvent(timer.GetTimeS());
@@ -905,7 +943,7 @@ void WindowContext::UpdateIcon() {
 	}
 }
 
-void WindowContext::UpdateTitle() {
+void WindowContext::UpdateTitle(uint64_t frame_num, double current_fps) {
 	static char title[128];
 	static char title_id[12];
 	static char app_ver[12];
@@ -915,10 +953,6 @@ void WindowContext::UpdateTitle() {
 	static bool has_app_ver =
 	    Loader::SystemContentParamSfoGetString("APP_VER", app_ver, sizeof(app_ver));
 	static const std::string processor_name = Common::GetSystemInfo().ProcessorName;
-	static uint64_t fps_start   = Common::Timer::QueryPerformanceCounter();
-	static uint64_t frame_num   = 0;
-	static uint64_t fps_frames  = 0;
-	static double   current_fps = 0.0;
 
 #if KYTY_BUILD == KYTY_BUILD_DEBUG
 	static constexpr auto build_type = "Debug";
@@ -928,17 +962,6 @@ void WindowContext::UpdateTitle() {
 	static constexpr auto build_type = "Unknown";
 #endif
 
-	const auto now       = Common::Timer::QueryPerformanceCounter();
-	const auto frequency = Common::Timer::QueryPerformanceFrequency();
-	frame_num++;
-	fps_frames++;
-	if (now - fps_start >= frequency) {
-		current_fps = static_cast<double>(fps_frames) * static_cast<double>(frequency) /
-		              static_cast<double>(now - fps_start);
-		fps_start   = now;
-		fps_frames  = 0;
-	}
-
 	const auto* device_name = graphic_ctx.GetPhysicalDeviceProperties().deviceName.data();
 	auto text = fmt::format(
 	    "[{} | {}] {}{}{}{}{}{}[{}] [{}], frame: {}, fps: {:.0f}", KYTY_BUILD_LABEL, build_type,
@@ -946,16 +969,7 @@ void WindowContext::UpdateTitle() {
 	    (has_title_id ? ", " : ""), (has_app_ver ? app_ver : ""), (has_app_ver ? " " : ""),
 	    device_name, processor_name, frame_num, current_fps);
 
-	struct TitleUpdate {
-		SDL_Window*  window;
-		std::string* text;
-	} update {window, &text};
-	EXIT_IF(!SDL_RunOnMainThread(
-	    [](void* data) {
-		    auto& title = *static_cast<TitleUpdate*>(data);
-		    SDL_SetWindowTitle(title.window, title.text->c_str());
-	    },
-	    &update, true));
+	SDL_SetWindowTitle(window, text.c_str());
 }
 
 } // namespace Libs::Graphics

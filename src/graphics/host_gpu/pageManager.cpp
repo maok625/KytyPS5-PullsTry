@@ -15,6 +15,12 @@
 #include <mutex>
 #include <vector>
 
+#if defined(_MSC_VER)
+#include <intrin.h>
+#elif defined(__x86_64__)
+#include <xmmintrin.h>
+#endif
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -62,7 +68,13 @@ class SpinGuard final {
 public:
 	explicit SpinGuard(std::atomic_flag& lock): m_lock(lock) {
 		while (m_lock.test_and_set(std::memory_order_acquire)) {
-			std::atomic_signal_fence(std::memory_order_seq_cst);
+#if defined(__x86_64__) || defined(_M_X64)
+			_mm_pause();
+#elif defined(_M_ARM64)
+			__yield();
+#elif defined(__aarch64__)
+			asm volatile("yield");
+#endif
 		}
 	}
 	~SpinGuard() { m_lock.clear(std::memory_order_release); }
@@ -71,6 +83,19 @@ public:
 private:
 	std::atomic_flag& m_lock;
 };
+
+[[nodiscard]] Common::VirtualMemory::Mode RestrictToWatch(Common::VirtualMemory::Mode guest,
+                                                          Common::VirtualMemory::Mode watched) {
+	using Mode = Common::VirtualMemory::Mode;
+	if (watched == Mode::NoAccess) {
+		return Mode::NoAccess;
+	}
+	if (watched == Mode::Read) {
+		return static_cast<Mode>(static_cast<uint32_t>(guest) &
+		                         ~static_cast<uint32_t>(Mode::Write));
+	}
+	return guest;
+}
 
 void ValidateRange(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
@@ -82,8 +107,8 @@ void ValidateRange(uint64_t vaddr, uint64_t size) {
 
 struct PageManager::Impl {
 	struct PageState {
-		uint8_t write_watchers  : 7 = 0;
-		uint8_t access_watchers : 1 = 0;
+		uint16_t write_watchers  : 15 = 0;
+		uint16_t access_watchers : 1  = 0;
 
 		[[nodiscard]] Common::VirtualMemory::Mode Perms() const noexcept {
 			if (access_watchers != 0) {
@@ -114,7 +139,7 @@ struct PageManager::Impl {
 				}
 			} else {
 				if constexpr (delta == 1) {
-					if (write_watchers == 0x7f) {
+					if (write_watchers == MaxWriteWatchers) {
 						Fatal("write-watcher overflow at 0x%016" PRIx64, address);
 					}
 					return ++write_watchers;
@@ -129,7 +154,7 @@ struct PageManager::Impl {
 			}
 		}
 	};
-	static_assert(sizeof(PageState) == 1);
+	static_assert(sizeof(PageState) == 2);
 
 	struct Region {
 		std::atomic_flag                    lock = ATOMIC_FLAG_INIT;
@@ -248,13 +273,62 @@ struct PageManager::Impl {
 		release_pending();
 	}
 
+	void ReapplyRegionProtection(Region& region, uint64_t base_addr, size_t first, size_t last,
+	                             Common::VirtualMemory::Mode guest_mode) {
+		SpinGuard lock(region.lock);
+		auto      perms       = guest_mode;
+		uint64_t  range_begin = 0;
+		uint64_t  range_bytes = 0;
+
+		const auto release_pending = [&] {
+			if (range_bytes != 0) {
+				Protect(base_addr + range_begin * PAGE_SIZE, range_bytes, perms);
+				range_bytes = 0;
+			}
+		};
+
+		for (size_t page_index = first; page_index < last; page_index++) {
+			const auto watched = RestrictToWatch(guest_mode, region.pages[page_index].Perms());
+			if (watched == guest_mode) {
+				release_pending();
+				continue;
+			}
+			if (range_bytes != 0 && watched != perms) {
+				release_pending();
+			}
+			if (range_bytes == 0) {
+				range_begin = page_index;
+				perms       = watched;
+			}
+			range_bytes += PAGE_SIZE;
+		}
+
+		release_pending();
+	}
+
+	void ReapplyProtection(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode guest_mode) {
+		ValidateRange(vaddr, size);
+		const auto begin = Common::AlignDown(vaddr, PAGE_SIZE);
+		const auto end   = Common::AlignUp(vaddr + size, PAGE_SIZE);
+		for (auto chunk_begin = begin; chunk_begin < end;) {
+			const auto chunk_end   = std::min(end, Common::AlignUp(chunk_begin + 1, REGION_SIZE));
+			const auto region_base = Common::AlignDown(chunk_begin, REGION_SIZE);
+			if (auto* region = FindRegion(chunk_begin); region != nullptr) {
+				const auto first = static_cast<size_t>((chunk_begin - region_base) / PAGE_SIZE);
+				const auto last  = static_cast<size_t>((chunk_end - region_base) / PAGE_SIZE);
+				ReapplyRegionProtection(*region, region_base, first, last, guest_mode);
+			}
+			chunk_begin = chunk_end;
+		}
+	}
+
 	template <bool track, bool is_read>
 	void UpdatePageWatchers(uint64_t vaddr, uint64_t size) {
 		ValidateRange(vaddr, size);
 		const auto begin = Common::AlignDown(vaddr, PAGE_SIZE);
 		const auto end   = Common::AlignUp(vaddr + size, PAGE_SIZE);
 		for (auto chunk_begin = begin; chunk_begin < end;) {
-			const auto chunk_end = std::min(end, Common::AlignUp(chunk_begin + 1, REGION_SIZE));
+			const auto chunk_end   = std::min(end, Common::AlignUp(chunk_begin + 1, REGION_SIZE));
 			const auto region_base = Common::AlignDown(chunk_begin, REGION_SIZE);
 			auto*      region = track ? GetOrCreateRegion(chunk_begin) : FindRegion(chunk_begin);
 			if (region == nullptr) {
@@ -289,6 +363,11 @@ void PageManager::UpdatePageWatchers(uint64_t vaddr, uint64_t size) {
 
 template void PageManager::UpdatePageWatchers<true>(uint64_t, uint64_t);
 template void PageManager::UpdatePageWatchers<false>(uint64_t, uint64_t);
+
+void PageManager::ReapplyProtection(uint64_t vaddr, uint64_t size,
+                                    Common::VirtualMemory::Mode guest_mode) {
+	m_impl->ReapplyProtection(vaddr, size, guest_mode);
+}
 
 template <bool track, bool is_read>
 void PageManager::UpdatePageWatchersForRegion(uint64_t base_addr, RegionBits& mask) {
