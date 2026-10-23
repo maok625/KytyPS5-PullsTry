@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_DESCRIPTORS_H_
 
 #include "common/assert.h"
+#include "common/hash.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/image/image.h"
@@ -18,12 +19,84 @@ namespace Libs::Graphics {
 
 struct ShaderStageRuntime;
 
+// What a texture descriptor decodes to before the texture cache looks up its image (see
+// RenderExecutor::DecodeTexture). It depends only on the descriptor and on how the shader uses the
+// texture, so a frame that binds the same texture thousands of times decodes it once.
+struct DecodedTexture {
+	TextureCache::ImageDesc desc;
+	bool                    null_descriptor   = false;
+	bool                    shader_conversion = false;
+	vk::Format              pixel_format      = vk::Format::eUndefined;
+	vk::Format              view_format       = vk::Format::eUndefined;
+	// The image a plain backing match found for the description (TextureCache::FindImage), and
+	// the image bound for it (the depth owner of a stencil plane): kept until an image over the
+	// description's range changes (TextureCache::RangeUnchangedSince from image_since).
+	mutable ImageId  found_image;
+	mutable ImageId  bound_image;
+	mutable uint64_t image_since = 0;
+};
+
 struct TextureBinding {
 	ImageId                    image_id;
 	vk::ImageView              image_view = nullptr;
-	TextureCache::ImageDesc    desc;
+	// The decoded texture, which RenderExecutor keeps until the frame ends, and its view.
+	const DecodedTexture*      texture = nullptr;
+	ImageViewInfo              view_info;
+	TextureCache::BindingType  type   = TextureCache::BindingType::Texture;
 	vk::ImageLayout            layout = vk::ImageLayout::eUndefined;
 	std::vector<vk::ImageView> mip_views;
+
+	// The whole description: the decoded texture's, with the binding's view.
+	[[nodiscard]] TextureCache::ImageDesc Desc() const {
+		EXIT_IF(texture == nullptr);
+		auto desc      = texture->desc;
+		desc.view_info = view_info;
+		desc.type      = type;
+		return desc;
+	}
+};
+
+struct TextureDecodeKey {
+	ShaderRecompiler::IR::DescriptorValue value;
+	ShaderRecompiler::IR::ImageResource   resource;
+
+	bool operator==(const TextureDecodeKey& other) const = default;
+};
+
+// A lookup of the table by reference: the key, with its resource's vectors, is copied only when
+// it is added.
+struct TextureDecodeView {
+	const ShaderRecompiler::IR::DescriptorValue& value;
+	const ShaderRecompiler::IR::ImageResource&   resource;
+};
+
+struct TextureDecodeKeyHash {
+	using is_transparent = void;
+
+	size_t operator()(const TextureDecodeKey& key) const noexcept {
+		return (*this)(TextureDecodeView {key.value, key.resource});
+	}
+	size_t operator()(const TextureDecodeView& key) const noexcept {
+		uint64_t hash = key.value.dword_count;
+		for (const auto dword: key.value.dwords) {
+			hash = Common::Fnv64Step(hash, dword);
+		}
+		hash = Common::Fnv64Step(hash, key.resource.source);
+		hash = Common::Fnv64Step(hash, static_cast<uint32_t>(key.resource.written));
+		return static_cast<size_t>(hash);
+	}
+};
+
+struct TextureDecodeKeyEqual {
+	using is_transparent = void;
+
+	bool operator()(const TextureDecodeKey& a, const TextureDecodeKey& b) const { return a == b; }
+	bool operator()(const TextureDecodeView& a, const TextureDecodeKey& b) const {
+		return a.value == b.value && a.resource == b.resource;
+	}
+	bool operator()(const TextureDecodeKey& a, const TextureDecodeView& b) const {
+		return (*this)(b, a);
+	}
 };
 
 struct PreparedBindings {

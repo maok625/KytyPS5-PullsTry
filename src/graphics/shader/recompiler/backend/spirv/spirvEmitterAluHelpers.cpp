@@ -161,6 +161,26 @@ uint32_t EmitFlushF32DenormToSignedZero(EmitterState& state, uint32_t value) {
 	              Binary(state, spv::OpFMul, TypeF32(state), value, ConstantF32(state, 0)), value);
 }
 
+// x - floor(x), and NaN for an infinity: Metal's fract gives 0 there. The check is on the bits,
+// so that fast math cannot fold it away.
+uint32_t EmitFPFract32(EmitterState& state, uint32_t src) {
+	const auto fract    = state.builder.AllocateId();
+	const auto bits     = state.builder.AllocateId();
+	const auto abs_bits = state.builder.AllocateId();
+	const auto infinite = state.builder.AllocateId();
+	const auto result   = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpExtInst, TypeF32(state), fract, GlslStd450(state),
+	                          GLSLstd450Fract, src);
+	state.builder.AddFunction(spv::OpBitcast, TypeU32(state), bits, src);
+	state.builder.AddFunction(spv::OpBitwiseAnd, TypeU32(state), abs_bits, bits,
+	                          ConstantU32(state, 0x7fffffffu));
+	state.builder.AddFunction(spv::OpIEqual, TypeBool(state), infinite, abs_bits,
+	                          ConstantU32(state, 0x7f800000u));
+	state.builder.AddFunction(spv::OpSelect, TypeF32(state), result, infinite,
+	                          ConstantF32(state, 0x7fc00000u), fract);
+	return result;
+}
+
 uint32_t EmitTrigCycleF32(EmitterState& state, uint32_t src, bool preserve_signed_zero) {
 	// Finite values of magnitude 2^23 and above are integers, so fract already gives them +0.
 	const auto fract = state.builder.AllocateId();

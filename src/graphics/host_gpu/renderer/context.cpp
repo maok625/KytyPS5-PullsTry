@@ -1,5 +1,6 @@
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/perfCounters.h"
 #include "common/profiler.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -7,6 +8,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -24,13 +26,28 @@ bool CommandBuffer::IsInvalid() const {
 }
 
 vk::CommandBuffer CommandBuffer::Handle() const {
+	EndComputeChain();
+	return StateHandle();
+}
+
+vk::CommandBuffer CommandBuffer::StateHandle() const {
 	EXIT_IF(IsInvalid());
+	m_used = true;
 	return m_buffer;
+}
+
+void CommandBuffer::EndComputeChain() const {
+	if (!m_compute_chain) {
+		return;
+	}
+	m_compute_chain = false;
+	ShaderAccessBarrier(StateHandle(), vk::PipelineStageFlagBits::eComputeShader);
 }
 
 void CommandBuffer::Begin() {
 	EXIT_IF(m_rendering || IsInvalid());
-	auto buffer = Handle();
+	m_compute_chain = false;
+	auto buffer     = Handle();
 
 	vk::CommandBufferBeginInfo begin_info {};
 	begin_info.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
@@ -38,6 +55,7 @@ void CommandBuffer::Begin() {
 	auto result = buffer.begin(&begin_info);
 
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	m_used = false;
 }
 
 void CommandBuffer::End() const {
@@ -67,6 +85,8 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	EXIT_IF(state.width == 0 || state.height == 0 || state.num_layers == 0 ||
 	        state.num_color_attachments > RENDER_COLOR_ATTACHMENTS_MAX);
 	EndRendering();
+	InsertDebugLabel(m_buffer, "Pass {}x{} layers={} colors={}", state.width, state.height,
+	                 state.num_layers, state.num_color_attachments);
 
 	std::array<vk::RenderingAttachmentInfo, RENDER_COLOR_ATTACHMENTS_MAX> colors {};
 	for (uint32_t i = 0; i < state.num_color_attachments; i++) {
@@ -104,6 +124,7 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	rendering.pDepthAttachment     = depth_stencil.has_depth ? &depth : nullptr;
 	rendering.pStencilAttachment   = depth_stencil.has_stencil ? &stencil : nullptr;
 	Handle().beginRendering(rendering);
+	PerfCounters::Add(PerfCounters::Counter::RenderPasses);
 	// The open pass holds the cleared contents, so a later clear begins a new pass.
 	m_render_state = state;
 	for (auto& color: m_render_state.color_attachments) {

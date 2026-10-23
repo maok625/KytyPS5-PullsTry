@@ -23,6 +23,7 @@
 #include "libs/errno.h"
 #include "libs/hmd2.h"
 #include "libs/libs.h"
+#include "graphics/presentation/videoOutResolution.h"
 #include "loader/systemContent.h"
 
 #include <algorithm>
@@ -196,6 +197,8 @@ struct VideoOutConfig {
 	VideoOutConfig*                     master      = nullptr;
 	uint32_t                            slave_count = 0;
 	int                                 flip_rate   = 0;
+	// Performance counter: the earliest the next flip may show (the flip rate's cap).
+	std::atomic<uint64_t>               next_flip_due {0};
 	uint64_t                            output_mode = VIDEO_OUT_OUTPUT_MODE_DEFAULT;
 	float                               gamma       = 1.0f;
 	VideoOutFlipStatus                  flip_status;
@@ -219,6 +222,7 @@ public:
 	void Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer);
 	void Complete(uint64_t request_id);
 	void WaitForSubmitSlot(VideoOutConfig& cfg);
+	bool WaitForDueFlip(uint64_t until);
 	bool Flip(uint32_t micros);
 	void GetFlipStatus(VideoOutConfig& cfg, VideoOutFlipStatus& out);
 	bool IsSafeForRendering(VideoOutConfig& cfg, int index);
@@ -504,9 +508,26 @@ static bool IsFlipDueLocked(const VideoOutConfig& cfg, uint64_t generation) {
 	if (!cfg.opened || cfg.closing || cfg.generation != generation) {
 		return false;
 	}
-	const int interval = cfg.flip_rate + 1;
+	return Common::Timer::QueryPerformanceCounter() >=
+	       cfg.next_flip_due.load(std::memory_order_relaxed);
+}
 
-	return interval <= 1 || (cfg.vblank_status.count % static_cast<uint64_t>(interval)) == 0;
+static uint64_t VblankPeriod() {
+	return std::max(Common::Timer::QueryPerformanceFrequency() /
+	                    std::max(Config::GetVblankFrequency(), 1u),
+	                uint64_t {1});
+}
+
+// A flip shows at most once per flip_rate + 1 vblank periods, on average exactly that often, but
+// a late frame shows at once instead of at the next vblank: the host presents on its own clock,
+// and waiting for a vblank would hold every frame of a game below its rate for half a period.
+static void NoteFlipShownLocked(VideoOutConfig& cfg, uint64_t now) {
+	const auto period   = VblankPeriod();
+	const auto interval = static_cast<uint64_t>(cfg.flip_rate + 1) * period;
+	const auto previous = cfg.next_flip_due.load(std::memory_order_relaxed);
+	// The slack lets a frame of a game at its rate show in the vblank it was made for.
+	cfg.next_flip_due.store(std::max(previous + interval, now + interval - period / 4),
+	                        std::memory_order_relaxed);
 }
 
 static bool IsValidBufferIndex(int index) {
@@ -729,6 +750,7 @@ bool VideoOutDriver::Impl::Close(int handle) {
 			output_mode_events = std::move(config.events->output_mode);
 		}
 		config.flip_rate   = 0;
+		config.next_flip_due.store(0, std::memory_order_relaxed);
 		master             = config.master;
 		config.master      = nullptr;
 
@@ -865,10 +887,11 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 	while (!token.stop_requested()) {
 		const auto sleep_begin = Common::Timer::QueryPerformanceCounter();
 		if (total_wait > 0) {
-			const auto remaining_us =
-			    (static_cast<uint64_t>(total_wait) * 1000000u + frequency - 1) / frequency;
-			Common::Thread::SleepMicro(static_cast<uint32_t>(
-			    std::clamp<uint64_t>(remaining_us, 1, std::numeric_limits<uint32_t>::max())));
+			// Until the next vblank, a frame that is ready and due shows at once.
+			const auto vblank = sleep_begin + static_cast<uint64_t>(total_wait);
+			while (!token.stop_requested() && m_flip_queue.WaitForDueFlip(vblank) &&
+			       m_flip_queue.Flip(0)) {
+			}
 		}
 		if (token.stop_requested()) {
 			break;
@@ -1308,6 +1331,7 @@ bool FlipQueue::Flip(uint32_t micros) {
 			continue;
 		}
 		auto& r = *it;
+		NoteFlipShownLocked(*r.cfg, Common::Timer::QueryPerformanceCounter());
 		r.cfg->flip_status.count++;
 		r.cfg->flip_status.processTime              = LibKernel::KernelGetProcessTime();
 		r.cfg->flip_status.processTimeCounter       = LibKernel::KernelGetProcessTimeCounter();
@@ -1873,9 +1897,11 @@ KYTY_SYSV_ABI int VideoOutGetOutputStatus(int handle, VideoOutOutputStatus* stat
 	const bool hdr_allowed = !Loader::SystemContentParamSfoGetInt("ATTRIBUTE", &attribute) ||
 	                         (attribute & 0x20000000) != 0;
 	ctx->mutex.Lock();
-	// Primary output reports 4K unless param.json Video-out Info enables resolution detection.
 	status->resolution =
-	    ((attribute3 & 4) != 0 && ctx->width < 3840 && ctx->height < 2160 ? 1u : 2u);
+	    Graphics::ReportedVideoOutResolution({.setting    = Config::GetVideoOutResolution(),
+	                                          .attribute3 = attribute3,
+	                                          .width      = ctx->width,
+	                                          .height     = ctx->height});
 	status->dynamicRange = hdr_allowed && DriverState().IsHdrSupported() ? 2u : 1u;
 	status->refreshRate =
 	    (ctx->output_mode == VIDEO_OUT_OUTPUT_MODE_119_88HZ || Config::GetVblankFrequency() >= 119

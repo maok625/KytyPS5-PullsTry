@@ -6,6 +6,7 @@
 #include "common/threads.h"
 #include "common/virtualMemory.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/renderer/frontWorker.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -848,6 +849,25 @@ static uint64_t FindGuestFreeRange(uint64_t search_addr, uint64_t size, uint64_t
 	return addr;
 }
 
+DirectMemoryFile GetDirectMemoryFile() {
+	if (g_guest_address_space == nullptr) {
+		return {};
+	}
+	return {g_guest_address_space->GetBackingFileDescriptor(),
+	        g_guest_address_space->GetBackingSize()};
+}
+
+bool TranslateDirectMemory(uint64_t vaddr, uint64_t size, uint64_t* file_offset) {
+	return g_guest_address_space != nullptr &&
+	       g_guest_address_space->TryTranslateBacking(vaddr, size, file_offset);
+}
+
+bool ContiguousDirectMemory(uint64_t vaddr, uint64_t size, uint64_t low, uint64_t high,
+                            uint64_t* begin, uint64_t* end) {
+	return g_guest_address_space != nullptr &&
+	       g_guest_address_space->TryContiguousBacking(vaddr, size, low, high, begin, end);
+}
+
 bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
 	return g_guest_address_space != nullptr &&
 	       g_guest_address_space->TryWriteBacking(vaddr, data, size);
@@ -860,10 +880,19 @@ bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 
 bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
-		if (!Graphics::GuestGpu::IsGpuThread()) {
-			return false;
-		}
 		auto& buffers = GetGpuResources().GetBufferCache();
+		if (!Graphics::GuestGpu::IsGpuThread()) {
+			// The front worker reads what the GPU did not write; a read-back is the GPU thread's.
+			if (!Graphics::InFrontJob()) {
+				return false;
+			}
+			if (buffers.HasGpuDirtyBytesShared(vaddr, size)) {
+				Graphics::AbortFrontJob();
+				return false;
+			}
+			Graphics::NoteFrontRead(vaddr, size);
+			return TryReadBacking(vaddr, data, size);
+		}
 		if (buffers.HasGpuDirtyBytes(vaddr, size)) {
 			buffers.ReadMemory(vaddr, size);
 		}

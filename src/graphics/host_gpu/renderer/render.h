@@ -4,14 +4,19 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/profiler.h"
+#include "graphics/host_gpu/pipelineUse.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
+#include "graphics/host_gpu/renderer/threadDimensionDispatch.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
+#include <memory>
 #include <optional>
 #include <span>
+#include <unordered_map>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -31,6 +36,12 @@ struct DrawCallInfo;
 struct DrawEmitInfo;
 struct DrawIndexBufferSource;
 struct DrawRenderState;
+struct FrontPipeline;
+struct PendingWork;
+// Defined with FrontPipeline (renderDraw.cpp).
+struct FrontPipelineDeleter {
+	void operator()(FrontPipeline* pipeline) const;
+};
 class RenderContext;
 class CommandScheduler;
 struct RenderExecutorTestAccess;
@@ -63,6 +74,10 @@ struct DrawIndexArgs {
 	int32_t          base_vertex                = 0;
 	uint32_t         first_instance             = 0;
 	DrawOffsetSource offset_source              = DrawOffsetSource::DrawState;
+	// Nonzero: the host GPU reads the draw's arguments (a VkDrawIndexedIndirectCommand, as the
+	// guest lays them out) at this guest address. index_count is then the size of the index
+	// buffer in indices, and the other counts and offsets are unused.
+	uint64_t         indirect_args_address      = 0;
 	uint32_t         render_target_slice_offset = 0;
 	// With indirect records, index_count is INDEX_BUFFER_SIZE.
 	DrawIndirectArgs indirect;
@@ -74,6 +89,9 @@ struct DrawAutoArgs {
 	uint32_t         first_vertex               = 0;
 	uint32_t         first_instance             = 0;
 	DrawOffsetSource offset_source              = DrawOffsetSource::DrawState;
+	// Nonzero: the host GPU reads the draw's arguments (a VkDrawIndirectCommand) at this guest
+	// address, and the counts and offsets above are unused.
+	uint64_t         indirect_args_address      = 0;
 	uint32_t         render_target_slice_offset = 0;
 	DrawIndirectArgs indirect;
 };
@@ -111,26 +129,40 @@ public:
 	KYTY_CLASS_NO_COPY(CommandBuffer);
 
 	[[nodiscard]] bool IsInvalid() const;
+	// Any command was recorded since Begin (Handle was taken).
+	[[nodiscard]] bool Used() const noexcept { return m_used; }
 
 	void SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0 = 0, uint32_t arg1 = 0,
 	                  uint32_t arg2 = 0, uint32_t arg3 = 0, uint64_t arg4 = 0);
 	void BeginRendering(const RenderState& state) const;
 	void EndRendering() const;
 
+	// Ends an open compute chain first: whatever is recorded waits for the chain's dispatches.
 	[[nodiscard]] vk::CommandBuffer Handle() const;
+	// For commands that only set state (binds, push constants): an open compute chain stays
+	// open.
+	[[nodiscard]] vk::CommandBuffer StateHandle() const;
+	// Dispatches recorded one after another, with no guest synchronization between them, run
+	// together as on the guest GPU. The barrier after a dispatch is left open until anything
+	// else is recorded (Handle) or the guest synchronizes (EndComputeChain).
+	void ContinueComputeChain() const noexcept { m_compute_chain = true; }
+	[[nodiscard]] bool InComputeChain() const noexcept { return m_compute_chain; }
+	void EndComputeChain() const;
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
 	[[nodiscard]] RenderContext&    GetContext() const noexcept { return m_context; }
 	[[nodiscard]] HW::Context&      GetRegisters() const noexcept { return *m_registers; }
 	[[nodiscard]] HW::UserConfig&   GetUserConfig() const noexcept { return *m_user_config; }
 	[[nodiscard]] HW::Shader&       GetShaders() const noexcept { return *m_shaders; }
-
-private:
-	explicit CommandBuffer(CommandScheduler& scheduler);
+	// The registers commands are recorded with. A draw recorded after later packets changed them
+	// binds a copy of its own for its recording (RenderExecutor::DrawIndex).
 	void Bind(HW::Context& registers, HW::UserConfig& user_config, HW::Shader& shaders) noexcept {
 		m_registers   = &registers;
 		m_user_config = &user_config;
 		m_shaders     = &shaders;
 	}
+
+private:
+	explicit CommandBuffer(CommandScheduler& scheduler);
 
 	void Begin();
 	void End() const;
@@ -147,6 +179,8 @@ private:
 	uint64_t            m_debug_arg4      = 0;
 	mutable RenderState m_render_state;
 	mutable bool        m_rendering   = false;
+	mutable bool        m_used        = false;
+	mutable bool        m_compute_chain = false;
 	HW::Context*        m_registers   = nullptr;
 	HW::UserConfig*     m_user_config = nullptr;
 	HW::Shader*         m_shaders     = nullptr;
@@ -156,11 +190,20 @@ private:
 
 class RenderExecutor {
 public:
-	explicit RenderExecutor(RenderContext& context): m_context(context) {}
+	explicit RenderExecutor(RenderContext& context);
+	~RenderExecutor();
 	KYTY_CLASS_NO_COPY(RenderExecutor);
 
 	void DispatchDirect(uint64_t submit_id, CommandBuffer& buffer, uint32_t thread_group_x,
 	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode, bool async_compute);
+	// A frame of the game ends: what the next frame draws into is told apart from what it does
+	// not (see PlanPipelineUse).
+	void NoteFlip();
+	// Records the draw or dispatch DrawIndex or DispatchDirect left pending (its program lookups
+	// run on the front worker while the work before it is recorded). Before anything else is
+	// recorded or guest memory written: the command processor calls it for every packet but
+	// register writes, draws and dispatches.
+	void FlushPendingWork();
 	void DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_addr,
 	                      uint32_t mode, bool async_compute);
 
@@ -175,7 +218,8 @@ public:
 	                                            const ShaderRecompiler::IR::DescriptorValue& value);
 
 private:
-	// False, with nothing drawn, when the draw's indirect records need CPU counts.
+	// False only for a draw with indirect_args_address that the host GPU cannot read the
+	// arguments of (see HostReadsIndirectArgs): nothing was drawn, and the caller reads them.
 	bool DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
 	bool DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args);
 
@@ -197,10 +241,58 @@ private:
 	                                          const DrawCallInfo& draw,
 	                                          uint32_t            render_target_slice_offset,
 	                                          DrawRenderState& state);
+	// The part of PrepareDrawRenderState after the program lookups.
+	[[nodiscard]] bool PrepareDrawTargets(CommandBuffer& buffer, const DrawCallInfo& draw,
+	                                      uint32_t render_target_slice_offset,
+	                                      DrawRenderState& state);
+	// DrawIndex from its prepared state on: targets, bindings, the recording.
+	void FinishDrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args,
+	                     const DrawCallInfo& draw, vk::PrimitiveTopology topology,
+	                     const DrawIndexBufferSource& index_source, bool primitive_restart,
+	                     DrawRenderState& state, bool prepare_targets);
+	// KYTY_FRONT_WORKER=0 keeps the program lookups on the GPU thread.
+	[[nodiscard]] static bool FrontWorkerEnabled();
+	// DrawIndex of an ordinary draw with a front worker: see FlushPendingWork.
+	void PipelineDrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args,
+	                       const DrawCallInfo& draw, vk::PrimitiveTopology topology,
+	                       const DrawIndexBufferSource& index_source, bool primitive_restart);
+	// DispatchDirect with a front worker, from its input before the program lookup.
+	void PipelineDispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
+	                            const std::array<uint32_t, 3>& groups, uint32_t mode,
+	                            const ShaderComputeInputInfo& input_info);
+	// DispatchDirect after its program lookup.
+	void FinishDispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
+	                          std::array<uint32_t, 3> groups, uint32_t mode,
+	                          ShaderComputeInputInfo& input_info,
+	                          const ShaderProgram& compute_program);
+	// The free slot for the next pending work, with a copy of the buffer's registers.
+	PendingWork& NextPendingWork(CommandBuffer& buffer, uint64_t submit_id);
+	// Queues the lookups of `next` on the front worker, and records the oldest pending work
+	// while more than FrontDepth wait.
+	void QueuePendingWork(CommandBuffer& buffer, PendingWork& next);
+	// Settles and records the oldest pending work.
+	void RecordOldestPendingWork(CommandBuffer& buffer);
+	// The front worker's job for the pending work is done and still holds, or redone here.
+	void SettlePendingLookups(PendingWork& pending);
+	void RecordPendingWork(PendingWork& pending, CommandBuffer& buffer);
 	void ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer, const DrawCallInfo& draw,
 	                         DrawRenderState& state, vk::PrimitiveTopology topology,
 	                         const DrawEmitInfo& emit, const DrawIndexBufferSource& index_source,
 	                         bool primitive_restart_enable);
+	// Whether the host GPU can read the arguments of an indirect draw in this state: draws that
+	// a special color mode, a depth copy or a quad list turns into other work need the counts
+	// on the CPU.
+	[[nodiscard]] static bool HostReadsIndirectArgs(const CommandBuffer& buffer);
+	// The same once the draw's state is known: the mesh paths need the counts on the CPU, and a
+	// rewritten fetch keeps the arguments' first instance.
+	[[nodiscard]] bool HostReadsIndirectArgs(const DrawRenderState& state) const;
+	// Copies the arguments of an indirect draw for the host GPU to read, without the offsets a
+	// native fetch adds itself; returns the copy.
+	[[nodiscard]] std::pair<vk::Buffer, uint64_t> PrepareIndirectArgs(CommandBuffer&      buffer,
+	                                                                  bool                indexed,
+	                                                                  const DrawEmitInfo& emit);
+	void ApplyDepthBoundsByShader(CommandBuffer& buffer, DrawRenderState& state,
+	                              const PipelineCache::Pipeline& pipeline);
 	[[nodiscard]] RenderState AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
 	                                               uint32_t color_count, RenderDepthInfo& depth,
 	                                               vk::ImageAspectFlags& feedback_aspects,
@@ -219,11 +311,78 @@ private:
 	                                        uint32_t group_y, uint32_t group_z, uint32_t mode);
 
 	RenderContext&                        m_context;
+	std::unique_ptr<ThreadDimensionDispatch> m_thread_dimensions; // created on first use
 	GraphicsBindings                     m_graphics_bindings;
 	PreparedBindings                     m_compute_bindings;
+	// Created on the first pipelined draw or dispatch (see FrontWorkerEnabled).
+	std::unique_ptr<FrontPipeline, FrontPipelineDeleter> m_front_pipeline;
+	// The resources the program lookups of the current draw and dispatch materialized.
+	PipelineCache::StageResources          m_draw_resources;
+	ShaderRecompiler::IR::ResourceSnapshot m_dispatch_resources;
+	// The last color target each slot resolved (colorRenderTarget.cpp).
+	struct ColorTargetMemos;
+	std::unique_ptr<ColorTargetMemos>    m_color_target_memos;
+	// The open compute chain has waited for the work recorded before it (see DispatchDirect).
+	bool                                 m_compute_chain_ordered = false;
 	std::vector<ImageId>                  m_bound_images;
+	// The frame in which each render target was last drawn into. A target is an image slot with
+	// its generation (so a slot given to a new image does not inherit the frame of the old one)
+	// and the mip level and array layer (a face of a cube map, a layer of an atlas or a cascade of
+	// a shadow map drawn once is not covered by draws into the others).
+	// One target of a draw: an image (slot and generation), a mip and a layer. Exact, no hash.
+	struct TargetId {
+		uint64_t image = 0;
+		uint32_t mip   = 0;
+		uint32_t layer = 0;
+		bool     operator==(const TargetId&) const = default;
+	};
+	struct TargetIdHash {
+		size_t operator()(const TargetId& id) const noexcept {
+			return std::hash<uint64_t> {}(id.image ^ ((uint64_t {id.mip} << 40) | (uint64_t {id.layer} << 8)));
+		}
+	};
+	static uint64_t ImageIdentity(ImageId image) {
+		return (uint64_t {image.index} << 32) | image.generation;
+	}
+	static TargetId TargetKey(ImageId image, uint32_t mip = 0, uint32_t layer = 0) {
+		return {ImageIdentity(image), mip, layer};
+	}
+	std::unordered_map<TargetId, TargetHistory, TargetIdHash> m_target_frames;
+	// Buffers a draw uses on the GPU alone, within one submission (a depth snapshot, the records
+	// of an emulated mesh draw). Kept and used again once the GPU has passed the submission that
+	// used them: creating and destroying one per draw cost 0.45 ms each on MoltenVK.
+	struct ScratchBuffer {
+		std::unique_ptr<Buffer> buffer;
+		uint64_t                tick = 0;
+	};
+	std::vector<ScratchBuffer> m_scratch;
+	uint64_t                   m_scratch_bytes = 0;
+	// The depth snapshot the last depth-bounds draw read (see depthSnapshotPlan.h). Held out
+	// of the scratch pool while it may be read again; returned to it when replaced.
+	struct DepthSnapshot {
+		std::unique_ptr<Buffer> buffer;
+		uint64_t                tick       = 0;
+		uint64_t                image      = 0;
+		uint32_t                layer      = 0;
+		uint64_t                generation = 0;
+		bool                    load_clear = false;
+		float                   clear      = 0.0f;
+	};
+	DepthSnapshot              m_depth_snapshot;
+	Buffer&                    AcquireScratch(uint64_t bytes);
+	static TargetId TargetKey(const RenderColorInfo& color);
+	static TargetId TargetKey(const RenderDepthInfo& depth);
+	uint64_t                               m_frame = 0;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
+	// CommitBindings: the (address, size) ranges a draw or dispatch writes.
+	std::vector<std::pair<uint64_t, uint64_t>> m_written_image_ranges;
+	std::vector<std::pair<uint64_t, uint64_t>> m_written_buffer_ranges;
+	// Dropped whole at the end of a frame when full (bindings point into it): a frame of Crash
+	// Bandicoot 4 decodes about 1,500 different ones.
+	static constexpr size_t                MaxDecodedTextures = 4096;
+	std::unordered_map<TextureDecodeKey, DecodedTexture, TextureDecodeKeyHash, TextureDecodeKeyEqual>
+	    m_decoded_textures;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;

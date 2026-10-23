@@ -6,27 +6,37 @@
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
+#include "common/perfCounters.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
+#include "common/trace.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/tile.h"
+#include "graphics/host_gpu/depthSnapshotPlan.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/hostLowering.h"
+#include "graphics/host_gpu/regionManager.h"
+#include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/gpuBreadcrumbs.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/frontWorker.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/shader/capturedVertexLayout.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
+#include "graphics/shader/triangleVertexValueShader.h"
 #include "kernel/eventQueue.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
@@ -380,18 +390,28 @@ static void UpdateGraphicsDynamicState(const CommandBuffer& buffer, DynamicState
 	dynamic_state.SetDepthTestEnabled(depth.depth_test_enable);
 	dynamic_state.SetDepthWriteEnabled(depth.depth_write_enable);
 	dynamic_state.SetDepthCompareOp(depth.depth_compare_op);
-#if !defined(__APPLE__)
+	// Without a depth bounds test in the device the pixel shader applies it (see
+	// ApplyDepthBoundsByShader), and DynamicState::Commit leaves it out.
 	dynamic_state.SetDepthBoundsTestEnabled(depth.depth_bounds_test_enable);
 	if (depth.depth_bounds_test_enable) {
 		dynamic_state.SetDepthBounds(ctx.GetDepthBoundsMin(), ctx.GetDepthBoundsMax());
 	}
-#endif
 
 	const auto& mode              = ctx.GetModeControl();
 	const auto& poly_offset       = ctx.GetPolyOffset();
 	const bool  use_front         = mode.poly_offset_front_enable && !mode.cull_front;
 	const bool  use_back          = mode.poly_offset_back_enable && !mode.cull_back;
 	const bool  depth_bias_enable = use_front || use_back;
+	if (!HostDepthIsExact(buffer.GetContext().GetGraphics().host.capabilities,
+	                      ctx.GetClipControl().IsZClipEnabled(), depth_bias_enable)) {
+		// Not stopped: polygon offset is common (decals, shadows), and MoltenVK has no
+		// VK_EXT_depth_clip_enable. Only depth that the offset moves past the range is wrong.
+		static std::atomic<bool> warned {false};
+		if (!warned.exchange(true)) {
+			LOGF("Warning: depth with polygon offset is not clamped on this host: it lacks depthClamp "
+			     "with VK_EXT_depth_clip_enable\n");
+		}
+	}
 	dynamic_state.SetDepthBiasEnabled(depth_bias_enable);
 	if (depth_bias_enable) {
 		// Vulkan has one bias for both faces. Prefer a visible front face when both are enabled.
@@ -415,16 +435,13 @@ static void UpdateGraphicsDynamicState(const CommandBuffer& buffer, DynamicState
 		dynamic_state.SetStencilReferences(front.reference, back.reference);
 	}
 
-#if defined(__APPLE__)
-	// MoltenVK has no VK_EXT_color_write_enable; the pipeline is created without the
-	// eColorWriteEnableEXT dynamic state and relies on the static colorWriteMask instead.
-#else
+	// Without VK_EXT_color_write_enable the pipeline has no such dynamic state (see
+	// CreatePipelineInternal), and DynamicState::Commit leaves it out.
 	vk::Bool32 enable[RENDER_COLOR_ATTACHMENTS_MAX] = {};
 	for (uint32_t slot = 0; slot < rendering.num_color_attachments; slot++) {
 		enable[slot] = rendering.color_attachments[slot].image_view != nullptr;
 	}
 	dynamic_state.SetColorWriteEnables(std::span {enable}.first(rendering.num_color_attachments));
-#endif
 }
 
 static bool DrawHasValidVertexShader(const HW::Shader& sh_ctx) {
@@ -447,6 +464,7 @@ struct DrawRenderState {
 	std::array<ShaderVertexInputInfo, 3> vertex_info;
 	ShaderPixelInputInfo  ps_input_info;
 	PipelineCache::GraphicsPrograms programs;
+	PipelineCache::StageResources*  resources = nullptr; // where the lookups put the resources
 };
 
 struct DrawCallInfo {
@@ -528,7 +546,7 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		for (const auto* stage: stages) {
 			for (const auto& binding: stage->images) {
 				if (binding.image_id != depth.image_id ||
-				    binding.desc.type != TextureCache::BindingType::Texture) continue;
+				    binding.type != TextureCache::BindingType::Texture) continue;
 				const auto native =
 				    std::ranges::find(image.views, binding.image_view, &CachedImageView::view);
 				EXIT_IF(native == image.views.end());
@@ -537,7 +555,7 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 				                                         native->info);
 			}
 		}
-		if (feedback_aspects && !m_context.GetGraphics().attachment_feedback_loop_enabled) {
+		if (feedback_aspects && !m_context.GetGraphics().host.capabilities.attachment_feedback_loop) {
 			static std::atomic_bool logged = false;
 			if (!logged.exchange(true, std::memory_order_relaxed)) {
 				std::printf("depth attachment feedback loop is not supported by the host\n");
@@ -545,7 +563,7 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		}
 		auto layout = depth_attachment_layout(depth);
 		if (sampled_aspects & ~DepthReadableAspects(layout)) {
-			layout = m_context.GetGraphics().attachment_feedback_loop_enabled
+			layout = m_context.GetGraphics().host.capabilities.attachment_feedback_loop
 			             ? vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
 			             : vk::ImageLayout::eGeneral;
 		}
@@ -870,26 +888,29 @@ static bool ResolvePrimitiveRestart(const CommandBuffer& buffer,
 	return false;
 }
 
-static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
-                           uint32_t color_output_mask, DrawRenderState& state) {
-	auto& ctx    = buffer.GetRegisters();
-	auto& sh_ctx = buffer.GetShaders();
-
+// From the registers alone, not the command buffer: the front worker runs it on a copy of them.
+static void RefreshShaders(const HW::Context& ctx, const HW::Shader& sh_ctx,
+                           const HW::UserConfig& user_config, PipelineCache& pipeline_cache,
+                           const DrawCallInfo& draw, uint32_t color_output_mask,
+                           DrawRenderState& state) {
 	const auto& vertex_shader_info = sh_ctx.GetVs();
 	const auto& pixel_shader_info  = sh_ctx.GetPs();
 	const auto& shader_regs        = ctx.GetShaderRegisters();
 
 	state.programs      = {};
 	state.ps_input_info = {};
-	std::array<Prospero::ColorComponentMapping, RENDER_COLOR_ATTACHMENTS_MAX>
-	    target_export_mapping {};
+	std::array<ShaderColorTarget, RENDER_COLOR_ATTACHMENTS_MAX> color_targets {};
 	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
 		const auto& rt = ctx.GetRenderTarget(slot);
 		if ((color_output_mask & (1u << slot)) != 0 && rt.base.addr != 0) {
-			target_export_mapping[slot] =
+			color_targets[slot].export_mapping =
 			    TextureGetRenderTargetFormat(rt.info.format, rt.info.channel_type,
 			                                 rt.info.channel_order)
 			        .export_mapping;
+			color_targets[slot].number_class =
+			    rt.info.channel_type == Prospero::ChannelType::kUInt   ? ShaderColorNumberClass::Uint
+			    : rt.info.channel_type == Prospero::ChannelType::kSInt ? ShaderColorNumberClass::Sint
+			                                                           : ShaderColorNumberClass::Float;
 		}
 	}
 	auto& pipeline_cache = buffer.GetContext().GetPipelineCache();
@@ -898,20 +919,38 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 		LogDrawPhase(draw.Name(), "GetGraphicsPrograms");
 	}
 	state.programs = pipeline_cache.GetGraphicsPrograms(
-	    vertex_shader_info, pixel_shader_info, shader_regs, ctx, buffer.GetUserConfig(),
-	    target_export_mapping, state.ps_active, state.vertex_info, state.ps_input_info);
+	    vertex_shader_info, pixel_shader_info, shader_regs, ctx, user_config,
+	    color_targets, state.ps_active, state.vertex_info, state.ps_input_info, state.resources);
+}
+
+// What decides the lookups beside the programs' registers: the color outputs, the pixel stage.
+static uint32_t PrepareDrawShaderState(const HW::Context& ctx, const HW::Shader& sh_ctx,
+                                       DrawRenderState& state) {
+	const auto& shader_regs       = ctx.GetShaderRegisters();
+	const auto  color_output_mask = DrawColorOutputMask(ctx);
+	state.ps_active = sh_ctx.GetPs().ps_regs.data_addr != 0 &&
+	                  (color_output_mask != 0 ||
+	                   PixelShaderHasDepthOrCoverageSideEffects(shader_regs));
+	return color_output_mask;
 }
 
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
                                             uint32_t            render_target_slice_offset,
 	                                        DrawRenderState& state) {
-	const auto& shader_regs       = buffer.GetRegisters().GetShaderRegisters();
-	const auto  color_output_mask = DrawColorOutputMask(buffer.GetRegisters());
-	state.ps_active = buffer.GetShaders().GetPs().ps_regs.data_addr != 0 &&
-	                  (color_output_mask != 0 ||
-	                   PixelShaderHasDepthOrCoverageSideEffects(shader_regs));
-	RefreshShaders(buffer, draw, color_output_mask, state);
-	uint32_t mrt_mask = 0;
+	KYTY_PROFILER_FUNCTION();
+	const auto color_output_mask =
+	    PrepareDrawShaderState(buffer.GetRegisters(), buffer.GetShaders(), state);
+	state.resources = &m_draw_resources;
+	RefreshShaders(buffer.GetRegisters(), buffer.GetShaders(), buffer.GetUserConfig(),
+	               buffer.GetContext().GetPipelineCache(), draw, color_output_mask, state);
+	return PrepareDrawTargets(buffer, draw, render_target_slice_offset, state);
+}
+
+bool RenderExecutor::PrepareDrawTargets(CommandBuffer& buffer, const DrawCallInfo& draw,
+                                        uint32_t render_target_slice_offset,
+                                        DrawRenderState& state) {
+	const auto color_output_mask = DrawColorOutputMask(buffer.GetRegisters());
+	uint32_t   mrt_mask          = 0;
 	if (state.ps_active) {
 		for (const auto& output: state.ps_input_info.stage.program->info.outputs) {
 			if (output.kind == ShaderRecompiler::IR::StageOutputKind::Mrt ||
@@ -972,6 +1011,7 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 
 static PreparedIndexBuffer PrepareIndexBuffer(CommandBuffer&               buffer,
                                               const DrawIndexBufferSource& source) {
+	KYTY_PROFILER_FUNCTION();
 	PreparedIndexBuffer prepared;
 	if (source.size == 0) {
 		return prepared;
@@ -992,6 +1032,7 @@ static PreparedIndexBuffer PrepareIndexBuffer(CommandBuffer&               buffe
 
 static void CommitVertexBuffers(vk::CommandBuffer            vk_buffer,
                                 const PreparedVertexBuffers& prepared) {
+	KYTY_PROFILER_FUNCTION();
 	for (uint32_t i = 0; i < prepared.count; i++) {
 		EXIT_IF(prepared.buffers[i] == nullptr);
 	}
@@ -1029,7 +1070,19 @@ static void LogDrawStateIfNeeded(const CommandBuffer& buffer, const DrawCallInfo
 }
 
 static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_buffer,
-                               const DrawCallInfo& draw, const DrawEmitInfo& emit) {
+                               const DrawCallInfo& draw, const DrawEmitInfo& emit,
+                               std::pair<vk::Buffer, uint64_t> indirect_args) {
+	if (emit.indirect_args_address != 0) {
+		// HostReadsIndirectArgs leaves quad lists, which need the count, on the CPU.
+		EXIT_IF(indirect_args.first == nullptr ||
+		        ucfg.GetPrimType() == Prospero::PrimitiveType::kQuadListLegacy);
+		if (draw.IsIndexed()) {
+			vk_buffer.drawIndexedIndirect(indirect_args.first, indirect_args.second, 1, 0);
+		} else {
+			vk_buffer.drawIndirect(indirect_args.first, indirect_args.second, 1, 0);
+		}
+		return;
+	}
 	switch (ucfg.GetPrimType()) {
 		case Prospero::PrimitiveType::kPointList:
 		case Prospero::PrimitiveType::kLineList:
@@ -1066,6 +1119,150 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 	}
 }
 
+// The host has no depth bounds test. The pixel shader applies it to a copy of the depth buffer
+// that this makes before the draw. The copy is exact when the draw does not change the depth it
+// tests against, so a draw that writes depth stops here. A draw that starts with a depth clear
+// tests against the clear value everywhere, so the buffer is filled with it instead of copied.
+void RenderExecutor::ApplyDepthBoundsByShader(CommandBuffer& buffer, DrawRenderState& state,
+                                              const PipelineCache::Pipeline& pipeline) {
+	auto&       depth      = state.depth_info;
+	auto&       cache      = m_context.GetTextureCache();
+	const auto& ps         = state.ps_input_info;
+	const auto  min_bounds = buffer.GetRegisters().GetDepthBoundsMin();
+	const auto  max_bounds = buffer.GetRegisters().GetDepthBoundsMax();
+	if (!state.ps_active || ps.ps_depth_bounds_format == 0) {
+		EXIT("depth bounds test on a draw without a pixel shader\n");
+	}
+	if (depth.depth_write_enable) {
+		EXIT("depth bounds test on a draw that also writes depth: test=%d compare=%d "
+		     "bounds=%f..%f\n",
+		     depth.depth_test_enable, static_cast<int>(depth.depth_compare_op),
+		     min_bounds, max_bounds);
+	}
+	auto&       image = cache.GetImage(depth.image_id);
+	const auto& view  = depth.desc.view_info;
+	if (image.backing.samples != 1 || view.base_level != 0 || view.level_count != 1 ||
+	    view.layer_count != 1) {
+		EXIT("depth bounds test on a multisampled, mipmapped or layered depth target\n");
+	}
+	const auto format  = image.backing.format;
+	const bool f32     = format == vk::Format::eD32Sfloat || format == vk::Format::eD32SfloatS8Uint;
+	const bool unorm16 = format == vk::Format::eD16Unorm || format == vk::Format::eD16UnormS8Uint;
+	if ((ps.ps_depth_bounds_format == 1 && !f32) || (ps.ps_depth_bounds_format == 2 && !unorm16)) {
+		EXIT("depth bounds test: depth format %d does not match the shader's depth read\n",
+		     static_cast<int>(format));
+	}
+	const auto extent = depth.desc.info.extent;
+	const auto bytes =
+	    Common::AlignUp(static_cast<uint64_t>(extent.width) * extent.height * (f32 ? 4u : 2u), 4);
+
+	auto& scheduler = m_context.GetCommandScheduler();
+	auto& held      = m_depth_snapshot;
+	const auto step = PlanDepthSnapshot({
+	    .target_image       = ImageIdentity(depth.image_id),
+	    .target_layer       = view.base_layer,
+	    .content_generation = image.ContentGeneration(),
+	    .load_clear         = static_cast<bool>(depth.load_clear_aspects & vk::ImageAspectFlagBits::eDepth),
+	    .clear_value        = depth.depth_clear_value,
+	    .cached             = held.buffer != nullptr && held.buffer->Size() >= bytes,
+	    .cached_target_image = held.image,
+	    .cached_target_layer = held.layer,
+	    .cached_generation  = held.generation,
+	    .cached_load_clear  = held.load_clear,
+	    .cached_clear_value = held.clear,
+	});
+	if (step != DepthSnapshotStep::Reuse) {
+		// The held snapshot goes back to the pool; a buffer that fits comes out of it.
+		if (held.buffer != nullptr) {
+			m_scratch.push_back({std::move(held.buffer), held.tick});
+		}
+		auto& fresh   = AcquireScratch(bytes);
+		auto  it      = std::ranges::find_if(m_scratch, [&](const ScratchBuffer& scratch) {
+            return scratch.buffer.get() == &fresh;
+        });
+		held.buffer   = std::move(it->buffer);
+		m_scratch.erase(it);
+		held.image      = ImageIdentity(depth.image_id);
+		held.layer      = view.base_layer;
+		held.generation = image.ContentGeneration();
+		held.load_clear = static_cast<bool>(depth.load_clear_aspects & vk::ImageAspectFlagBits::eDepth);
+		held.clear      = depth.depth_clear_value;
+	}
+	held.tick          = scheduler.CurrentTick();
+	auto&      snapshot = *held.buffer;
+	const auto address  = snapshot.BufferDeviceAddress();
+
+	scheduler.EndRendering();
+	auto vk_buffer = buffer.Handle();
+	if (step == DepthSnapshotStep::Reuse) {
+		// The snapshot shows the target as it is: nothing to copy.
+	} else if (step == DepthSnapshotStep::Fill) {
+		// The pass clears the depth buffer first: every pixel holds the clear value.
+		const auto clear = depth.depth_clear_value;
+		const auto half =
+		    static_cast<uint32_t>(std::lround(std::clamp(clear, 0.0f, 1.0f) * 65535.0f));
+		const auto word = f32 ? std::bit_cast<uint32_t>(clear) : (half | (half << 16u));
+		vk_buffer.fillBuffer(snapshot.Handle(), 0, bytes, word);
+	} else {
+		const ImageSubresourceRange range {view.base_level, view.level_count, view.base_layer,
+		                                   view.layer_count};
+		const auto                  attachment_layout = image.binding.attachment_layout;
+		const auto                  attachment_access = image.binding.attachment_access;
+		image.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead,
+		              range, vk_buffer);
+		vk::BufferImageCopy copy {};
+		copy.imageSubresource = {vk::ImageAspectFlagBits::eDepth, view.base_level, view.base_layer,
+		                         1};
+		copy.imageExtent      = {extent.width, extent.height, 1};
+		vk_buffer.copyImageToBuffer(image.backing.image, vk::ImageLayout::eTransferSrcOptimal,
+		                            snapshot.Handle(), 1, &copy);
+		image.Transit(attachment_layout, attachment_access, range, vk_buffer);
+	}
+	if (step != DepthSnapshotStep::Reuse) {
+		vk::MemoryBarrier2 barrier {};
+		barrier.srcStageMask  = vk::PipelineStageFlagBits2::eTransfer;
+		barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+		barrier.dstStageMask  = vk::PipelineStageFlagBits2::eFragmentShader;
+		barrier.dstAccessMask = vk::AccessFlagBits2::eShaderStorageRead;
+		vk::DependencyInfo dependency {};
+		dependency.memoryBarrierCount = 1;
+		dependency.pMemoryBarriers    = &barrier;
+		vk_buffer.pipelineBarrier2(dependency);
+	}
+
+	const uint32_t parameters[ShaderRecompiler::IR::PushData::DepthBoundsDwordCount] {
+	    static_cast<uint32_t>(address), static_cast<uint32_t>(address >> 32u), extent.width,
+	    std::bit_cast<uint32_t>(min_bounds),
+	    std::bit_cast<uint32_t>(max_bounds)};
+	vk_buffer.pushConstants(pipeline.pipeline_layout, pipeline.push_constant_stages,
+	                        ps.ps_depth_bounds_dword * sizeof(uint32_t), sizeof(parameters),
+	                        parameters);
+}
+
+void RenderExecutor::NoteFlip() {
+	if (m_decoded_textures.size() >= MaxDecodedTextures) {
+		// Prepared bindings point into the table; each draw prepares its own again.
+		for (auto& stage: m_graphics_bindings.vertex) stage.images.clear();
+		if (m_graphics_bindings.pixel) m_graphics_bindings.pixel->images.clear();
+		m_compute_bindings.images.clear();
+		m_decoded_textures.clear();
+	}
+	m_frame++;
+	RegionManager::NoteFrame();
+	PerfCounters::EndFrame();
+	Trace::EndFrame();
+	KYTY_PROFILER_FRAME();
+}
+
+RenderExecutor::TargetId RenderExecutor::TargetKey(const RenderColorInfo& color) {
+	return TargetKey(color.image_id, color.guest_mip_level, color.guest_array_layer);
+}
+
+RenderExecutor::TargetId RenderExecutor::TargetKey(const RenderDepthInfo& depth) {
+	return TargetKey(depth.image_id, depth.desc.view_info.base_level,
+	                 depth.desc.view_info.base_layer);
+}
+
 bool RenderExecutor::CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo& draw,
                                        const DrawEmitInfo& emit, DrawRenderState& state) {
 	if (!buffer.GetRegisters().GetRenderControl().copy_depth_to_color) {
@@ -1075,7 +1272,7 @@ bool RenderExecutor::CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo&
 	const auto& hw = buffer.GetRegisters();
 	auto& depth = state.depth_info;
 	auto& color = state.color_info[0];
-	EXIT_NOT_IMPLEMENTED(!m_context.GetGraphics().maintenance8_enabled ||
+	EXIT_NOT_IMPLEMENTED(!m_context.GetGraphics().host.capabilities.maintenance8 ||
 	                     !Prospero::IsRectList(ucfg.GetPrimType()) ||
 	                     draw.IsIndexed() || draw.index_count != 3 || draw.instance_count != 1 ||
 	                     emit.vertex_offset != 0 || emit.first_instance != 0 ||
@@ -1127,14 +1324,17 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
                                          vk::PrimitiveTopology topology, const DrawEmitInfo& emit,
                                          const DrawIndexBufferSource& index_source,
 	                                     bool primitive_restart_enable) {
+	PerfCounters::Add(PerfCounters::Counter::Draws);
+	KYTY_PROFILER_FUNCTION();
 	auto& ucfg = buffer.GetUserConfig();
 	if (CopyDepthToColor(buffer, draw, emit, state)) {
 		return;
 	}
 	const auto vertex_stages =
 	    std::span {state.vertex_info.data(), state.programs.VertexStageCount()};
-	const bool mesh_active = state.vertex_info[0].stage.program->stage == ShaderType::Mesh;
-	uint32_t   mesh_groups = 0;
+	const bool mesh_active   = state.vertex_info[0].stage.program->stage == ShaderType::Mesh;
+	const bool mesh_emulated = mesh_active && state.vertex_info[0].mesh.emulated;
+	uint32_t   mesh_groups   = 0;
 	if (mesh_active) {
 		const auto& mesh = state.vertex_info[0].mesh;
 		EXIT_NOT_IMPLEMENTED(mesh.fast_launch && (draw.IsIndexed() || primitive_restart_enable));
@@ -1153,15 +1353,86 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			return;
 		}
 		mesh_groups        = (primitives - 1u) / mesh.primitives_per_group + 1u;
-		const auto& limits = m_context.GetGraphics().mesh_shader_properties;
-		if (mesh_groups > limits.maxMeshWorkGroupCount[0] ||
-		    draw.instance_count > limits.maxMeshWorkGroupCount[1] ||
-		    static_cast<uint64_t>(mesh_groups) * draw.instance_count >
-		        limits.maxMeshWorkGroupTotalCount) {
+		bool within_limits = false;
+		if (mesh_emulated) {
+			const auto& limits = m_context.GetGraphics().GetPhysicalDeviceProperties().limits;
+			within_limits      = mesh_groups <= limits.maxComputeWorkGroupCount[0] &&
+			                     draw.instance_count <= limits.maxComputeWorkGroupCount[1];
+		} else {
+			const auto& limits = m_context.GetGraphics().mesh_shader_properties;
+			within_limits      = mesh_groups <= limits.maxMeshWorkGroupCount[0] &&
+			                     draw.instance_count <= limits.maxMeshWorkGroupCount[1] &&
+			                     static_cast<uint64_t>(mesh_groups) * draw.instance_count <=
+			                         limits.maxMeshWorkGroupTotalCount;
+		}
+		if (!within_limits) {
 			EXIT("mesh draw exceeds host workgroup limits: %ux%u\n", mesh_groups,
 			     draw.instance_count);
 		}
 	}
+
+	if (state.ps_active && m_context.GetGraphics().host.faults.no_per_vertex_inputs &&
+	    ShaderPixelReadsVertexValues(state.ps_input_info)) {
+		if (topology != vk::PrimitiveTopology::eTriangleList || vertex_stages.size() != 1 ||
+		    mesh_active) {
+			EXIT("a pixel shader reads raw vertex values in a draw that is not a plain triangle "
+			     "list, which the host GPU cannot do yet: primitive=%u stages=%u mesh=%u\n",
+			     static_cast<uint32_t>(ucfg.GetPrimType()),
+			     static_cast<uint32_t>(vertex_stages.size()), static_cast<uint32_t>(mesh_active));
+		}
+		topology = vk::PrimitiveTopology::ePatchList;
+		// A list has no strips to restart, and a patch list may not have the restart index.
+		primitive_restart_enable = false;
+	}
+	// The pipeline before anything is prepared for the draw: when it is still being built the
+	// draw is left out, and by then it must not have touched buffers or render targets.
+	if (draw.IsIndexed()) {
+		LogDrawPhase(draw.Name(), "CreatePipeline");
+	}
+	DrawEffects effects {.clears_depth = state.depth_info.depth_clear_enable ||
+	                                     state.depth_info.stencil_clear_enable};
+	// A target drawn in the previous frame, or earlier in this one, is drawn again anyway; one
+	// cleared or overwritten in this frame shows the clear where a draw is missing.
+	auto&      texture_cache = m_context.GetTextureCache();
+	const auto observe       = [&](const TargetId& target, ImageId image) {
+        auto&       history = m_target_frames[target];
+        const auto& native  = texture_cache.GetImage(image);
+        // CPU writes to the target's memory, and GPU buffer writes to it (fills, copies), are
+        // uploaded when the draw acquires it, after this decision: the upload resets the
+        // target in this frame.
+        if (native.IsCpuDirty() || native.IsBufferModified()) {
+            history.MarkReset(m_frame);
+        }
+        switch (history.Observe(native.ContentGeneration(), m_frame)) {
+            case TargetHistory::Seen::Fresh: effects.writes_fresh_target = true; break;
+            case TargetHistory::Seen::Reset: effects.writes_reset_target = true; break;
+            case TargetHistory::Seen::Drawn: break;
+        }
+	};
+	const bool writes_depth =
+	    state.depth_info.image_id &&
+	    (state.depth_info.depth_write_enable || state.depth_info.stencil_test_enable);
+	for (uint32_t i = 0; i < state.color_count; i++) {
+		observe(TargetKey(state.color_info[i]), state.color_info[i].image_id);
+	}
+	if (writes_depth) {
+		observe(TargetKey(state.depth_info), state.depth_info.image_id);
+	}
+	for (const auto& stage: vertex_stages) {
+		effects.writes_memory = effects.writes_memory || HasShaderMemoryWrites(stage.stage);
+	}
+	if (state.ps_active) {
+		effects.writes_memory =
+		    effects.writes_memory || HasShaderMemoryWrites(state.ps_input_info.stage);
+	}
+	auto* const pipeline_or_none = m_context.GetPipelineCache().GetGraphicsPipeline(
+	    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages, buffer,
+	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
+	    state.programs, effects, m_frame);
+	if (pipeline_or_none == nullptr) {
+		return;
+	}
+	auto& pipeline = *pipeline_or_none;
 
 	if (mesh_active && draw.IsIndexed()) {
 		// Register the original guest indices for shader reads; PrepareGraphicsBindings
@@ -1185,12 +1456,16 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	const auto stages = std::span {descriptor_stages.data(), stage_count};
 	PrepareGraphicsBindings(stages, std::span {state.color_info, state.color_count});
-	PreparedVertexBuffers vertex_bindings;
-	PreparedIndexBuffer   index_binding;
+	PreparedVertexBuffers           vertex_bindings;
+	PreparedIndexBuffer             index_binding;
+	std::pair<vk::Buffer, uint64_t> indirect_args;
 	if (!mesh_active) {
 		LogDrawPhase(draw.Name(), "PrepareVertexBuffers");
 		vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0]);
 		index_binding   = PrepareIndexBuffer(buffer, index_source);
+		if (emit.indirect_args_address != 0) {
+			indirect_args = PrepareIndirectArgs(buffer, draw.IsIndexed(), emit);
+		}
 	}
 	std::pair<Buffer*, uint64_t> args_buffer {};
 	if (emit.indirect.address != 0) {
@@ -1217,23 +1492,89 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// memory.
 	auto vk_buffer = buffer.Handle();
 	SetDrawDebugPhase(buffer, submit_id, draw, draw.IsIndexed() ? 0x100u : 0x200u);
+	std::array<uint32_t, ShaderRecompiler::IR::PushData::MeshEmulatedDrawDwordCount>
+	    mesh_draw_data {};
 	if (!mesh_active) {
 		CommitVertexBuffers(vk_buffer, vertex_bindings);
 	}
 	if (state.ps_active && !draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x300u);
 	}
-	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
+	// An emulated mesh draw: a compute pass writes one record per workgroup
+	// (capturedVertexLayout.h), then the vertex shader draws the records.
+	uint32_t mesh_vertex_count = 0;
+	if (mesh_emulated) {
+		const auto& mesh = state.vertex_info[0].mesh;
+		EXIT_IF(pipeline.mesh_compute == nullptr || mesh.max_primitives == 0);
+		const uint64_t slots        = static_cast<uint64_t>(mesh_groups) * draw.instance_count;
+		const uint64_t record_bytes = uint64_t {pipeline.mesh_slot_words} * sizeof(uint32_t);
+		const auto     planned =
+		    PlanCapturedDraw(record_bytes, uint64_t {mesh.max_primitives} * 3u, slots);
+		if (!planned) {
+			EXIT("emulated mesh draw is too large: %llu groups, %llu bytes\n",
+			     static_cast<unsigned long long>(slots),
+			     static_cast<unsigned long long>(slots * record_bytes));
+		}
+		mesh_vertex_count = planned->vertices;
+		auto& scheduler   = m_context.GetCommandScheduler();
+		auto& records     = AcquireScratch(planned->bytes);
+		const auto address = records.BufferDeviceAddress();
+		mesh_draw_data     = {draw.index_count,
+		                      draw.IsIndexed() ? static_cast<uint32_t>(emit.vertex_offset)
+		                                       : emit.first_vertex,
+		                      emit.first_instance,
+		                      index_source.guest_element_size,
+		                      static_cast<uint32_t>(index_source.address),
+		                      static_cast<uint32_t>(index_source.address >> 32u),
+		                      static_cast<uint32_t>(address),
+		                      static_cast<uint32_t>(address >> 32u),
+		                      mesh_groups};
+		scheduler.EndRendering();
+		const PipelineCache::Pipeline compute_view {
+		    .pipeline_layout       = pipeline.mesh_compute_layout,
+		    .pipeline              = pipeline.mesh_compute,
+		    .descriptor_set_layout = pipeline.descriptor_set_layout,
+		    .uses_push_descriptors = pipeline.uses_push_descriptors};
+		PreparedBindings* mesh_stage = &bindings.vertex[0];
+		CommitBindings(buffer, vk::PipelineBindPoint::eCompute, compute_view,
+		               std::span {&mesh_stage, 1u});
+		vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.mesh_compute);
+		vk_buffer.pushConstants(pipeline.mesh_compute_layout, vk::ShaderStageFlagBits::eCompute, 0,
+		                        sizeof(mesh_draw_data), mesh_draw_data.data());
+		const auto mesh_crumb = GpuBreadcrumbs::Enabled(m_context.GetGraphics())
+		    ? GpuBreadcrumbs::Begin(m_context.GetGraphics(), vk_buffer,
+		                            fmt::format("mesh-capture vs={:016x} submit={} groups={}x{}", state.vertex_info[0].stage.program->shader_hash,
+		                                        submit_id, mesh_groups, draw.instance_count))
+		    : 0u;
+		vk_buffer.dispatch(mesh_groups, draw.instance_count, 1);
+		if (mesh_crumb != 0) GpuBreadcrumbs::End(vk_buffer, mesh_crumb);
+		vk::MemoryBarrier2 barrier {};
+		barrier.srcStageMask  = vk::PipelineStageFlagBits2::eComputeShader;
+		barrier.srcAccessMask = vk::AccessFlagBits2::eShaderStorageWrite;
+		barrier.dstStageMask  = vk::PipelineStageFlagBits2::eVertexShader;
+		barrier.dstAccessMask = vk::AccessFlagBits2::eShaderStorageRead;
+		vk::DependencyInfo dependency {};
+		dependency.memoryBarrierCount = 1;
+		dependency.pMemoryBarriers    = &barrier;
+		vk_buffer.pipelineBarrier2(dependency);
+		// Only the pixel shader's bindings go with the graphics pipeline.
+		const auto graphics_stages = state.ps_active
+		                                 ? std::span {&descriptor_stages[stage_count - 1], 1u}
+		                                 : std::span<PreparedBindings* const> {};
+		CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, graphics_stages);
+		vk_buffer.pushConstants(pipeline.pipeline_layout, pipeline.push_constant_stages, 0,
+		                        sizeof(mesh_draw_data), mesh_draw_data.data());
+	} else {
+		CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
+	}
 	if (!mesh_active) {
 		CommitIndexBuffer(vk_buffer, index_binding);
 	}
 	using ShaderRecompiler::IR::PushData;
-	const auto draw_stages =
-	    vk::ShaderStageFlagBits::eFragment |
-	    (mesh_active ? vk::ShaderStageFlagBits::eMeshEXT : vk::ShaderStageFlagBits::eVertex);
+	// Pushes name the stages of the layout's one range (pipeline.push_constant_stages).
 	const auto draw_dwords =
 	    PushData::GraphicsDrawDwords(mesh_active, state.ps_input_info.object_primitive_id);
-	if (draw_dwords != 0) {
+	if (!mesh_emulated && draw_dwords != 0) {
 		std::array<uint32_t, PushData::MeshDrawDwordCount> draw_data {};
 		if (mesh_active) {
 			draw_data = {draw.index_count,
@@ -1245,14 +1586,28 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		} else {
 			draw_data[0] = buffer.GetUserConfig().GetObjectId();
 		}
-		vk_buffer.pushConstants(pipeline.pipeline_layout, draw_stages, 0,
+		vk_buffer.pushConstants(pipeline.pipeline_layout, pipeline.push_constant_stages, 0,
 		                        draw_dwords * sizeof(uint32_t), draw_data.data());
 	}
 	if (const auto planes = vertex_stages.back().user_clip_planes; planes != 0) {
-		vk_buffer.pushConstants(pipeline.pipeline_layout, draw_stages,
-		                        PushData::UserClipPlaneDword * sizeof(uint32_t),
-		                        std::bit_width(planes) * 4u * sizeof(uint32_t),
-		                        buffer.GetRegisters().GetUserClipPlanes().data());
+		// An emulated mesh draw keeps its record address where the planes start
+		// (MeshEmulationAddressDword == UserClipPlaneDword); its program gets no planes.
+		if (mesh_emulated) {
+			static std::atomic_bool logged = false;
+			if (!logged.exchange(true, std::memory_order_relaxed)) {
+				std::printf("user clip planes are not supported in emulated mesh draws\n");
+			}
+		} else {
+			vk_buffer.pushConstants(pipeline.pipeline_layout, pipeline.push_constant_stages,
+			                        PushData::UserClipPlaneDword * sizeof(uint32_t),
+			                        std::bit_width(planes) * 4u * sizeof(uint32_t),
+			                        buffer.GetRegisters().GetUserClipPlanes().data());
+		}
+	}
+
+	if (state.depth_info.depth_bounds_test_enable &&
+	    !m_context.GetGraphics().host.capabilities.depth_bounds) {
+		ApplyDepthBoundsByShader(buffer, state, pipeline);
 	}
 
 	auto& dynamic_state = m_context.GetCommandScheduler().GetDynamicState();
@@ -1264,7 +1619,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	vk::PipelineStageFlags shader_write_stages = {};
 	for (const auto& stage: vertex_stages) {
 		if (HasShaderBufferWrites(stage.stage)) {
-			shader_write_stages |= ShaderPipelineStages(NativeShaderStage(stage.logical_stage));
+			shader_write_stages |= ShaderPipelineStages(NativeShaderStage(*stage.stage.program));
 		}
 	}
 	if (state.ps_active && HasShaderBufferWrites(state.ps_input_info.stage)) {
@@ -1280,11 +1635,25 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x400u);
 	}
 	m_context.GetCommandScheduler().BeginRendering(rendering);
+	InsertDebugLabel(vk_buffer, "{} submit={} indices={} instances={}", draw.Name(), submit_id,
+	                 draw.index_count, draw.instance_count);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
 	}
-	if (mesh_active) {
+	const bool profile = CommandScheduler::GpuProfileEnabled();
+	if (profile) m_context.GetCommandScheduler().GpuProfileBegin();
+	const auto crumb = GpuBreadcrumbs::Enabled(m_context.GetGraphics())
+	    ? GpuBreadcrumbs::Begin(m_context.GetGraphics(), vk_buffer,
+	                            fmt::format("{} vs={:016x} ps={:016x} submit={} indices={} instances={} indirect={:x}", draw.Name(),
+	                                        state.vertex_info[0].stage.program->shader_hash,
+	                                        state.ps_active ? state.ps_input_info.stage.program->shader_hash : 0ull, submit_id,
+	                                        draw.index_count, draw.instance_count, emit.indirect_args_address),
+	                            emit.indirect_args_address)
+	    : 0u;
+	if (mesh_emulated) {
+		vk_buffer.draw(mesh_vertex_count, 1, 0, 0);
+	} else if (mesh_active) {
 		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
 	} else if (args_buffer.first == nullptr) {
 		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
@@ -1305,6 +1674,21 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		m_context.GetCommandScheduler().EndRendering();
 		ShaderWriteBarrier(vk_buffer, shader_write_stages);
 	}
+	if (state.depth_info.image_id &&
+	    (state.depth_info.depth_write_enable || state.depth_info.stencil_test_enable ||
+	     state.depth_info.stencil_clear_enable || static_cast<bool>(state.depth_info.load_clear_aspects))) {
+		m_context.GetTextureCache().GetImage(state.depth_info.image_id).NoteContentWrite();
+	}
+	// The targets hold this draw's picture now (see TargetHistory).
+	for (uint32_t i = 0; i < state.color_count; i++) {
+		m_target_frames[TargetKey(state.color_info[i])].Drawn(
+		    m_frame, texture_cache.GetImage(state.color_info[i].image_id).ContentGeneration());
+	}
+	if (writes_depth) {
+		m_target_frames[TargetKey(state.depth_info)].Drawn(
+		    m_frame, texture_cache.GetImage(state.depth_info.image_id).ContentGeneration());
+	}
+	m_context.GetCommandScheduler().NoteWork();
 	LogDrawPhase(draw.Name(), "DrawComplete");
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x700u);
@@ -1349,7 +1733,23 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	                    reinterpret_cast<uint64_t>(args.index_addr));
 
 	Common::LockGuard lock(m_context.GetMutex());
-	if (args.index_count == 0 || (args.instance_count == 0 && args.indirect.address == 0)) {
+	const bool        host_args = args.indirect_args_address != 0;
+	EXIT_IF(host_args && args.offset_source != DrawOffsetSource::IndirectArgs);
+	// An ordinary draw records nothing before its program lookups, so they can run on the front
+	// worker while the draw before it is recorded. Any other draw records in order.
+	const bool pipelined = FrontWorkerEnabled() && !host_args &&
+	                       static_cast<Prospero::IndexType>(args.index_type_and_size) !=
+	                           Prospero::IndexType::kIndex8 &&
+	                       OrdinaryDrawMode(buffer.GetRegisters());
+	if (!pipelined) {
+		FlushPendingWork();
+	}
+	if (host_args &&
+	    (!HostReadsIndirectArgs(buffer) || args.index_count == 0 ||
+	     static_cast<Prospero::IndexType>(args.index_type_and_size) == Prospero::IndexType::kIndex8)) {
+		return false;
+	}
+	if (args.index_count == 0 || (!host_args && args.instance_count == 0)) {
 		return true;
 	}
 
@@ -1422,13 +1822,43 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndex, args.index_count,
-	                        args.instance_count, args.first_instance};
+	                        host_args ? 1u : args.instance_count, args.first_instance};
+	if (pipelined) {
+		PipelineDrawIndex(submit_id, buffer, args, draw, topology, index_source, primitive_restart);
+		return true;
+	}
 	DrawRenderState state {};
-	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
+	const auto color_output_mask =
+	    PrepareDrawShaderState(buffer.GetRegisters(), buffer.GetShaders(), state);
+	state.resources = &m_draw_resources;
+	RefreshShaders(buffer.GetRegisters(), buffer.GetShaders(), buffer.GetUserConfig(),
+	               m_context.GetPipelineCache(), draw, color_output_mask, state);
+	if (host_args) {
+		if (!PrepareDrawTargets(buffer, draw, args.render_target_slice_offset, state)) {
+			ResetBindings();
+			return true;
+		}
+		if (!HostReadsIndirectArgs(state)) {
+			ResetBindings();
+			return false;
+		}
+	}
+	FinishDrawIndex(submit_id, buffer, args, draw, topology, index_source, primitive_restart,
+	                state, !host_args);
+	return true;
+}
+
+void RenderExecutor::FinishDrawIndex(uint64_t submit_id, CommandBuffer& buffer,
+                                     const DrawIndexArgs& args, const DrawCallInfo& draw,
+                                     vk::PrimitiveTopology        topology,
+                                     const DrawIndexBufferSource& index_source,
+                                     bool primitive_restart, DrawRenderState& state,
+                                     bool prepare_targets) {
+	if (prepare_targets && !PrepareDrawTargets(buffer, draw, args.render_target_slice_offset, state)) {
 		ResetBindings();
 		return true;
 	}
-
+	auto& ucfg = buffer.GetUserConfig();
 	LogDrawStateIfNeeded(buffer, draw, state, args.index_type_and_size,
 	                     args.index_addr);
 	const auto emit = ResolveDrawEmit(ucfg, state.vertex_info[0], args.offset_source,
@@ -1439,6 +1869,333 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	ResetBindings();
 	return emit.has_value();
+}
+
+// ---- Draws and dispatches whose program lookups run on the front worker (frontWorker.h).
+
+// A draw or dispatch waiting to be recorded: what DrawIndex or DispatchDirect knew of it, with a
+// copy of its registers.
+struct PendingWork {
+	bool                          dispatch  = false;
+	uint64_t                      submit_id = 0;
+	HW::Context                   registers;
+	HW::UserConfig                user_config;
+	HW::Shader                    shaders;
+	// A draw.
+	DrawIndexArgs                 args {};
+	DrawCallInfo                  draw {};
+	vk::PrimitiveTopology         topology = vk::PrimitiveTopology::ePointList;
+	DrawIndexBufferSource         index_source {};
+	bool                          primitive_restart = false;
+	uint32_t                      color_output_mask = 0;
+	DrawRenderState               state;
+	PipelineCache::StageResources resources;
+	// A dispatch: its groups, its input before the lookups and after them.
+	std::array<uint32_t, 3>                dispatch_groups {};
+	uint32_t                               dispatch_mode = 0;
+	ShaderComputeInputInfo                 dispatch_input;
+	ShaderComputeInputInfo                 compute_info;
+	ShaderProgram                          compute_program;
+	ShaderRecompiler::IR::ResourceSnapshot compute_resources;
+	// BufferCache::GpuModifiedVersion when the lookups were queued: a GPU write recorded since
+	// may be in what they read.
+	uint64_t gpu_modified_version = 0;
+	uint64_t ticket               = 0;
+};
+
+// KYTY_FRONT_DEPTH: how many draws or dispatches wait to be recorded while the front worker runs
+// the lookups of the ones after them. One lets a long lookup stall the GPU thread; more smooth
+// the lookups' lengths out (FC25: 39 FPS with 1, 42-43 with 3 or 4).
+static uint32_t FrontDepth() {
+	static const uint32_t depth = [] {
+		const char* value = std::getenv("KYTY_FRONT_DEPTH");
+		const auto  parsed = value != nullptr ? std::strtoul(value, nullptr, 10) : 3ul;
+		return static_cast<uint32_t>(std::clamp<unsigned long>(parsed, 1ul, FrontWorker::Capacity - 2));
+	}();
+	return depth;
+}
+
+struct FrontPipeline {
+	FrontWorker worker;
+	// The work queued and not recorded yet, from `first` to `next`: a ring.
+	std::array<PendingWork, FrontWorker::Capacity> work;
+	uint64_t                                       first = 0;
+	uint64_t                                       next  = 0;
+	// Settling or recording the oldest work: the worker may run the GPU thread's commands
+	// (FrontWorker::Wait), which must not record the work after it first.
+	bool busy = false;
+};
+
+void FrontPipelineDeleter::operator()(FrontPipeline* pipeline) const {
+	delete pipeline;
+}
+
+static void RunLookups(PendingWork& work, PipelineCache& pipeline_cache) {
+	if (work.dispatch) {
+		work.compute_info    = work.dispatch_input;
+		work.compute_program = pipeline_cache.GetComputeProgram(
+		    work.shaders.GetCs(), work.registers.GetShaderRegisters(), work.compute_info, 0,
+		    &work.compute_resources);
+		return;
+	}
+	RefreshShaders(work.registers, work.shaders, work.user_config, pipeline_cache, work.draw,
+	               work.color_output_mask, work.state);
+}
+
+PendingWork& RenderExecutor::NextPendingWork(CommandBuffer& buffer, uint64_t submit_id) {
+	if (!m_front_pipeline) {
+		m_front_pipeline.reset(new FrontPipeline);
+	}
+	auto& pipeline = *m_front_pipeline;
+	EXIT_IF(pipeline.busy || pipeline.next - pipeline.first >= pipeline.work.size());
+	auto& next = pipeline.work[pipeline.next % pipeline.work.size()];
+	next.submit_id   = submit_id;
+	next.registers   = buffer.GetRegisters();
+	next.user_config = buffer.GetUserConfig();
+	next.shaders     = buffer.GetShaders();
+	return next;
+}
+
+void RenderExecutor::QueuePendingWork(CommandBuffer& buffer, PendingWork& next) {
+	auto& pipeline       = *m_front_pipeline;
+	auto& pipeline_cache = m_context.GetPipelineCache();
+	// The GPU thread changes the program cache only while the worker is idle: what the workers
+	// built waits for then, and a lookup that needs it meanwhile is redone here.
+	if (pipeline.worker.Idle()) {
+		pipeline_cache.PrepareFrontLookups();
+	}
+	next.gpu_modified_version = m_context.GetBufferCache().GpuModifiedVersion();
+	next.ticket = pipeline.worker.Start([&next, &pipeline_cache] { RunLookups(next, pipeline_cache); });
+	pipeline.next++;
+	while (pipeline.next - pipeline.first > FrontDepth()) {
+		RecordOldestPendingWork(buffer);
+	}
+}
+
+void RenderExecutor::RecordOldestPendingWork(CommandBuffer& buffer) {
+	auto& pipeline = *m_front_pipeline;
+	auto& oldest   = pipeline.work[pipeline.first % pipeline.work.size()];
+	pipeline.busy  = true;
+	SettlePendingLookups(oldest);
+	RecordPendingWork(oldest, buffer);
+	pipeline.first++;
+	pipeline.busy = false;
+}
+
+void RenderExecutor::PipelineDrawIndex(uint64_t submit_id, CommandBuffer& buffer,
+                                       const DrawIndexArgs& args, const DrawCallInfo& draw,
+                                       vk::PrimitiveTopology        topology,
+                                       const DrawIndexBufferSource& index_source,
+                                       bool                         primitive_restart) {
+	auto& next             = NextPendingWork(buffer, submit_id);
+	next.dispatch          = false;
+	next.args              = args;
+	next.draw              = draw;
+	next.topology          = topology;
+	next.index_source      = index_source;
+	next.primitive_restart = primitive_restart;
+	next.state             = {};
+	next.state.resources   = &next.resources;
+	next.color_output_mask = PrepareDrawShaderState(next.registers, next.shaders, next.state);
+	QueuePendingWork(buffer, next);
+}
+
+void RenderExecutor::PipelineDispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
+                                            const std::array<uint32_t, 3>& groups, uint32_t mode,
+                                            const ShaderComputeInputInfo& input_info) {
+	auto& next           = NextPendingWork(buffer, submit_id);
+	next.dispatch        = true;
+	next.dispatch_groups = groups;
+	next.dispatch_mode   = mode;
+	next.dispatch_input  = input_info;
+	QueuePendingWork(buffer, next);
+}
+
+void RenderExecutor::SettlePendingLookups(PendingWork& pending) {
+	auto&      pipeline = *m_front_pipeline;
+	const auto service  = [this] { m_context.GetGpu().ServiceCommands(); };
+	const bool aborted  = pipeline.worker.Wait(pending.ticket, service);
+	if (!aborted) {
+		// What the GPU wrote since the lookups were queued, where they read.
+		auto& buffer_cache = m_context.GetBufferCache();
+		if (buffer_cache.GpuModifiedVersion() == pending.gpu_modified_version ||
+		    std::ranges::none_of(pipeline.worker.Reads(pending.ticket), [&](const FrontRead& read) {
+			    return buffer_cache.HasGpuDirtyBytes(read.vaddr, read.size);
+		    })) {
+			return;
+		}
+	}
+	// What the worker read has changed, or it stopped: the lookups again, here, once the worker
+	// is idle (they may change the program cache).
+	pipeline.worker.WaitIdle(service);
+	if (!pending.dispatch) {
+		pending.state             = {};
+		pending.state.resources   = &pending.resources;
+		pending.color_output_mask =
+		    PrepareDrawShaderState(pending.registers, pending.shaders, pending.state);
+	}
+	RunLookups(pending, m_context.GetPipelineCache());
+}
+
+void RenderExecutor::RecordPendingWork(PendingWork& pending, CommandBuffer& buffer) {
+	auto& registers   = buffer.GetRegisters();
+	auto& user_config = buffer.GetUserConfig();
+	auto& shaders     = buffer.GetShaders();
+	buffer.Bind(pending.registers, pending.user_config, pending.shaders);
+	if (pending.dispatch) {
+		const auto& groups = pending.dispatch_groups;
+		buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DispatchDirect),
+		                    pending.submit_id, groups[0], groups[1], groups[2],
+		                    pending.dispatch_mode, pending.shaders.GetCs().cs_regs.data_addr);
+		if (pending.compute_program) {
+			FinishDispatchDirect(pending.submit_id, buffer, groups, pending.dispatch_mode,
+			                     pending.compute_info, pending.compute_program);
+		}
+	} else {
+		buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DrawIndex),
+		                    pending.submit_id, pending.args.index_count, 0, 1,
+		                    pending.args.instance_count,
+		                    reinterpret_cast<uint64_t>(pending.args.index_addr));
+		FinishDrawIndex(pending.submit_id, buffer, pending.args, pending.draw, pending.topology,
+		                pending.index_source, pending.primitive_restart, pending.state, true);
+	}
+	buffer.Bind(registers, user_config, shaders);
+}
+
+void RenderExecutor::FlushPendingWork() {
+	if (!m_front_pipeline || m_front_pipeline->busy ||
+	    m_front_pipeline->first == m_front_pipeline->next) {
+		return;
+	}
+	Common::LockGuard lock(m_context.GetMutex());
+	while (m_front_pipeline->first != m_front_pipeline->next) {
+		RecordOldestPendingWork(m_context.GetCommandScheduler().Current());
+	}
+}
+
+bool RenderExecutor::HostReadsIndirectArgs(const CommandBuffer& buffer) {
+	const auto& hw = buffer.GetRegisters();
+	if (buffer.GetUserConfig().GetPrimType() == Prospero::PrimitiveType::kQuadListLegacy ||
+	    hw.GetRenderControl().copy_depth_to_color) {
+		return false;
+	}
+	switch (static_cast<CbColorMode>(hw.GetColorControl().mode)) {
+		case CbColorMode::Normal: return true;
+		case CbColorMode::Disable: {
+			// DepthStencilCopy: an override that marks the target dirty and valid.
+			const auto& override = hw.GetDepthRenderOverride();
+			return !override.force_z_dirty && !override.force_stencil_dirty;
+		}
+		default: return false;
+	}
+}
+
+bool RenderExecutor::HostReadsIndirectArgs(const DrawRenderState& state) const {
+	const auto& vertex = state.vertex_info[0];
+	if (vertex.stage.program->stage == ShaderType::Mesh) {
+		return false;
+	}
+	return !vertex.fetch_embedded ||
+	       m_context.GetGraphics().host.capabilities.draw_indirect_first_instance;
+}
+
+std::pair<vk::Buffer, uint64_t> RenderExecutor::PrepareIndirectArgs(CommandBuffer&      buffer,
+                                                                    bool                indexed,
+                                                                    const DrawEmitInfo& emit) {
+	static_assert(sizeof(vk::DrawIndexedIndirectCommand) == 5 * sizeof(uint32_t) &&
+	              sizeof(vk::DrawIndirectCommand) == 4 * sizeof(uint32_t));
+	const uint64_t size = indexed ? sizeof(vk::DrawIndexedIndirectCommand)
+	                              : sizeof(vk::DrawIndirectCommand);
+	const auto [source, source_offset] =
+	    m_context.GetBufferCache().ObtainBuffer(emit.indirect_args_address, size, false);
+	EXIT_IF(source == nullptr);
+	auto& copy = AcquireScratch(size);
+	buffer.EndRendering();
+	const auto vk_buffer = buffer.Handle();
+	// After the GPU's writes of the arguments, and after earlier draws read the copy.
+	vk::MemoryBarrier before {};
+	before.srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite;
+	before.dstAccessMask = vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite;
+	vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                          vk::PipelineStageFlagBits::eTransfer, {}, 1, &before, 0, nullptr, 0,
+	                          nullptr);
+	const vk::BufferCopy region {source_offset, 0, size};
+	vk_buffer.copyBuffer(source->Handle(), copy.Handle(), 1, &region);
+	if (!emit.indirect_offsets) {
+		// The last two dwords of both layouts: the vertex offset (or first vertex) and the
+		// first instance.
+		vk::MemoryBarrier copied {};
+		copied.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+		copied.dstAccessMask = vk::AccessFlagBits::eTransferWrite;
+		vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+		                          vk::PipelineStageFlagBits::eTransfer, {}, 1, &copied, 0, nullptr,
+		                          0, nullptr);
+		vk_buffer.fillBuffer(copy.Handle(), size - 2 * sizeof(uint32_t), 2 * sizeof(uint32_t), 0);
+	}
+	vk::MemoryBarrier after {};
+	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead;
+	vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                          vk::PipelineStageFlagBits::eDrawIndirect, {}, 1, &after, 0, nullptr, 0,
+	                          nullptr);
+	return {copy.Handle(), 0};
+}
+
+Buffer& RenderExecutor::AcquireScratch(uint64_t bytes) {
+	EXIT_IF(bytes == 0);
+	auto& scheduler = m_context.GetCommandScheduler();
+	auto& master    = scheduler.GetMasterSemaphore();
+	master.Refresh();
+	ScratchBuffer* chosen = nullptr;
+	for (auto& scratch: m_scratch) {
+		if (scratch.buffer->Size() < bytes || !master.IsFree(scratch.tick)) {
+			continue;
+		}
+		if (chosen == nullptr || scratch.buffer->Size() < chosen->buffer->Size()) {
+			chosen = &scratch;
+		}
+	}
+	size_t chosen_index = 0;
+	if (chosen == nullptr) {
+		// Sizes are rounded up, so a few buffers serve many draws.
+		const auto size = std::max<uint64_t>(std::bit_ceil(bytes), 64u * 1024u);
+		m_scratch.push_back({std::make_unique<Buffer>(
+		                         m_context.GetGraphics(), scheduler, MemoryUsage::DeviceLocal, 0,
+		                         vk::BufferUsageFlagBits::eStorageBuffer |
+		                             vk::BufferUsageFlagBits::eTransferSrc |
+		                             vk::BufferUsageFlagBits::eTransferDst |
+		                             vk::BufferUsageFlagBits::eIndirectBuffer |
+		                             vk::BufferUsageFlagBits::eShaderDeviceAddress,
+		                         size),
+		                     0});
+		m_scratch_bytes += size;
+		chosen_index = m_scratch.size() - 1;
+	} else {
+		chosen_index = static_cast<size_t>(chosen - m_scratch.data());
+	}
+	// Busy until the open submission has run.
+	m_scratch[chosen_index].tick = scheduler.CurrentTick();
+	// Past the budget, the buffers no draw has used for a while go; the busy and the recently
+	// used ones stay: a frame that needs more than the budget at once (75 depth snapshots of
+	// 8 MiB) would otherwise create and destroy them again every frame, and a wait for a busy
+	// one would stall every draw of that frame.
+	constexpr uint64_t ScratchBudget    = 256u * 1024u * 1024u;
+	constexpr uint64_t ScratchIdleTicks = 64;
+	const auto         current          = scheduler.CurrentTick();
+	for (size_t i = 0; i < m_scratch.size() && m_scratch_bytes > ScratchBudget;) {
+		if (i != chosen_index && m_scratch[i].tick + ScratchIdleTicks < current &&
+		    master.IsFree(m_scratch[i].tick)) {
+			m_scratch_bytes -= m_scratch[i].buffer->Size();
+			scheduler.DeferOperation([old = std::move(m_scratch[i].buffer)]() mutable { old.reset(); });
+			m_scratch.erase(m_scratch.begin() + static_cast<std::ptrdiff_t>(i));
+			if (i < chosen_index) {
+				chosen_index--;
+			}
+		} else {
+			i++;
+		}
+	}
+	return *m_scratch[chosen_index].buffer;
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
@@ -1488,8 +2245,8 @@ bool RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 
 	hw_check(buffer);
 
-	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndexAuto,
-	                         args.vertex_count, args.instance_count, args.first_instance};
+	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndexAuto, args.vertex_count,
+	                         host_args ? 1u : args.instance_count, args.first_instance};
 
 	vk::PrimitiveTopology topology = vk::PrimitiveTopology::ePointList;
 	if (!GetDrawTopology(ucfg, topology)) {
@@ -1500,6 +2257,10 @@ bool RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
 		ResetBindings();
 		return true;
+	}
+	if (host_args && !HostReadsIndirectArgs(state)) {
+		ResetBindings();
+		return false;
 	}
 
 	const bool rect_list = Prospero::IsRectList(ucfg.GetPrimType());

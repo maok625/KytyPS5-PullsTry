@@ -3,8 +3,11 @@
 
 #include "common/common.h"
 #include "common/stringUtils.h"
+#include "graphics/shader/capturedVertexLayout.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "graphics/shader/shader.h"
 
+#include <optional>
 #include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv {
@@ -22,6 +25,23 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
                                   uint32_t       push_data_start_dword = 0,
                                   const Profile& profile               = DefaultProfile,
                                   bool           emit_debug_info       = false);
+
+// The record of a mesh program's outputs on a host without mesh shaders: the program runs as a
+// compute shader (EmitProgram with an emulated mesh program), which stores one record per
+// workgroup.
+[[nodiscard]] CapturedVertexLayout MeshCaptureLayout(const IR::Program&         program,
+                                                     const ShaderMeshInputInfo& mesh);
+
+// The vertex shader that draws what the compute shader stored: one triangle per primitive of
+// every record. A primitive that is absent, that the program culled, or that a cull distance
+// rejects gets one position for its three corners, so it covers no sample. The pixel shader is
+// unchanged.
+struct MeshEmulationVertexProgram {
+	std::vector<uint32_t> spirv;
+	uint32_t              slot_words = 0;
+};
+[[nodiscard]] MeshEmulationVertexProgram
+EmitMeshEmulationVertexProgram(const IR::Program& program, ShaderStageInputInfo input_info);
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv
 

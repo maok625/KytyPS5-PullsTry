@@ -12,6 +12,7 @@
 #include "graphics/shader/recompiler/ir/opcodes/ValueOpcodes.h"
 #include "graphics/shader/shader.h"
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <deque>
@@ -215,9 +216,13 @@ struct SamplerResource {
 };
 
 struct SampledResourcePair {
-	uint32_t image        = 0;
-	uint32_t sampler      = 0;
-	uint32_t first_use_pc = 0;
+	uint32_t image            = 0;
+	uint32_t sampler          = 0;
+	uint32_t first_use_pc     = 0;
+	// The entry of the sampler binding that holds the sampler for this texture alone, or
+	// UINT32_MAX. Set on a host where a sampler applies the minimum LOD of the texture it reads,
+	// because the texture view cannot (see DefineDescriptors).
+	uint32_t descriptor_index = UINT32_MAX;
 
 	bool operator==(const SampledResourcePair& other) const = default;
 };
@@ -369,6 +374,14 @@ static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 58u);
 struct PushData {
 	static constexpr uint32_t DwordCount = 32;
 	static constexpr uint32_t MeshDrawDwordCount = 6;
+	// An emulated mesh draw adds the 64-bit address of the record buffer and the workgroup count of
+	// the draw's first dimension.
+	static constexpr uint32_t MeshEmulationAddressDword  = MeshDrawDwordCount;
+	static constexpr uint32_t MeshEmulationGroupsDword   = MeshDrawDwordCount + 2;
+	static constexpr uint32_t MeshEmulatedDrawDwordCount = MeshDrawDwordCount + 3;
+	// Depth bounds test of a pixel shader: depth buffer copy address (two dwords), row width in
+	// pixels, minimum and maximum bound as float bits.
+	static constexpr uint32_t        DepthBoundsDwordCount = 5;
 	static constexpr uint32_t NoStart    = UINT32_MAX;
 	std::array<uint32_t, DwordCount> dwords {};
 
@@ -498,9 +511,17 @@ struct Bindings {
 	uint32_t dispatch_thread_dword = PushData::NoStart;
 	uint32_t memory_offset_dword = 0;
 
-	[[nodiscard]] uint32_t ShaderDataDwords() const {
+	// After the byte offsets of the storage buffers (8 bits each), the bytes that the last dword
+	// of each binding's range pads (2 bits each). A driver may round a storage buffer's range up
+	// to whole dwords; with the pad the shader knows the exact end, which matters where a buffer
+	// is guest memory itself and a store past the end would reach other guest data.
+	[[nodiscard]] uint32_t MemoryPadDword() const {
 		return memory_offset_dword +
 		       (descriptor_counts[static_cast<size_t>(DescriptorBindingKind::Buffers)] + 3u) / 4u;
+	}
+	[[nodiscard]] uint32_t ShaderDataDwords() const {
+		return MemoryPadDword() +
+		       (descriptor_counts[static_cast<size_t>(DescriptorBindingKind::Buffers)] + 15u) / 16u;
 	}
 	[[nodiscard]] bool UsesPushData() const {
 		return push_data_start_dword != PushData::NoStart;
@@ -555,6 +576,12 @@ struct ShaderInfo {
 	bool                            shared_int64_atomics          = false;
 	bool                            coherent_buffers              = false;
 	bool                            float64                       = false;
+	// The shader has packed FP16 arithmetic (PackedFPAdd16 and its kind).
+	bool                            packed_float16                = false;
+	// The shader moves an append or consume counter.
+	bool                            append_consume                = false;
+	// The shader reads the barycentrics as values.
+	bool                            barycentric                   = false;
 
 	bool operator==(const ShaderInfo& other) const = default;
 };
@@ -643,6 +670,8 @@ struct CompiledShaderInfo {
 	uint32_t                      scratch_dwords      = 0;
 	uint32_t                      param_export_mask   = 0;
 	bool                          has_address_writes  = false;
+	// A mesh program compiled as a compute shader (see capturedVertexLayout.h).
+	bool                          mesh_emulated = false;
 	ShaderInfo                    info;
 	Bindings                      bindings;
 };
@@ -653,6 +682,10 @@ struct UniformFillPlan {
 	Value                pattern_size;
 	Value                element_count;
 };
+
+class SrtTape;
+class SrtNodes;
+class SrtTrace;
 
 // Resource analysis retained by the shader cache. It owns immutable descriptor/SRT,
 // condition and fill values without translated blocks, plus reusable evaluation scratch.
@@ -669,11 +702,94 @@ struct ResourcePlan {
 			uint64_t generation = 0;
 		};
 
+		// A context under an EXEC mask evaluates a few values of the plan: it keeps them in a
+		// small open-addressed table (`slots`), not a dense entry per value (`values`). An entry
+		// of an older generation is free; a reset one keeps its slot (generation | 3).
+		struct Slot {
+			uint32_t key = UINT32_MAX;
+			Entry    entry;
+		};
+
+		Entry& Memo(uint32_t index, uint32_t count) {
+			if (!sparse && index < values.size()) return values[index];
+			return MemoSlow(index, count);
+		}
+
+		Entry& MemoSlow(uint32_t index, uint32_t count) {
+			if (!sparse) {
+				values.resize(std::max<size_t>(count, index + 1u));
+				return values[index];
+			}
+			if (slot_generation != generation) {
+				slot_generation = generation;
+				slots_used      = 0;
+			}
+			if (slots.empty() || 2u * (slots_used + 1u) > slots.size()) GrowSlots();
+			const auto mask = static_cast<uint32_t>(slots.size() - 1u);
+			for (auto at = (index * 0x9e3779b1u) >> 7u;; ++at) {
+				auto& slot = slots[at & mask];
+				const bool free = (slot.entry.generation & ~uint64_t {3}) != generation;
+				if (slot.key == index) {
+					// The caller marks the entry at once, so it is counted as taken.
+					if (free) slots_used++;
+					return slot.entry;
+				}
+				if (free || slot.key == UINT32_MAX) {
+					slot.key   = index;
+					slot.entry = {};
+					slots_used++;
+					return slot.entry;
+				}
+			}
+		}
+
+		void GrowSlots() {
+			auto old = std::move(slots);
+			slots.assign(old.empty() ? 64u : old.size() * 2u, Slot {});
+			slots_used = 0;
+			const auto mask = static_cast<uint32_t>(slots.size() - 1u);
+			for (const auto& slot: old) {
+				if (slot.key == UINT32_MAX || (slot.entry.generation & ~uint64_t {3}) != generation)
+					continue;
+				for (auto at = (slot.key * 0x9e3779b1u) >> 7u;; ++at) {
+					auto& free = slots[at & mask];
+					if (free.key == UINT32_MAX) {
+						free = slot;
+						slots_used++;
+						break;
+					}
+				}
+			}
+		}
+
 		std::vector<Entry> values;
+		std::vector<Slot>  slots;
+		uint32_t           slots_used      = 0;
+		uint64_t           slot_generation = 0;
+		bool               sparse          = false;
+		// The entries marked unknown in this generation (SrtWalker::ResetUnknowns).
+		std::vector<uint32_t> unknowns;
 		uint64_t           generation = 0;
 		const SrtWalker*    session = nullptr;
 		Value              active_mask;
 		uint8_t            read_policy = 0;
+		// The next context of the same key, and of the same session (SrtWalker::AcquireContext).
+		uint32_t next_of_key     = UINT32_MAX;
+		uint32_t next_of_session = UINT32_MAX;
+	};
+
+	struct EvaluationKey {
+		Value   active_mask;
+		uint8_t read_policy = 0;
+
+		bool operator==(const EvaluationKey& other) const = default;
+	};
+
+	struct EvaluationKeyHash {
+		size_t operator()(const EvaluationKey& key) const {
+			return (reinterpret_cast<uintptr_t>(key.active_mask.TryInstruction()) >> 4u) * 4u +
+			       key.read_policy;
+		}
 	};
 
 	ResourcePlan();
@@ -702,9 +818,23 @@ struct ResourcePlan {
 	bool                                resource_tracking_complete = false;
 	ShaderInfo                          info;
 	UniformFillPlan                     uniform_fill;
+	// Null when MaterializeResources must walk the values (SrtWalker.h).
+	std::shared_ptr<const SrtTape>      srt_tape;
+	// Null when the walker walks the values themselves (SrtWalker.h).
+	std::shared_ptr<const SrtNodes>     srt_nodes;
 	std::unique_ptr<Xbyak::CodeGenerator> srt_code;
+	// The last walk over the nodes, which the next walk replays (SrtTrace, SrtWalker.h); null
+	// before the first walk and while the plan's path changes from walk to walk.
+	mutable std::shared_ptr<SrtTrace>     srt_trace;
+	mutable uint32_t                      srt_trace_failures = 0;
+	mutable uint32_t                      srt_trace_pause    = 0;
 	// GPU-thread scratch for nested clean/EXEC memos, activity and material keys.
 	mutable std::deque<EvaluationContext> evaluation_contexts;
+	// The first context of each key; a key has one context per session that uses it.
+	mutable std::unordered_map<EvaluationKey, uint32_t, EvaluationKeyHash> evaluation_keys;
+	// The same heads by node reference and read policy, for walkers over SrtNodes: entry
+	// ref * 4 + policy, the root mask at ref evaluation_value_count (SrtWalker::AcquireContext).
+	mutable std::vector<uint32_t>          evaluation_ref_keys;
 	mutable uint32_t                       evaluation_value_count = 0;
 	mutable std::vector<uint8_t>            active_sources;
 	mutable std::vector<uint8_t>            visited_blocks;
@@ -729,6 +859,8 @@ struct Program: ResourcePlan {
 	uint32_t                      wave_size      = 64;
 	uint32_t                      scratch_dwords = 0;
 	bool                          dispatcher_fallback = false;
+	// The shader has a DS_ORDERED_COUNT: it adds once per wave, so it needs real waves.
+	bool                          uses_ordered_count  = false;
 	CFG::FailureKind              cfg_failure_kind    = CFG::FailureKind::None;
 	std::string                   fallback_reason;
 	struct ScalarWrite { uint32_t pc; ScalarReg reg; Value value; };
@@ -736,6 +868,7 @@ struct Program: ResourcePlan {
 	// Typed memory and export instructions reference shader-local metadata by dense index.
 	// Decoder-only details (such as NSA register numbers) have already become IR operands.
 	std::vector<ExportInfo>       export_info;
+	bool                          mesh_emulated        = false;
 	bool                          has_address_writes = false;
 	bool                          shader_info_complete = false;
 	Bindings                      bindings;
