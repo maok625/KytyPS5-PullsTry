@@ -47,7 +47,12 @@ static RenderContext* g_renderer = nullptr;
 
 namespace Gen5Driver {
 
+#if defined(__APPLE__) && (defined(__x86_64__) || defined(_M_X64))
+// The macOS guest address space ends its system-reserved range at 0x0fbfffffff.
+static constexpr uint64_t DriverDmemBase = 0x0fa0000000ull;
+#else
 static constexpr uint64_t DriverDmemBase = 0x0fe0000000ull;
+#endif
 static constexpr uint32_t DriverDmemSize = 0x200000;
 static constexpr uint32_t AgcDmemOffset  = 0x40000;
 
