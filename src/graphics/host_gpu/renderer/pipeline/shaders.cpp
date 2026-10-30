@@ -5,6 +5,7 @@
 #include "common/profiler.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/hostLowering.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
@@ -13,131 +14,24 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
-#include "graphics/shader/recompiler/BufferFormat.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/rectListShader.h"
 #include "graphics/shader/shader.h"
+#include "graphics/shader/triangleVertexValueShader.h"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <span>
 #include <vector>
 
 namespace Libs::Graphics {
-
-// IDK: maybe we can remove it?
-constexpr uint8_t kTemporaryVertexAttribFormat113 =
-    static_cast<uint8_t>(Prospero::VertexAttribFormat::k16_16SInt);
-constexpr uint32_t kTemporaryPs5BufferFormat121 = 121u;
-
-static bool NarrowInputFormat(vk::Format& format, uint32_t& size, uint32_t used_components) {
-	if (used_components == 0 || used_components >= size) {
-		return false;
-	}
-
-	switch (format) {
-		case vk::Format::eR32G32B32A32Sfloat:
-			switch (used_components) {
-				case 1: format = vk::Format::eR32Sfloat; break;
-				case 2: format = vk::Format::eR32G32Sfloat; break;
-				case 3: format = vk::Format::eR32G32B32Sfloat; break;
-				default: return false;
-			}
-			size = used_components;
-			return true;
-		case vk::Format::eR32G32B32Sfloat:
-			switch (used_components) {
-				case 1: format = vk::Format::eR32Sfloat; break;
-				case 2: format = vk::Format::eR32G32Sfloat; break;
-				default: return false;
-			}
-			size = used_components;
-			return true;
-		case vk::Format::eR16G16B16A16Sfloat:
-			switch (used_components) {
-				case 1: format = vk::Format::eR16Sfloat; break;
-				case 2: format = vk::Format::eR16G16Sfloat; break;
-				default: return false;
-			}
-			size = used_components;
-			return true;
-		case vk::Format::eR8G8B8A8Unorm:
-			switch (used_components) {
-				case 1: format = vk::Format::eR8Unorm; break;
-				case 2: format = vk::Format::eR8G8Unorm; break;
-				default: return false;
-			}
-			size = used_components;
-			return true;
-		case vk::Format::eR8G8B8A8Snorm:
-			if (used_components != 2) {
-				return false;
-			}
-			format = vk::Format::eR8G8Snorm;
-			size   = 2;
-			return true;
-		case vk::Format::eR8G8B8A8Uint:
-			switch (used_components) {
-				case 1: format = vk::Format::eR8Uint; break;
-				case 2: format = vk::Format::eR8G8Uint; break;
-				default: return false;
-			}
-			size = used_components;
-			return true;
-		default: break;
-	}
-
-	return false;
-}
-
-static void GetInputFormat(const ShaderBufferResource& res, vk::Format& format, uint32_t& size,
-                           uint32_t used_components) {
-	const auto fmt        = res.Format();
-	const auto raw_format = res.RawFormat();
-	if (raw_format == kTemporaryVertexAttribFormat113) {
-		static bool logged_113 = false;
-		if (!logged_113) {
-			LOGF("InputFormat: temporary: accepting invalid PS5 buffer format 113 as "
-			     "vk::Format::eR32G32B32A32Sfloat\n");
-			logged_113 = true;
-		}
-		format = vk::Format::eR32G32B32A32Sfloat;
-		size   = 4;
-		if (NarrowInputFormat(format, size, used_components)) {
-			LOGF("InputFormat: narrowing fmt=%u to %s for used_components=%u\n", raw_format,
-			     vk::to_string(format).c_str(), used_components);
-		}
-		return;
-	}
-	if (raw_format == kTemporaryPs5BufferFormat121) {
-		static bool logged_121 = false;
-		if (!logged_121) {
-			LOGF("InputFormat: accepting PS5 buffer format 121 as vk::Format::eR16G16Sfloat\n");
-			logged_121 = true;
-		}
-		format = vk::Format::eR16G16Sfloat;
-		size   = 2;
-		return;
-	}
-
-	format = VulkanFormat(fmt);
-	size   = ShaderRecompiler::Format::GetFormatInfo(fmt).component_count;
-	if (format == vk::Format::eUndefined || size == 0) {
-		EXIT("unknown vertex format: fmt = %u\n", raw_format);
-	}
-
-	if (NarrowInputFormat(format, size, used_components)) {
-		static std::atomic<uint64_t> log_count = 0;
-		auto                         log_id    = log_count.fetch_add(1);
-		if (log_id < 32) {
-			LOGF("VertexInput: narrowed vertex format to %" PRIu32
-			     " component(s) for shader fetch\n",
-			     used_components);
-		}
-	}
-}
 
 static vk::BlendFactor GetBlendFactor(uint32_t factor) {
 	switch (static_cast<Prospero::BlendFactor>(factor)) {
@@ -193,17 +87,20 @@ static void AddLayoutBindings(std::vector<vk::DescriptorSetLayoutBinding>& descr
 
 static void CreateDescriptorLayout(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                                    std::span<const vk::DescriptorSetLayoutBinding> bindings) {
-	const auto& limits = graphics.GetPhysicalDeviceProperties().limits;
-	uint64_t descriptor_count = 0;
-	uint64_t storage_buffers = 0;
-	uint64_t samplers = 0;
+	const auto&              limits = graphics.GetPhysicalDeviceProperties().limits;
+	DescriptorLayoutShape    shape;
+	uint64_t                 samplers = 0;
 	std::array<uint64_t, 32> stage_buffers {}, stage_resources {}, stage_samplers {};
 	for (const auto& binding: bindings) {
-		descriptor_count += binding.descriptorCount;
+		shape.descriptors += binding.descriptorCount;
 		const bool storage = binding.descriptorType == vk::DescriptorType::eStorageBuffer;
 		const bool sampler = binding.descriptorType == vk::DescriptorType::eSampler;
-		if (storage) storage_buffers += binding.descriptorCount;
-		if (sampler) samplers += binding.descriptorCount;
+		if (storage) {
+			shape.storage_buffers += binding.descriptorCount;
+		}
+		if (sampler) {
+			samplers += binding.descriptorCount;
+		}
 		for (auto stages = static_cast<uint32_t>(binding.stageFlags); stages != 0; stages &= stages - 1u) {
 			const auto stage = std::countr_zero(stages);
 			if (storage) stage_buffers[stage] += binding.descriptorCount;
@@ -220,15 +117,17 @@ static void CreateDescriptorLayout(GraphicContext& graphics, PipelineCache::Pipe
 			}
 		}
 	}
-	if (storage_buffers > limits.maxDescriptorSetStorageBuffers) {
+	if (shape.storage_buffers > limits.maxDescriptorSetStorageBuffers) {
 		EXIT("native storage-buffer descriptors exceed device limit: %" PRIu64 "/%u\n",
-		     storage_buffers, limits.maxDescriptorSetStorageBuffers);
+		     static_cast<uint64_t>(shape.storage_buffers), limits.maxDescriptorSetStorageBuffers);
 	}
 	if (samplers > limits.maxDescriptorSetSamplers) {
 		EXIT("native sampler descriptors exceed device limit: %" PRIu64 "/%u\n",
 		     samplers, limits.maxDescriptorSetSamplers);
 	}
-	pipeline.uses_push_descriptors = descriptor_count <= graphics.max_push_descriptors;
+	pipeline.uses_push_descriptors =
+	    ChooseDescriptorDelivery(graphics.host, graphics.max_push_descriptors, shape) ==
+	    DescriptorDelivery::Pushed;
 
 	vk::DescriptorSetLayoutCreateInfo create {};
 	create.flags        = pipeline.uses_push_descriptors
@@ -242,33 +141,33 @@ static void CreateDescriptorLayout(GraphicContext& graphics, PipelineCache::Pipe
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
-                            const PipelineRenderingState&          rendering,
-                            const PipelineVertexInputState&        vertex_input,
-                            std::span<const ShaderVertexInputInfo> vertex_info,
-                            const ShaderPixelInputInfo*            ps_input_info,
-                            const PipelineCache::GraphicsPrograms& programs,
-                            const PipelineStaticParameters&        static_params,
-                            vk::PipelineCache                      driver_cache) {
-	const auto& vs_input_info  = vertex_info.front();
-	const auto& vertex_program = programs.vertex[0];
-	const auto& pixel_program  = programs.pixel;
-	const bool  tessellation   = vertex_info.size() == 3;
-	const bool ps_active = ps_input_info != nullptr;
-	EXIT_IF(!vertex_program || (ps_active && !pixel_program));
-	const bool with_depth = rendering.depth_format != vk::Format::eUndefined ||
-	                        rendering.stencil_format != vk::Format::eUndefined;
-	EXIT_IF(!vs_input_info.stage);
-	const bool mesh = vs_input_info.stage.program->stage == ShaderType::Mesh;
-	EXIT_NOT_IMPLEMENTED(mesh && !graphics.mesh_shader_enabled);
-	const bool rect_list =
-	    !mesh && !tessellation && static_params.topology == vk::PrimitiveTopology::ePatchList;
+                            const GraphicsPipelineKey&                 key,
+                            const std::array<const ShaderModule*, 4>& stages,
+                            vk::PipelineCache                          driver_cache) {
+	const auto& rendering     = key.rendering;
+	const auto& vertex_input  = key.vertex_input;
+	const auto& static_params = key.static_params;
+	const auto& vertex        = *stages[0];
+	const auto* pixel         = stages[3];
+	const bool  with_depth    = rendering.depth_format != vk::Format::eUndefined ||
+	                            rendering.stencil_format != vk::Format::eUndefined;
+	const bool  mesh          = vertex.info.stage == ShaderType::Mesh;
+	// TODO(upstream merge stage 2): mesh draws on a host without mesh shaders (a compute shader
+	// writes the records, see capturedVertexLayout.h) and per-vertex values on a host without
+	// per-vertex inputs (triangleVertexValueShader.h) come back on the merged pipeline cache.
+	EXIT_NOT_IMPLEMENTED(mesh && !graphics.host.capabilities.mesh_shader);
+	const bool mesh_emulated = false;
+	const bool rect_list = static_params.patch_control_points != 0 && stages[1] == nullptr;
 
 	vk::ShaderModule tess_control_shader_module = nullptr;
 	vk::ShaderModule tess_eval_shader_module    = nullptr;
 
 	if (rect_list) {
-		const auto shaders =
-		    BuildRectListShaders(vs_input_info, ps_active ? ps_input_info : nullptr);
+		std::span<const RectListParameter> parameters;
+		if (pixel != nullptr) parameters = pixel->rect_parameters;
+		const auto shaders = BuildRectListShaders(
+		    parameters, vertex.info.param_export_mask,
+		    ShaderRecompiler::Spirv::VertexClipDistanceCount(vertex.info.stage, vertex.info.info));
 		tess_control_shader_module = CompileSPV(shaders.control, graphics.device);
 		if (graphics_debug_dump_enabled()) {
 			LOGF("PipelineTrace: vkCreateShaderModule RectList TCS done module=%p\n",
@@ -287,11 +186,12 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 	vk::PipelineShaderStageCreateInfo shader_stages[4] {};
 	uint32_t                          shader_stage_count = 0;
-	for (uint32_t i = 0; i < vertex_info.size(); i++) {
-		shader_stages[shader_stage_count++] = {.stage =
-		                                           NativeShaderStage(vertex_info[i].logical_stage),
-		                                       .module = programs.vertex[i].module,
-		                                       .pName  = "main"};
+	for (const auto* stage: stages) {
+		if (stage != nullptr) {
+			shader_stages[shader_stage_count++] = {.stage  = NativeShaderStage(stage->info.stage),
+			                                       .module = stage->module,
+			                                       .pName  = "main"};
+		}
 	}
 	if (rect_list) {
 		shader_stages[shader_stage_count++] = {.stage =
@@ -301,11 +201,6 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		shader_stages[shader_stage_count++] = {.stage =
 		                                           vk::ShaderStageFlagBits::eTessellationEvaluation,
 		                                       .module = tess_eval_shader_module,
-		                                       .pName  = "main"};
-	}
-	if (ps_active) {
-		shader_stages[shader_stage_count++] = {.stage  = vk::ShaderStageFlagBits::eFragment,
-		                                       .module = pixel_program.module,
 		                                       .pName  = "main"};
 	}
 
@@ -323,46 +218,7 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		input_attr[index].binding  = vertex_input.attributes[index].binding;
 		input_attr[index].location = index;
 		input_attr[index].offset   = vertex_input.attributes[index].offset;
-
-		uint32_t   attr_size     = 4;
-		const auto registers_num = vs_input_info.resources_dst[index].registers_num;
-		const auto compiled_components =
-		    vs_input_info.stage.program->info.vertex_fetch_components[index];
-		const auto used_components =
-		    compiled_components > 0 ? static_cast<int>(compiled_components) : registers_num;
-		GetInputFormat(vs_input_info.resources[index], input_attr[index].format, attr_size,
-		               static_cast<uint32_t>(used_components));
-
-		if (graphics_debug_dump_enabled()) {
-			static std::atomic_uint log_count = 0;
-			const auto              log_id    = log_count.fetch_add(1, std::memory_order_relaxed);
-			if (log_id < 128) {
-				LOGF("VertexInputState[%u]: attr=%u binding=%u offset=%u stride=%u fmt=%d "
-				     "src_fmt=%u dst=v%u regs=%u"
-				     " fetched_components=%u attr_size=%u swizzle=%u,%u,%u,%u\n",
-				     log_id, index, input_attr[index].binding, input_attr[index].offset,
-				     input_desc[input_attr[index].binding].stride,
-				     static_cast<int>(input_attr[index].format),
-				     static_cast<uint32_t>(vs_input_info.resources[index].Format()),
-				     static_cast<uint32_t>(vs_input_info.resources_dst[index].register_start),
-				     static_cast<uint32_t>(registers_num), static_cast<uint32_t>(used_components),
-				     attr_size, static_cast<uint32_t>(vs_input_info.resources[index].DstSelX()),
-				     static_cast<uint32_t>(vs_input_info.resources[index].DstSelY()),
-				     static_cast<uint32_t>(vs_input_info.resources[index].DstSelZ()),
-				     static_cast<uint32_t>(vs_input_info.resources[index].DstSelW()));
-			}
-		}
-
-		if (vs_input_info.resources[index].OutOfBounds() != 0) {
-			static bool logged = false;
-			if (!logged) {
-				LOGF("VertexInput: temporary: accepting PS5 out-of-bounds behavior %" PRIu8 "\n",
-				     vs_input_info.resources[index].OutOfBounds());
-				logged = true;
-			}
-		}
-
-		EXIT_IF(registers_num < 1 || registers_num > 4);
+		input_attr[index].format   = vertex.vertex_formats[index];
 	}
 
 	vk::PipelineVertexInputStateCreateInfo vertex_input_info {};
@@ -372,9 +228,11 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	vertex_input_info.pVertexAttributeDescriptions    = input_attr;
 
 	vk::PipelineInputAssemblyStateCreateInfo input_assembly {};
-	input_assembly.topology = static_params.topology;
+	// An emulated mesh draw is a triangle list without vertex input.
+	input_assembly.topology =
+	    mesh_emulated ? vk::PrimitiveTopology::eTriangleList : static_params.topology;
 	input_assembly.primitiveRestartEnable =
-	    static_params.primitive_restart_enable ? VK_TRUE : VK_FALSE;
+	    !mesh_emulated && static_params.primitive_restart_enable ? VK_TRUE : VK_FALSE;
 
 	vk::PipelineViewportDepthClipControlCreateInfoEXT depth_clip_control {};
 	depth_clip_control.negativeOneToOne = (static_params.negative_one_to_one ? VK_TRUE : VK_FALSE);
@@ -382,39 +240,40 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	vk::PipelineViewportStateCreateInfo viewport_state {};
 	viewport_state.pNext = &depth_clip_control;
 
-	vk::CullModeFlags cull_mode = vk::CullModeFlagBits::eNone;
-	if (static_params.cull_back) {
-		cull_mode |= vk::CullModeFlagBits::eBack;
-	}
-	if (static_params.cull_front) {
-		cull_mode |= vk::CullModeFlagBits::eFront;
-	}
-
-	vk::FrontFace front_face =
-	    (static_params.face ? vk::FrontFace::eClockwise : vk::FrontFace::eCounterClockwise);
-
 	vk::PipelineRasterizationDepthClipStateCreateInfoEXT clip_ext {};
 	clip_ext.depthClipEnable = static_params.depth_clip_enable ? VK_TRUE : VK_FALSE;
 
 	vk::PipelineRasterizationStateCreateInfo rasterizer {};
-	// MoltenVK lacks VK_EXT_depth_clip_enable; omit the depth-clip struct on macOS and accept
-	// Vulkan's default depth clipping (enabled) instead of the PS5's clamp behavior.
-#if !defined(__APPLE__)
-	// The DB clamps depth to the viewport range after polygon offset is applied.
-	rasterizer.depthClampEnable = VK_TRUE;
-	rasterizer.pNext = &clip_ext;
-#endif
+	const auto&                              host = graphics.host.capabilities;
+	// The DB clamps depth to the viewport range after polygon offset is applied, and clips
+	// against the near and far planes only when the guest asks for it. Vulkan turns clipping off
+	// when it clamps, unless VK_EXT_depth_clip_enable sets the two apart.
+	if (host.depth_clamp && host.depth_clip_enable) {
+		rasterizer.depthClampEnable = VK_TRUE;
+		rasterizer.pNext            = &clip_ext;
+	} else if (!static_params.depth_clip_enable) {
+		// No clipping and a clamp: what depth clamping alone does.
+		if (!HostDepthIsExact(host, false, false)) {
+			EXIT("draw with depth clipping off needs depthClamp, which the host GPU does not "
+			     "enable\n");
+		}
+		rasterizer.depthClampEnable = VK_TRUE;
+	}
+	// Clipping on without VK_EXT_depth_clip_enable: clipped as the guest asks and not clamped.
+	// Exact while polygon offset does not move depth past the range (HostDepthIsExact); the draw
+	// warns once when it does not hold, and goes on.
 	vk::PipelineRasterizationProvokingVertexStateCreateInfoEXT provoking_vertex {};
-	EXIT_NOT_IMPLEMENTED(static_params.provoking_vtx_last &&
-	                     !graphics.provoking_vertex_last_enabled);
-	if (graphics.provoking_vertex_last_enabled) {
-		provoking_vertex.provokingVertexMode = static_params.provoking_vtx_last
-		    ? vk::ProvokingVertexModeEXT::eLastVertex : vk::ProvokingVertexModeEXT::eFirstVertex;
+	// The vertex shader of a captured mesh draw puts the guest's provoking vertex first, so such
+	// a draw takes flat values from the first vertex on every host.
+	const bool provoking_last = static_params.provoking_vtx_last && !mesh_emulated;
+	EXIT_NOT_IMPLEMENTED(provoking_last && !graphics.host.capabilities.provoking_vertex_last);
+	if (graphics.host.capabilities.provoking_vertex_last) {
+		provoking_vertex.provokingVertexMode = provoking_last
+		                                           ? vk::ProvokingVertexModeEXT::eLastVertex
+		                                           : vk::ProvokingVertexModeEXT::eFirstVertex;
 		provoking_vertex.pNext = rasterizer.pNext;
 		rasterizer.pNext = &provoking_vertex;
 	}
-	rasterizer.cullMode  = cull_mode;
-	rasterizer.frontFace = front_face;
 	rasterizer.polygonMode = static_params.polygon_mode;
 	rasterizer.lineWidth = 1.0f;
 
@@ -459,31 +318,35 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	color_write.pColorWriteEnables = color_write_enable;
 
 	vk::PipelineColorBlendStateCreateInfo color_blending {};
-	// MoltenVK lacks VK_EXT_color_write_enable; drop the dynamic color-write struct on macOS
-	// and rely on each attachment's static colorWriteMask (all channels enabled by default).
-#if !defined(__APPLE__)
-	color_blending.pNext = &color_write;
-#endif
+	// Colour writes are turned off at draw time only for a slot with no image, and a slot with no
+	// image takes no writes anyway. So without VK_EXT_color_write_enable nothing is lost.
+	if (host.color_write_enable) {
+		color_blending.pNext = &color_write;
+	}
 	color_blending.logicOp         = vk::LogicOp::eCopy;
 	color_blending.attachmentCount = rendering.color_count;
 	color_blending.pAttachments    = color_blend_attachment;
 
 	std::vector<vk::DescriptorSetLayoutBinding> descriptor_bindings;
 	vk::ShaderStageFlags graphics_stages = vk::ShaderStageFlagBits::eFragment;
-	for (const auto& stage: vertex_info) {
-		const auto native_stage = NativeShaderStage(stage.logical_stage);
-		AddLayoutBindings(descriptor_bindings, *stage.stage.program, native_stage);
-		pipeline.uses_image_heap |= stage.stage.program->info.uses_image_heap;
-		graphics_stages |= native_stage;
-	}
-	if (ps_active) {
-		EXIT_IF(!ps_input_info->stage);
-		AddLayoutBindings(descriptor_bindings, *ps_input_info->stage.program,
-		                  vk::ShaderStageFlagBits::eFragment);
-		pipeline.uses_image_heap |= ps_input_info->stage.program->info.uses_image_heap;
+	for (const auto* stage: stages) {
+		if (stage != nullptr) {
+			const auto native_stage = NativeShaderStage(stage->info.stage);
+			AddLayoutBindings(descriptor_bindings, stage->info, native_stage);
+			pipeline.uses_image_heap |= stage->info.info.uses_image_heap;
+			graphics_stages |= native_stage;
+		}
 	}
 	CreateDescriptorLayout(graphics, pipeline, descriptor_bindings);
-	const vk::PushConstantRange push_constants {graphics_stages, 0,
+	// An emulated mesh program is bound to the compute pipeline: the graphics layout pushes to the
+	// pixel shader, and to the vertex shader its record address. One range covers every stage, so
+	// a push of any of them names the same stages.
+	static_assert(ShaderRecompiler::IR::PushData::MeshEmulatedDrawDwordCount * sizeof(uint32_t) <=
+	              ShaderRecompiler::IR::NativePushConstantSize);
+	pipeline.push_constant_stages =
+	    mesh_emulated ? vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment
+	                  : graphics_stages;
+	const vk::PushConstantRange push_constants {pipeline.push_constant_stages, 0,
 	                                            ShaderRecompiler::IR::NativePushConstantSize};
 	const std::array set_layouts {pipeline.descriptor_set_layout, graphics.image_heap_layout};
 
@@ -498,7 +361,7 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	if (graphics_debug_dump_enabled()) {
 		LOGF("PipelineTrace: vkCreatePipelineLayout begin VS=%" PRIu64 " PS=%" PRIu64
 		     " set_layouts=1 push_constants=%" PRIu32 "\n",
-		     vertex_program.id, ps_active ? pixel_program.id : 0, 1u);
+		     key.stage_ids[0], key.stage_ids[3], 1u);
 	}
 	auto result = graphics.device.createPipelineLayout(&pipeline_layout_info, nullptr,
 	                                                   &pipeline.pipeline_layout);
@@ -508,14 +371,14 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
-	EXIT_NOT_IMPLEMENTED(pipeline.pipeline_layout == nullptr);
-
 	vk::PipelineDepthStencilStateCreateInfo depth_stencil_info {};
 
 	std::vector<vk::DynamicState> dynamic_states {
 	    vk::DynamicState::eViewportWithCount,
 	    vk::DynamicState::eScissorWithCount,
 	    vk::DynamicState::eLineWidth,
+	    vk::DynamicState::eCullMode,
+	    vk::DynamicState::eFrontFace,
 	    vk::DynamicState::eDepthTestEnable,
 	    vk::DynamicState::eDepthWriteEnable,
 	    vk::DynamicState::eDepthCompareOp,
@@ -528,14 +391,14 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	    vk::DynamicState::eStencilWriteMask,
 	    vk::DynamicState::eBlendConstants,
 	};
-#if !defined(__APPLE__)
-	dynamic_states.push_back(vk::DynamicState::eDepthBoundsTestEnable);
-	dynamic_states.push_back(vk::DynamicState::eDepthBounds);
-	if (rendering.color_count != 0) {
+	if (host.depth_bounds) {
+		dynamic_states.push_back(vk::DynamicState::eDepthBoundsTestEnable);
+		dynamic_states.push_back(vk::DynamicState::eDepthBounds);
+	}
+	if (host.color_write_enable && rendering.color_count != 0) {
 		dynamic_states.push_back(vk::DynamicState::eColorWriteEnableEXT);
 	}
-#endif
-	if (graphics.attachment_feedback_loop_enabled) {
+	if (graphics.host.capabilities.attachment_feedback_loop) {
 		dynamic_states.push_back(vk::DynamicState::eAttachmentFeedbackLoopEnableEXT);
 	}
 
@@ -552,12 +415,14 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	pipeline_info.pNext                    = &rendering_info;
 	pipeline_info.stageCount               = shader_stage_count;
 	pipeline_info.pStages                  = shader_stages;
-	pipeline_info.pVertexInputState        = mesh ? nullptr : &vertex_input_info;
-	pipeline_info.pInputAssemblyState      = mesh ? nullptr : &input_assembly;
+	const vk::PipelineVertexInputStateCreateInfo no_vertex_input {};
+	pipeline_info.pVertexInputState =
+	    mesh_emulated ? &no_vertex_input : (mesh ? nullptr : &vertex_input_info);
+	pipeline_info.pInputAssemblyState = mesh && !mesh_emulated ? nullptr : &input_assembly;
 	vk::PipelineTessellationStateCreateInfo tessellation_state {};
-	tessellation_state.patchControlPoints =
-	    tessellation ? vs_input_info.tess.input_control_points : 3u;
-	pipeline_info.pTessellationState = (rect_list || tessellation) ? &tessellation_state : nullptr;
+	tessellation_state.patchControlPoints = static_params.patch_control_points;
+	pipeline_info.pTessellationState =
+	    static_params.patch_control_points != 0 ? &tessellation_state : nullptr;
 	pipeline_info.pViewportState          = &viewport_state;
 	pipeline_info.pRasterizationState     = &rasterizer;
 	pipeline_info.pMultisampleState       = &multisampling;
@@ -573,7 +438,7 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		LOGF("PipelineTrace: vkCreateGraphicsPipelines begin VS=%" PRIu64 " PS=%" PRIu64
 		     " topology=%" PRIu32 " color_mask=0x%08" PRIx32
 		     " depth=%s blend=%s dyn_states=%" PRIu32 "\n",
-		     vertex_program.id, ps_active ? pixel_program.id : 0,
+		     key.stage_ids[0], key.stage_ids[3],
 		     static_cast<uint32_t>(static_params.topology), static_params.color_mask[0],
 		     (with_depth ? "true" : "false"), (static_params.blend_enable[0] ? "true" : "false"),
 		     dynamic_state.dynamicStateCount);
@@ -586,39 +451,78 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
-	EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);
+	graphics.device.destroyShaderModule(tess_control_shader_module, nullptr);
+	graphics.device.destroyShaderModule(tess_eval_shader_module, nullptr);
+}
 
-	if (tess_control_shader_module != nullptr) {
-		graphics.device.destroyShaderModule(tess_control_shader_module, nullptr);
+// KYTY_PIPELINE_IR=<guest shader hashes in hex, comma-separated>: the compute pipelines of those
+// shaders.
+static bool CapturesPipelineIr(const GraphicContext& graphics, uint64_t shader_hash) {
+	static const char* wanted = std::getenv("KYTY_PIPELINE_IR");
+	if (!graphics.pipeline_executable_info_enabled || wanted == nullptr) return false;
+	for (const char* cursor = wanted; *cursor != '\0';) {
+		char* end = nullptr;
+		if (std::strtoull(cursor, &end, 16) == shader_hash) return true;
+		if (end == cursor) break;
+		cursor = *end == ',' ? end + 1 : end;
 	}
-	if (tess_eval_shader_module != nullptr) {
-		graphics.device.destroyShaderModule(tess_eval_shader_module, nullptr);
+	return false;
+}
+
+// Writes pipeline_ir_<hash>_<n>.txt in the working directory: each executable's statistics and
+// the text of its internal representations (for RADV: NIR, ACO IR and the assembly).
+static void DumpPipelineIr(GraphicContext& graphics, vk::Pipeline pipeline, uint64_t shader_hash) {
+	static std::atomic<uint32_t> count {0};
+	const auto path = fmt::format("pipeline_ir_{:016x}_{}.txt", shader_hash, count++);
+	FILE* out = std::fopen(path.c_str(), "w");
+	if (out == nullptr) return;
+	const vk::PipelineInfoKHR pipeline_info {.pipeline = pipeline};
+	const auto executables = graphics.device.getPipelineExecutablePropertiesKHR(pipeline_info).value;
+	for (uint32_t index = 0; index < executables.size(); ++index) {
+		std::fprintf(out, "=== %s: %s (subgroup %u)\n", executables[index].name.data(),
+		             executables[index].description.data(), executables[index].subgroupSize);
+		const vk::PipelineExecutableInfoKHR executable {.pipeline = pipeline, .executableIndex = index};
+		for (const auto& stat: graphics.device.getPipelineExecutableStatisticsKHR(executable).value) {
+			std::fprintf(out, "%s: %llu\n", stat.name.data(),
+			             static_cast<unsigned long long>(stat.value.u64));
+		}
+		uint32_t ir_count = 0;
+		(void)graphics.device.getPipelineExecutableInternalRepresentationsKHR(&executable, &ir_count, nullptr);
+		std::vector<vk::PipelineExecutableInternalRepresentationKHR> irs(ir_count);
+		(void)graphics.device.getPipelineExecutableInternalRepresentationsKHR(&executable, &ir_count, irs.data());
+		std::vector<std::vector<char>> texts(ir_count);
+		for (uint32_t i = 0; i < ir_count; ++i) {
+			texts[i].resize(irs[i].dataSize);
+			irs[i].pData = texts[i].data();
+		}
+		(void)graphics.device.getPipelineExecutableInternalRepresentationsKHR(&executable, &ir_count, irs.data());
+		for (uint32_t i = 0; i < ir_count; ++i) {
+			std::fprintf(out, "--- %s: %s\n", irs[i].name.data(), irs[i].description.data());
+			if (irs[i].isText) std::fwrite(texts[i].data(), 1, strnlen(texts[i].data(), texts[i].size()), out);
+			std::fprintf(out, "\n");
+		}
 	}
+	std::fclose(out);
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
-                            const ShaderComputeInputInfo& input_info,
-                            vk::ShaderModule compute_module, vk::PipelineCache driver_cache) {
-	EXIT_IF(compute_module == nullptr);
-
+                            const ShaderModule& module, vk::PipelineCache driver_cache) {
 	vk::PipelineShaderStageCreateInfo                     comp_shader_stage_info {};
 	vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo comp_subgroup_size {};
 	comp_shader_stage_info.stage  = vk::ShaderStageFlagBits::eCompute;
-	comp_shader_stage_info.module = compute_module;
+	comp_shader_stage_info.module = module.module;
 	comp_shader_stage_info.pName  = "main";
-	EXIT_IF(!input_info.stage);
-	const auto wave_size = input_info.stage.program->wave_size;
-	if (graphics.compute_subgroup_size_control_enabled &&
+	const auto wave_size = module.info.wave_size;
+	if (graphics.host.capabilities.compute_subgroup_size_control &&
 	    wave_size >= graphics.min_subgroup_size && wave_size <= graphics.max_subgroup_size) {
 		comp_subgroup_size.requiredSubgroupSize = wave_size;
 		comp_shader_stage_info.pNext            = &comp_subgroup_size;
 	}
 
 	std::vector<vk::DescriptorSetLayoutBinding> descriptor_bindings;
-	AddLayoutBindings(descriptor_bindings, *input_info.stage.program,
-	                  vk::ShaderStageFlagBits::eCompute);
-	pipeline.uses_image_heap = input_info.stage.program->info.uses_image_heap;
+	AddLayoutBindings(descriptor_bindings, module.info, vk::ShaderStageFlagBits::eCompute);
+	pipeline.uses_image_heap = module.info.info.uses_image_heap;
 	CreateDescriptorLayout(graphics, pipeline, descriptor_bindings);
 	const vk::PushConstantRange push_constants {vk::ShaderStageFlagBits::eCompute, 0,
 	                                            ShaderRecompiler::IR::NativePushConstantSize};
@@ -632,18 +536,12 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 	EXIT_IF(pipeline.pipeline_layout != nullptr);
 
-	LOGF("PipelineTrace: vkCreatePipelineLayout CS begin set_layouts=1 push_constants=%u\n",
-	     1u);
 	auto result = graphics.device.createPipelineLayout(&pipeline_layout_info, nullptr,
 	                                                  &pipeline.pipeline_layout);
-	LOGF("PipelineTrace: vkCreatePipelineLayout CS done result=%s layout=%p\n",
-	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline_layout));
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
-	EXIT_NOT_IMPLEMENTED(pipeline.pipeline_layout == nullptr);
-
 	vk::ComputePipelineCreateInfo info {};
-	if (input_info.stage.program->info.uses_gds) {
+	if (module.info.info.uses_gds) {
 		info.flags = vk::PipelineCreateFlagBits::eDispatchBase;
 	}
 	info.stage             = comp_shader_stage_info;
@@ -652,15 +550,18 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 	EXIT_IF(pipeline.pipeline != nullptr);
 
-	LOGF("PipelineTrace: vkCreateComputePipelines begin layout=%p\n",
-	     static_cast<void*>(pipeline.pipeline_layout));
-	result = graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr,
+	const bool capture = CapturesPipelineIr(graphics, module.info.shader_hash);
+	if (capture) {
+		info.flags |= vk::PipelineCreateFlagBits::eCaptureStatisticsKHR |
+		              vk::PipelineCreateFlagBits::eCaptureInternalRepresentationsKHR;
+	}
+	// A pipeline from the driver's cache may come without its internal representations.
+	result = graphics.device.createComputePipelines(capture ? nullptr : driver_cache, 1, &info, nullptr,
 	                                                &pipeline.pipeline);
-	LOGF("PipelineTrace: vkCreateComputePipelines done result=%s pipeline=%p\n",
-	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
+	if (capture && result == vk::Result::eSuccess) {
+		DumpPipelineIr(graphics, pipeline.pipeline, module.info.shader_hash);
+	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
-
-	EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);
 }
 
 } // namespace Libs::Graphics

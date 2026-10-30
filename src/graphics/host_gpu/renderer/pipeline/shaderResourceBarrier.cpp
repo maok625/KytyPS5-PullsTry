@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 
 #include "common/assert.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/shader/shader.h"
 #include "graphics/shader/shaderBindings.h"
 
@@ -20,6 +21,11 @@ vk::ShaderStageFlagBits NativeShaderStage(ShaderType stage) {
 		case ShaderType::Compute: return vk::ShaderStageFlagBits::eCompute;
 		default: EXIT("unknown native shader stage\n");
 	}
+}
+
+vk::ShaderStageFlagBits NativeShaderStage(const ShaderRecompiler::IR::CompiledShaderInfo& program) {
+	return program.mesh_emulated ? vk::ShaderStageFlagBits::eCompute
+	                             : NativeShaderStage(program.stage);
 }
 
 vk::PipelineStageFlags ShaderPipelineStages(vk::ShaderStageFlags stages) {
@@ -90,7 +96,7 @@ vk::BufferMemoryBarrier MakeGdsDependency(vk::Buffer buffer) {
 
 bool HasShaderBufferWrites(const ShaderStageRuntime& runtime) {
 	EXIT_IF(!runtime);
-	const auto& program   = *runtime.program;
+	const auto& program   = runtime.module->info;
 	const auto& resources = *runtime.resources;
 	EXIT_IF(resources.buffers.size() != program.info.buffers.size());
 	// Address writes reach memory outside the bound buffer descriptors.
@@ -108,6 +114,24 @@ bool HasShaderBufferWrites(const ShaderStageRuntime& runtime) {
 		has_writes |= descriptor.Base48() != 0 && descriptor.NumRecords() != 0;
 	}
 	return has_writes;
+}
+
+bool HasShaderMemoryWrites(const ShaderStageRuntime& runtime) {
+	if (HasShaderBufferWrites(runtime)) {
+		return true;
+	}
+	const auto& program = runtime.module->info;
+	for (const auto& buffer: program.info.buffers) {
+		if (buffer.atomic) {
+			return true;
+		}
+	}
+	for (const auto& image: program.info.images) {
+		if (image.written || image.atomic) {
+			return true;
+		}
+	}
+	return false;
 }
 
 void ShaderAccessBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags source_stages) {

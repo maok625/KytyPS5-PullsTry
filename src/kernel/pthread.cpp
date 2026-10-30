@@ -6,6 +6,7 @@
 #include "common/emulatorConfig.h"
 #include "common/hostException.h"
 #include "common/logging/log.h"
+#include "common/perfCounters.h"
 #include "common/singleton.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -521,6 +522,7 @@ static void SchedulerBackoffOnce() {
 
 static void SleepMicroWithSignalPoll(uint64_t microseconds) {
 	if (microseconds == 0) {
+		PerfCounters::Add(PerfCounters::Counter::ZeroSleeps);
 		KernelDispatchPendingSignalForCurrentThread();
 		return;
 	}
@@ -535,6 +537,7 @@ static void SleepMicroWithSignalPoll(uint64_t microseconds) {
 
 static void SleepNanoWithSignalPoll(uint64_t nanoseconds) {
 	if (nanoseconds == 0) {
+		PerfCounters::Add(PerfCounters::Counter::ZeroSleeps);
 		KernelDispatchPendingSignalForCurrentThread();
 		return;
 	}
@@ -2277,7 +2280,10 @@ int KYTY_SYSV_ABI PthreadRwlockDestroy(PthreadRwlock* rwlock) {
 		return KERNEL_ERROR_EINVAL;
 	}
 
-	EXIT_NOT_IMPLEMENTED(*rwlock == nullptr);
+	// SCE_PTHREAD_RWLOCK_INITIALIZER has no allocated resources until first use.
+	if (*rwlock == nullptr) {
+		return OK;
+	}
 
 	{
 		std::lock_guard lock((*rwlock)->m);

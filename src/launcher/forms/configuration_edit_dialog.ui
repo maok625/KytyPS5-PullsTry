@@ -115,7 +115,17 @@
             </item>
             <item row="0" column="1">
              <widget class="QComboBox" name="comboBox_screen_resolution">
-              <property name="toolTip"><string>Window resolution</string></property>
+              <property name="toolTip"><string>Window resolution as WIDTHxHEIGHT; pick a preset or type a custom size. Non-16:9 sizes such as 21:9 show the game with black bars unless Stretch to window is on.</string></property>
+              <property name="editable"><bool>true</bool></property>
+              <property name="insertPolicy"><enum>QComboBox::NoInsert</enum></property>
+              <item><property name="text"><string notr="true">1280x720</string></property></item>
+              <item><property name="text"><string notr="true">1920x1080</string></property></item>
+              <item><property name="text"><string notr="true">2560x1440</string></property></item>
+              <item><property name="text"><string notr="true">3840x2160</string></property></item>
+              <item><property name="text"><string notr="true">2560x1080</string></property></item>
+              <item><property name="text"><string notr="true">3440x1440</string></property></item>
+              <item><property name="text"><string notr="true">3840x1600</string></property></item>
+              <item><property name="text"><string notr="true">5120x2160</string></property></item>
              </widget>
             </item>
             <item row="1" column="0">
@@ -129,11 +139,21 @@
              </widget>
             </item>
             <item row="2" column="0">
+             <widget class="QLabel" name="label_video_out_resolution">
+              <property name="text"><string>Video output:</string></property>
+             </widget>
+            </item>
+            <item row="2" column="1">
+             <widget class="QComboBox" name="comboBox_video_out_resolution">
+              <property name="toolTip"><string>The output resolution the console reports to games, which render at it. Title: 4K unless the game may detect a smaller output</string></property>
+             </widget>
+            </item>
+            <item row="3" column="0">
              <widget class="QLabel" name="label_vblank_frequency">
               <property name="text"><string>Vblank frequency:</string></property>
              </widget>
             </item>
-            <item row="2" column="1">
+            <item row="3" column="1">
              <widget class="QSpinBox" name="spinBox_vblank_frequency">
               <property name="toolTip"><string>Virtual display refresh rate used for frame pacing</string></property>
               <property name="minimum"><number>30</number></property>
@@ -141,48 +161,73 @@
               <property name="value"><number>60</number></property>
              </widget>
             </item>
-            <item row="3" column="0">
+            <!--
+            <item row="4" column="0">
              <widget class="QLabel" name="label_shader_optimization">
               <property name="text"><string>Shader optimization:</string></property>
              </widget>
             </item>
-            <item row="3" column="1">
+            <item row="4" column="1">
              <widget class="QComboBox" name="comboBox_shader_optimization_type">
               <property name="toolTip"><string>Optimize shaders for code size or performance</string></property>
              </widget>
             </item>
+            -->
             <item row="4" column="0">
+             <widget class="QLabel" name="label_pipeline_cache_folder">
+              <property name="text"><string>Pipeline cache folder:</string></property>
+             </widget>
+            </item>
+            <item row="4" column="1">
+             <widget class="QLineEdit" name="lineEdit_pipeline_cache_folder">
+              <property name="toolTip"><string>Folder for the pipeline and program lists of each game. Empty: the user&apos;s cache folder</string></property>
+              <property name="clearButtonEnabled"><bool>true</bool></property>
+             </widget>
+            </item>
+            <item row="5" column="0">
              <widget class="QLabel" name="label_gpu">
               <property name="text"><string>GPU:</string></property>
              </widget>
             </item>
-            <item row="4" column="1">
+            <item row="5" column="1">
              <widget class="QComboBox" name="comboBox_gpu">
               <property name="toolTip"><string>Graphics device used by the emulator</string></property>
              </widget>
             </item>
-            <item row="5" column="1">
+            <item row="6" column="1">
              <widget class="QCheckBox" name="checkBox_readback">
               <property name="toolTip"><string>Read back writable linear images</string></property>
               <property name="text"><string>Enable readback</string></property>
              </widget>
             </item>
-            <item row="6" column="1">
+            <item row="7" column="1">
              <widget class="QCheckBox" name="checkBox_readback_tiled">
               <property name="toolTip"><string>Read back small writable tiled images</string></property>
               <property name="text"><string>Enable tiled readback</string></property>
              </widget>
             </item>
-            <item row="7" column="1">
+            <item row="8" column="1">
              <widget class="QCheckBox" name="checkBox_tessellation">
               <property name="toolTip"><string>Draw tessellated geometry. Disabled by default; unsupported tessellation may cause crashes.</string></property>
               <property name="text"><string>Enable tessellation support (experimental)</string></property>
              </widget>
             </item>
-            <item row="8" column="1">
+            <item row="9" column="1">
+             <widget class="QCheckBox" name="checkBox_occlusion_queries">
+              <property name="toolTip"><string>Count the samples of occlusion queries on the GPU, so hidden lights and objects stay hidden. Costs some performance.</string></property>
+              <property name="text"><string>Enable occlusion queries</string></property>
+             </widget>
+            </item>
+            <item row="10" column="1">
              <widget class="QCheckBox" name="checkBox_hdr">
               <property name="toolTip"><string>Enable HDR10 output for supported games. Requires HDR enabled on the host display.</string></property>
               <property name="text"><string>Enable HDR display support</string></property>
+             </widget>
+            </item>
+            <item row="11" column="1">
+             <widget class="QCheckBox" name="checkBox_shader_cache">
+              <property name="toolTip"><string>Save compiled shaders and pipelines per game and load them at startup.</string></property>
+              <property name="text"><string>Cache shaders</string></property>
              </widget>
             </item>
            </layout>
@@ -231,6 +276,12 @@
            <property name="title"><string>General</string></property>
            <layout class="QVBoxLayout" name="generalLayout">
             <item>
+             <widget class="QCheckBox" name="checkBox_pro">
+              <property name="toolTip"><string>Enable experimental Pro mode for supported titles. PSSR uses linear scaling. Disabled by default.</string></property>
+              <property name="text"><string>Pro mode (experimental)</string></property>
+             </widget>
+            </item>
+            <item>
              <widget class="QCheckBox" name="checkBox_fullscreen">
               <property name="toolTip"><string>Run in borderless desktop fullscreen</string></property>
               <property name="text"><string>Run in fullscreen</string></property>
@@ -240,6 +291,12 @@
              <widget class="QCheckBox" name="checkBox_hide_cursor">
               <property name="toolTip"><string>Hide the host cursor after 2 seconds without mouse activity</string></property>
               <property name="text"><string>Auto-hide cursor</string></property>
+             </widget>
+            </item>
+            <item>
+             <widget class="QCheckBox" name="checkBox_stretch">
+              <property name="toolTip"><string>Stretch the game image to fill the window instead of keeping its aspect ratio with black bars</string></property>
+              <property name="text"><string>Stretch to window</string></property>
              </widget>
             </item>
             <item>
@@ -374,6 +431,17 @@
         <widget class="QCheckBox" name="checkBox_network_connected">
          <property name="toolTip"><string>Let games use your computer's local network connection.</string></property>
          <property name="text"><string>Enable network connection</string></property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QCheckBox" name="checkBox_psn_emulation">
+         <property name="text"><string>Emulate PSN (compatibility)</string></property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QCheckBox" name="checkBox_ea_emulation">
+         <property name="toolTip"><string>Answer games of EA with a built-in stand-in for EA's servers, so they reach their offline menus.</string></property>
+         <property name="text"><string>Emulate EA servers (compatibility)</string></property>
         </widget>
        </item>
        <item>

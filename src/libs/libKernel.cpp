@@ -1,5 +1,6 @@
 #include "common/abi.h"
 #include "common/assert.h"
+#include "common/signalDefer.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
@@ -20,6 +21,7 @@
 #include "libs/network.h"
 #include "loader/elf.h"
 #include "loader/runtimeLinker.h"
+#include "loader/systemContent.h"
 #include "loader/symbolDatabase.h"
 
 #include <algorithm>
@@ -967,7 +969,7 @@ static int SignalDispatchHostSignal() {
 static void HostSignalDispatchHandler(int /*host_signal*/, siginfo_t* /*info*/,
                                       void* native_context) {
 	Pthread current = PthreadSelfOrNull();
-	if (current == nullptr) {
+	if (current == nullptr || Common::DeferSignalInSection()) {
 		return;
 	}
 
@@ -1001,6 +1003,8 @@ static bool EnsureHostSignalDispatchInstalled() {
 		action.sa_sigaction = HostSignalDispatchHandler;
 		sigemptyset(&action.sa_mask);
 		action.sa_flags = SA_SIGINFO | SA_RESTART;
+		// A signal deferred in a host section (signalDefer.h) is raised again when it ends.
+		Common::SetSignalRedelivery([] { ::pthread_kill(::pthread_self(), SignalDispatchHostSignal()); });
 		return ::sigaction(SignalDispatchHostSignal(), &action, nullptr) == 0;
 	}();
 	return installed;
@@ -1321,23 +1325,12 @@ static void* KYTY_SYSV_ABI KernelGetProcParam() {
 }
 
 static int KYTY_SYSV_ABI KernelIsTrinityMode() {
-	static std::atomic_uint32_t call_count {0};
-
-	auto count = call_count.fetch_add(1, std::memory_order_relaxed);
-	if (count < 8 || (count % 1024) == 0) {
-		PRINT_NAME();
-		LOGF("\tcall = %u, return = 0 (base PS5 mode)\n", count + 1);
-	}
-
-	return 0;
+	return Loader::SystemContentIsTrinityMode() ? 1 : 0;
 }
 
 static int KYTY_SYSV_ABI KernelGetOperationMode(int* mode, int* submode) {
-	PRINT_NAME();
-
-	*mode    = 2; // PS5 Base
+	*mode    = Loader::SystemContentIsTrinityMode() ? 3 : 2;
 	*submode = 0; // None
-	LOGF("\t mode = %d, submode = %d\n", *mode, *submode);
 	return OK;
 }
 
@@ -1370,22 +1363,8 @@ static void KYTY_SYSV_ABI KernelRtldSetApplicationHeapAPI(void* api[]) {
 	[[maybe_unused]] auto* heap_posix_memalign = api[6];
 }
 
-static int64_t KYTY_SYSV_ABI write(int d, const char* str, int64_t size) {
-	// PRINT_NAME();
-
-	EXIT_NOT_IMPLEMENTED(d < 0);
-
-	if (Network::Net::IsSocket(d)) {
-		return Network::Net::Send(d, str, static_cast<uint64_t>(size), 0);
-	}
-
-	if (d > 2) {
-		return POSIX_N_CALL(FileSystem::KernelWrite(d, str, size));
-	}
-
-	int size_int = static_cast<int>(size);
-
-	return size_int;
+static int64_t KYTY_SYSV_ABI write(int d, const void* buf, size_t nbytes) {
+	return POSIX_N_CALL(FileSystem::KernelWrite(d, buf, nbytes));
 }
 
 static int KYTY_SYSV_ABI open(const char* path, int flags, int mode) {

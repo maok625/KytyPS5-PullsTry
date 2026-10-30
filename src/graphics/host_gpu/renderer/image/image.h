@@ -102,6 +102,10 @@ public:
 		m_maybe_cpu_dirty = false;
 	}
 
+	// Counts the writes to the image's contents (GPU writes, uploads, clears, copies, draws
+	// that write depth or stencil). A reader that holds a copy compares it.
+	[[nodiscard]] uint64_t ContentGeneration() const noexcept { return m_content_generation; }
+	void                   NoteContentWrite() noexcept { m_content_generation++; }
 	[[nodiscard]] bool IsGpuModified() const noexcept { return m_gpu_modified; }
 	void               MarkGpuModified() noexcept { m_gpu_modified = true; }
 	void               ClearGpuModified() noexcept { m_gpu_modified = false; }
@@ -139,14 +143,20 @@ public:
 	}
 
 	static inline std::atomic<uint64_t> heap_epoch {0};
+	static inline std::atomic<uint64_t> serials {0};
 
+	// Unique per image, unlike ImageId: freed slots are reused.
+	const uint64_t   serial = serials.fetch_add(1u, std::memory_order_relaxed) + 1u;
 	ImageInfo        info;
 	VulkanImage      backing;
 	std::vector<CachedImageView> views;
 	ImageUsage       usage;
 	ImageBinding     binding;
 	bool             registered     = false;
-	mutable uint32_t query_epoch    = 0;
+	// The submission of the last download of the image to guest memory: the download writes the
+	// whole range when that submission ends (TextureCache::DownloadImageMemory).
+	uint64_t         download_tick  = 0;
+	mutable bool     picked         = false; // Set only while FindImagesInRegion collects it.
 	uint64_t         track_addr     = 0;
 	uint64_t         track_addr_end = 0;
 	ImageId          depth_id {};
@@ -155,6 +165,8 @@ public:
 	// The current stencil plane's mapping into the depth image, also retained by its association.
 	ImageSubresourceRange stencil_subresources;
 	uint64_t         tick_accessed_last = 0;
+	// The cache's GC tick when the image was last put at the back of the LRU list.
+	uint64_t         lru_touched_gc     = ~uint64_t {0};
 	size_t           lru_id             = 0;
 	// Resident image heap elements that select this image.
 	std::atomic<uint32_t> heap_refs {0};
@@ -174,6 +186,7 @@ private:
 	bool              m_cpu_dirty       = false;
 	bool              m_maybe_cpu_dirty = false;
 	bool              m_gpu_modified    = false;
+	uint64_t          m_content_generation = 0;
 	bool              m_buffer_modified = false;
 };
 

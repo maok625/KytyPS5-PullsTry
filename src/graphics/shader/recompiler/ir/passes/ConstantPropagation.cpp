@@ -50,6 +50,32 @@ public:
 		}
 	}
 
+	// The operations whose operands a fold of one of their users inspects (beyond the operation's
+	// own opcode and value): a change below such an operation can change how its users fold.
+	// Every other fold reads only its direct operands, so the walk stops at other operations.
+	static bool InspectedThrough(ValueOpcode opcode) {
+		switch (opcode) {
+			case ValueOpcode::Identity:
+			case ValueOpcode::SelectU32:
+			case ValueOpcode::BitwiseAnd32:
+			case ValueOpcode::BitwiseOr32:
+			case ValueOpcode::BitwiseNot32:
+			case ValueOpcode::ShiftLeftLogical32:
+			case ValueOpcode::ShiftRightLogical32:
+			case ValueOpcode::GetBuiltin:
+			case ValueOpcode::CompositeExtractU64:
+			case ValueOpcode::CompositeExtractU32x4:
+			case ValueOpcode::Ballot:
+			case ValueOpcode::LogicalNot:
+			case ValueOpcode::LogicalAnd:
+			case ValueOpcode::LogicalOr:
+			case ValueOpcode::IEqual32:
+			case ValueOpcode::INotEqual32:
+			case ValueOpcode::Phi: return true;
+			default: return false;
+		}
+	}
+
 	void QueueUsers(const std::vector<Use>& users) {
 		for (const auto& use: users) affected.push_back(use.user);
 	}
@@ -57,13 +83,16 @@ public:
 	void FlushUsers() {
 		++generation;
 		// Pattern folds inspect nested operands even when intermediate operations
-		// stay dynamic. Visit their union once per drain, including cyclic Phi edges.
+		// stay dynamic. Visit their union once per drain, including cyclic Phi edges, through the
+		// operations such folds look into (see InspectedThrough). Walking every transitive user
+		// made the pass quadratic in large shaders.
 		for (size_t i = 0; i < affected.size(); ++i) {
 			auto* inst = affected[i];
 			const auto found = locations.find(inst);
 			if (found == locations.end() || found->second.visited == generation) continue;
 			found->second.visited = generation;
 			Queue(inst);
+			if (!InspectedThrough(inst->GetOpcode())) continue;
 			for (const auto& use: inst->Uses()) affected.push_back(use.user);
 		}
 		affected.clear();
@@ -163,6 +192,16 @@ bool ReplaceBinaryIdentity(Inst& inst, Type type, uint64_t identity) {
 	    (type == Type::U32 ? rhs.U32() == identity : rhs.U64() == identity)) {
 		Replace(inst, lhs);
 		return true;
+	}
+	return false;
+}
+
+// Whether one operand is the other's negation.
+bool IsComplementPair(const Inst& inst, ValueOpcode negation) {
+	for (uint32_t arg = 0; arg < 2u; ++arg) {
+		const auto* negate = Arg(inst, arg).TryInstruction();
+		if (negate != nullptr && negate->GetOpcode() == negation &&
+		    Arg(*negate, 0) == Arg(inst, arg ^ 1u)) return true;
 	}
 	return false;
 }
@@ -626,8 +665,9 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 		case ValueOpcode::BitwiseXor32:
 			if (!FoldU32(inst, [opcode = inst.GetOpcode()](uint32_t a, uint32_t b) {
 				    return opcode == ValueOpcode::BitwiseOr32 ? a | b : a ^ b;
-			    })) {
-				ReplaceBinaryIdentity(inst, Type::U32, 0u);
+			    }) && !ReplaceBinaryIdentity(inst, Type::U32, 0u) &&
+			    IsComplementPair(inst, ValueOpcode::BitwiseNot32)) {
+				Replace(inst, Value(UINT32_MAX));
 			}
 			return;
 		case ValueOpcode::BitwiseNot32: {
@@ -802,6 +842,8 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 					Replace(inst, lhs.U1() ? lhs : rhs);
 				} else if (IsImmediate(rhs, Type::U1)) {
 					Replace(inst, rhs.U1() ? rhs : lhs);
+				} else if (IsComplementPair(inst, ValueOpcode::LogicalNot)) {
+					Replace(inst, Value(true));
 				} else {
 					const auto* left = lhs.TryInstruction();
 					const auto* right = rhs.TryInstruction();
@@ -892,8 +934,10 @@ private:
 		if (inst.GetOpcode() != ValueOpcode::CompositeExtractU32x4 ||
 		    !Immediate(Arg(inst, 1), 0u)) return {};
 		const auto* source = Arg(inst, 0).TryInstruction();
-		return source != nullptr && source->GetOpcode() == ValueOpcode::Ballot
-		           ? Arg(*source, 0) : Value {};
+		if (source == nullptr) return {};
+		// Helper lanes keep the per-lane EXEC, so the live mask projects to true.
+		if (source->GetOpcode() == ValueOpcode::LiveMask) return Value(true);
+		return source->GetOpcode() == ValueOpcode::Ballot ? Arg(*source, 0) : Value {};
 	}
 
 	bool CanProject(Value value) {

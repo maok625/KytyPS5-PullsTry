@@ -2,9 +2,11 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RANGESET_H_
 
 #include "common/assert.h"
+#include "graphics/host_gpu/regionDefinitions.h"
 
 #include <algorithm>
 #include <cstdint>
+#include <iterator>
 #include <map>
 
 namespace Libs::Graphics {
@@ -17,14 +19,19 @@ public:
 		if (it != m_ranges.begin() && std::prev(it)->second >= address) {
 			it = std::prev(it);
 		}
-		uint64_t begin = address;
-		uint64_t last  = end;
-		while (it != m_ranges.end() && it->first <= last) {
-			begin = std::min(begin, it->first);
-			last  = std::max(last, it->second);
-			it    = m_ranges.erase(it);
+		if (it == m_ranges.end() || it->first > address) {
+			it = m_ranges.emplace_hint(it, address, end);
+		} else {
+			if (it->second >= end) {
+				return;
+			}
+			it->second = end;
 		}
-		m_ranges.emplace(begin, last);
+		auto next = std::next(it);
+		while (next != m_ranges.end() && next->first <= it->second) {
+			it->second = std::max(it->second, next->second);
+			next       = m_ranges.erase(next);
+		}
 	}
 
 	void Subtract(uint64_t address, uint64_t size) {
@@ -89,6 +96,17 @@ public:
 				func(begin, last);
 			}
 		}
+	}
+
+	// The range that holds `address`; empty when no range holds it. Ranges that touch are one
+	// range here.
+	[[nodiscard]] GuestSpan Find(uint64_t address) const {
+		auto it = m_ranges.upper_bound(address);
+		if (it == m_ranges.begin()) {
+			return {};
+		}
+		--it;
+		return address < it->second ? GuestSpan {it->first, it->second} : GuestSpan {};
 	}
 
 	[[nodiscard]] bool Empty() const { return m_ranges.empty(); }

@@ -66,22 +66,44 @@ RegionManager* MemoryTracker::GetOrCreateRegion(uint64_t index) {
 	return ptr;
 }
 
-void MemoryTracker::QueueBdaSync(uint64_t vaddr, uint64_t size) {
-	const auto begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
-	const auto end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
-	std::lock_guard lock(m_bda_sync_mutex);
-	m_bda_sync.Add(begin, end - begin);
-}
-
-RangeSet MemoryTracker::TakeBdaSync() {
-	std::lock_guard lock(m_bda_sync_mutex);
-	return std::exchange(m_bda_sync, RangeSet {});
+void MemoryTracker::HarvestArmedWrites() {
+	CheckNotInUploadCallback();
+	// Every region scans at most once for each guest submission (HarvestIfDue): a second pass in
+	// the same submission finds nothing unless a region got armed since.
+	const auto submission = RegionManager::Submission();
+	const auto generation = RegionManager::ArmGeneration();
+	if (submission == m_harvested_submission.load(std::memory_order_relaxed) &&
+	    generation == m_harvested_generation.load(std::memory_order_relaxed)) {
+		return;
+	}
+	std::lock_guard lock(m_region_mutex);
+	for (const auto& manager: m_region_storage) {
+		if (manager->maybe_armed.load(std::memory_order_relaxed)) {
+			std::scoped_lock region_lock(manager->lock);
+			Harvest(manager.get());
+		}
+	}
+	m_harvested_submission.store(submission, std::memory_order_relaxed);
+	m_harvested_generation.store(generation, std::memory_order_relaxed);
 }
 
 bool MemoryTracker::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
-	return Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+	return Iterate<true>(vaddr, size, [this](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+		// Most queries find a region with nothing armed: they read its bits without the lock.
+		bool modified = false;
+		bool armed    = true;
+		if (manager->lock.TryRead([&] {
+			    armed = manager->maybe_armed.load(std::memory_order_relaxed);
+			    if (!armed) {
+				    modified = manager->IsModified<DirtySource::Cpu>(offset, bytes);
+			    }
+		    }) &&
+		    !armed) {
+			return modified;
+		}
 		std::scoped_lock lock(manager->lock);
+		Harvest(manager);
 		return manager->IsModified<DirtySource::Cpu>(offset, bytes);
 	});
 }
@@ -89,6 +111,11 @@ bool MemoryTracker::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 bool MemoryTracker::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
 	return Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+		bool modified = false;
+		if (manager->lock.TryRead(
+		        [&] { modified = manager->IsModified<DirtySource::Gpu>(offset, bytes); })) {
+			return modified;
+		}
 		std::scoped_lock lock(manager->lock);
 		return manager->IsModified<DirtySource::Gpu>(offset, bytes);
 	});
@@ -100,7 +127,6 @@ void MemoryTracker::MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size) {
 		std::scoped_lock lock(manager->lock);
 		manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
 	});
-	QueueBdaSync(vaddr, size);
 }
 
 void MemoryTracker::MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
@@ -139,10 +165,9 @@ void MemoryTracker::UntrackMemory(uint64_t vaddr, uint64_t size) {
 		EXIT("cannot untrack GPU-dirty memory\n");
 	}
 	Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+		manager->Disarm(manager->GetCpuAddr() + offset, bytes);
 		manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
 	});
-	locks.clear();
-	QueueBdaSync(vaddr, size);
 }
 
 } // namespace Libs::Graphics

@@ -26,9 +26,10 @@ struct DebugStats {
 	uint64_t flexible_total      = 0;
 	uint64_t flexible_used       = 0;
 	uint64_t pool_committed      = 0;
-	uint64_t cpu_page_entries    = 0; // 2 MiB page-table entries in use.
-	uint64_t gpu_page_entries    = 0;
-	uint64_t page_entries_total  = 0; // Per side.
+	uint64_t cpu_page_entries       = 0; // 2 MiB page-table entries in use.
+	uint64_t gpu_page_entries       = 0;
+	uint64_t cpu_page_entries_total = 0;
+	uint64_t gpu_page_entries_total = 0;
 };
 [[nodiscard]] DebugStats GetDebugStats();
 
@@ -125,7 +126,6 @@ static_assert(sizeof(KernelMemoryPoolBlockStats) == 16,
               "KernelMemoryPoolBlockStats struct size is incorrect");
 
 void                   RegisterCallbacks(callback_func_t alloc_func, callback_func_t free_func);
-void                   SetFlexibleMemorySize(uint64_t size);
 int AllocateDirectMemory(int64_t search_start, int64_t search_end, size_t size, size_t alignment,
                          int memory_type, int64_t* phys_addr_out, bool automatic = false);
 int MapAutomaticMemory(uint64_t vaddr, size_t size, int type, int prot);
@@ -133,10 +133,27 @@ int UnmapAmmMemory(uint64_t vaddr, size_t size);
 bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
+// How many bytes from vaddr have backing, page by page (0x4000), stopping at the first page without.
+// Sparse (PRT) ranges read as zeros where this stops, so only this tells resident pages from empty ones.
+[[nodiscard]] uint64_t BackedPrefix(uint64_t vaddr, uint64_t size);
+// Changes when guest backing is mapped or unmapped.
+[[nodiscard]] uint64_t BackingGeneration();
 bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   CopySparseMemory(uint64_t vaddr, void* data, uint64_t size);
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
+// The file of guest direct memory (a memfd on Linux, -1 elsewhere) and its size.
+struct DirectMemoryFile {
+	int      fd   = -1;
+	uint64_t size = 0;
+};
+[[nodiscard]] DirectMemoryFile GetDirectMemoryFile();
+// Where [vaddr, vaddr + size) lies in that file, when it is mapped from it in one piece.
+[[nodiscard]] bool TranslateDirectMemory(uint64_t vaddr, uint64_t size, uint64_t* file_offset);
+// The largest range within [low, high) around [vaddr, vaddr + size) that is mapped from that file
+// in one piece, or false when [vaddr, vaddr + size) itself is not.
+[[nodiscard]] bool ContiguousDirectMemory(uint64_t vaddr, uint64_t size, uint64_t low,
+                                          uint64_t high, uint64_t* begin, uint64_t* end);
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 void                   InstallGpuResources(Graphics::RenderContext* renderer) noexcept;
 [[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept;
@@ -197,6 +214,9 @@ int KYTY_SYSV_ABI KernelMemoryPoolGetBlockStats(KernelMemoryPoolBlockStats* outp
 
 uint64_t AllocateProgramMemory(uint64_t search_addr, uint64_t size,
                                Common::VirtualMemory::Mode mode, const char* name);
+// Loaded modules' segments use flexible memory without taking its backing.
+void ChargeFlexibleMemory(uint64_t size);
+void ReleaseFlexibleMemory(uint64_t size);
 void SetProgramMemoryProtection(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode);
 uint64_t AllocateRuntimeMemory(uint64_t search_addr, uint64_t size,
                                Common::VirtualMemory::Mode mode, const char* name,
@@ -222,6 +242,11 @@ bool     TestPlaceholderRangeIsFree(uint64_t vaddr, uint64_t size);
 bool     TestGuestAddressRangeIsOwned(uint64_t vaddr, uint64_t size);
 bool     TestGuestBackingOutsideAddressSpace();
 uint64_t TestGuestBackingSize();
+uint64_t TestFlexibleBackingHighWater();
+uint64_t TestGuestFreeRangeVisits();
+uint64_t TestDirectMappingCount();
+uint64_t TestFlexibleMappingCount();
+uint64_t TestBackingBytesZeroed();
 bool     TestGuestFreeRangeBounds();
 #endif
 

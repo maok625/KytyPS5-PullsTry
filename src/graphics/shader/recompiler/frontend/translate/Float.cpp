@@ -1,12 +1,46 @@
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 
 #include <array>
+#include <bit>
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
+IR::U32 Translator::ReadPackedF16(const Decoder::Operand& operand) {
+	// Without selectors or modifiers the lanes are the register's halves as they are.
+	if (operand.kind != Decoder::OperandKind::FloatInlineConstant && !operand.op_sel &&
+	    operand.op_sel_hi && !operand.negate && !operand.negate_hi && !operand.absolute &&
+	    operand.sdwa_sel == 6u) {
+		return ApplyBitSourceModifiers(operand, ReadRawU32(operand));
+	}
+	const auto low  = Read16LaneBits(operand, false);
+	const auto high = Read16LaneBits(operand, true);
+	return ir.BitwiseOr(low, ir.ShiftLeftLogical(high, IR::U32(IR::Value(16u))));
+}
+
 void Translator::PackedFloat16(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
                                bool accumulator, bool quiet_snan) {
+	// Addition, multiplication and FMA are packed operations of their own: the backend runs them
+	// on native FP16 when the host has it. The result modifiers and the NaN quieting of MIN/MAX
+	// still go lane by lane through F32.
+	const auto packed = opcode == IR::ValueOpcode::FPAdd32   ? IR::ValueOpcode::PackedFPAdd16
+	                    : opcode == IR::ValueOpcode::FPMul32 ? IR::ValueOpcode::PackedFPMul16
+	                    : opcode == IR::ValueOpcode::FPFma32 ? IR::ValueOpcode::PackedFPFma16
+	                                                         : IR::ValueOpcode::Void;
+	if (packed != IR::ValueOpcode::Void && !quiet_snan && !inst.dst.clamp && inst.dst.omod == 0u) {
+		const auto lhs = ReadPackedF16(inst.src0);
+		const auto rhs = ReadPackedF16(inst.src1);
+		auto       raw = DestinationOperand(inst);
+		raw.omod       = 0u;
+		raw.clamp      = false;
+		if (packed == IR::ValueOpcode::PackedFPFma16) {
+			const auto& third = accumulator ? inst.dst : inst.src2;
+			WriteOperand(raw, ir.Emit(packed, {lhs, rhs, ReadPackedF16(third)}));
+		} else {
+			WriteOperand(raw, ir.Emit(packed, {lhs, rhs}));
+		}
+		return;
+	}
 	const auto translate_lane = [&](bool high) {
 		const auto lhs = ReadF16LaneAsF32(inst.src0, high);
 		const auto rhs = ReadF16LaneAsF32(inst.src1, high);
@@ -116,6 +150,33 @@ void Translator::Float16Ternary(const Decoder::Instruction& inst, IR::ValueOpcod
 void Translator::FloatUnary(const Decoder::Instruction& inst, IR::ValueOpcode opcode) {
 	const auto type = IR::ArgTypeOf(opcode, 0);
 	WriteOperand(DestinationOperand(inst), ir.Emit(opcode, {ReadOperand(inst.src0, type)}));
+}
+
+void Translator::V_FRACT(const Decoder::Instruction& inst, IR::Type type) {
+	// x - floor(x) rounds to 1.0 for a tiny negative x; v_fract returns the largest value below
+	// one instead. The ordered compare lets NaN through.
+	const auto destination = DestinationOperand(inst);
+	if (type == IR::Type::F64) {
+		const auto result    = ir.Emit(IR::ValueOpcode::FPFract64, {ReadOperand(inst.src0, type)});
+		const auto below_one = ir.Emit(IR::ValueOpcode::BitCastF64U64,
+		                               {IR::Value(uint64_t {0x3fefffffffffffff})});
+		const auto above     = ir.Emit(IR::ValueOpcode::FPOrdGreaterThan64, {result, below_one});
+		WriteOperand(destination, ir.Emit(IR::ValueOpcode::SelectF64, {above, below_one, result}));
+		return;
+	}
+	const bool half   = type == IR::Type::F16;
+	const auto source = half ? ReadF16AsF32(inst.src0) : IR::F32(ReadOperand(inst.src0, type));
+	const auto result = IR::F32(ir.Emit(IR::ValueOpcode::FPFract32, {source}));
+	// Clamp in the destination precision: 0x3f7fe000 is the half 0x3bff.
+	const auto below_one =
+	    IR::F32(IR::Value::F32(std::bit_cast<float>(half ? 0x3f7fe000u : 0x3f7fffffu)));
+	const auto above   = IR::U1(ir.Emit(IR::ValueOpcode::FPOrdGreaterThan32, {result, below_one}));
+	const auto clamped = SelectF32(above, below_one, result);
+	if (half) {
+		WriteF16(destination, clamped);
+	} else {
+		WriteOperand(destination, clamped);
+	}
 }
 
 void Translator::FloatBinary(const Decoder::Instruction& inst, IR::ValueOpcode opcode,

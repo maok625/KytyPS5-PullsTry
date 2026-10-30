@@ -216,6 +216,8 @@ uint32_t* KYTY_SYSV_ABI AgcAcbWaitRegMem(CommandBuffer* buf, uint8_t size, uint8
                                          uint8_t cache_policy, const volatile void* address,
                                          uint64_t reference, uint64_t mask, uint32_t poll_cycles);
 uint64_t KYTY_SYSV_ABI  AgcAcbWaitOnAddressGetSize(uint8_t size);
+uint32_t* KYTY_SYSV_ABI AgcAcbMemSemaphore(CommandBuffer* buf, const volatile void* address,
+                                           uint8_t mailbox, uint8_t signal_type, uint8_t op);
 uint32_t* KYTY_SYSV_ABI AgcAcbDmaData(CommandBuffer* buf, uint8_t dst, uint8_t dst_cache_policy,
                                       uint64_t dst_address_or_offset, uint8_t src,
                                       uint8_t  src_cache_policy,
@@ -307,6 +309,16 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetFlip(CommandBuffer* buf, uint32_t video_out_han
 } // namespace Gen5
 
 namespace Gen5Driver {
+
+// The guest address of the driver's direct memory. Games get it from the system table, not from
+// a constant. On macOS under Rosetta 2 the guest's system-reserved range ends at 0x0fbfffffff
+// (see memoryAddressSpace.inc), so the block is at the top of that range there.
+#if defined(__APPLE__) && (defined(__x86_64__) || defined(_M_X64))
+inline constexpr uint64_t DriverDmemBase = 0x0fbfe00000ull;
+#else
+inline constexpr uint64_t DriverDmemBase = 0x0fe0000000ull;
+#endif
+inline constexpr uint32_t DriverDmemSize = 0x200000;
 
 int Initialize();
 
