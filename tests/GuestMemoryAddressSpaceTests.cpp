@@ -43,7 +43,7 @@ int main() {
 
 	CheckStatus(memory.Reserve(GuestBase, 0x8000), GuestMemoryStatus::Success,
 	            "guest reservation failed");
-	CheckStatus(memory.Reserve(GuestBase, GuestPage), GuestMemoryStatus::AddressAlreadyMapped,
+	CheckStatus(memory.Reserve(GuestBase, GuestPage), GuestMemoryStatus::AddressAlreadyReserved,
 	            "overlapping reservation was accepted");
 	CheckStatus(memory.Map(GuestBase, backing, 1, GuestPage,
 	                       GuestMemoryPermission::CpuRead),
