@@ -1,4 +1,7 @@
+#include <mach/error.h>
 #include <mach/mach.h>
+#include <mach/mach_host.h>
+#include <mach/mach_init.h>
 #include <mach/mach_vm.h>
 #include <mach/vm_map.h>
 #include <mach/vm_region.h>
