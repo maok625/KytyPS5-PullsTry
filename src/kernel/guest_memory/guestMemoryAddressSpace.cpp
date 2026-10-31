@@ -151,12 +151,12 @@ GuestMemoryStatus GuestMemoryModel::Reserve(GuestVirtualAddress guest_base,
 	const auto end = guest_base + size;
 	auto next = m_reservations.lower_bound(guest_base);
 	if (next != m_reservations.end() && next->first < end) {
-		return GuestMemoryStatus::AddressAlreadyMapped;
+		return GuestMemoryStatus::AddressAlreadyReserved;
 	}
 	if (next != m_reservations.begin()) {
 		const auto previous = std::prev(next);
 		if (previous->first + previous->second > guest_base) {
-			return GuestMemoryStatus::AddressAlreadyMapped;
+			return GuestMemoryStatus::AddressAlreadyReserved;
 		}
 	}
 	try {
@@ -399,6 +399,7 @@ GuestMemoryStatus GuestMemoryModel::Translate(GuestVirtualAddress guest_address,
 	    AddOverflows(guest_address, minimum_size)) {
 		return GuestMemoryStatus::InvalidArgument;
 	}
+	*out = {};
 	std::lock_guard lock(m_mutex);
 	auto mapping = FindMappingUnlocked(guest_address);
 	if (mapping == m_mappings.end()) {
