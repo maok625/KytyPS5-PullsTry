@@ -45,6 +45,9 @@ int main() {
 	            "guest reservation failed");
 	CheckStatus(memory.Reserve(GuestBase, GuestPage), GuestMemoryStatus::AddressAlreadyMapped,
 	            "overlapping reservation was accepted");
+	CheckStatus(memory.Map(GuestBase, backing, 1, GuestPage,
+	                       GuestMemoryPermission::CpuRead),
+	            GuestMemoryStatus::InvalidAlignment, "unaligned backing offset was accepted");
 	CheckStatus(memory.Map(GuestBase, backing, 0, BackingSize,
 	                       GuestMemoryPermission::CpuRead | GuestMemoryPermission::CpuWrite |
 	                           GuestMemoryPermission::GpuRead),
@@ -71,9 +74,28 @@ int main() {
 	                             GuestMemoryPermission::GpuWrite, &denied_translation),
 	            GuestMemoryStatus::PermissionDenied, "alias allowed GPU writes without permission");
 
+	// A partial unmap must split one mapping while preserving both surviving sides.
+	constexpr GuestVirtualAddress AdjacentBase = GuestBase + 0x10000;
+	CheckStatus(memory.Reserve(AdjacentBase, 3 * GuestPage), GuestMemoryStatus::Success,
+	            "partial-unmap reservation failed");
+	const auto read_write = GuestMemoryPermission::CpuRead | GuestMemoryPermission::CpuWrite;
+	CheckStatus(memory.Map(AdjacentBase, backing, 0, BackingSize, read_write),
+	            GuestMemoryStatus::Success, "partial-unmap source mapping failed");
+	CheckStatus(memory.Unmap(AdjacentBase + GuestPage, GuestPage), GuestMemoryStatus::Success,
+	            "middle-page partial unmap failed");
+	CheckStatus(memory.Write(AdjacentBase, &marker, sizeof(marker)), GuestMemoryStatus::Success,
+	            "left side of split mapping was lost");
+	CheckStatus(memory.Write(AdjacentBase + 2 * GuestPage, &marker, sizeof(marker)),
+	            GuestMemoryStatus::Success, "right side of split mapping was lost");
+	CheckStatus(memory.Unmap(AdjacentBase, GuestPage), GuestMemoryStatus::Success,
+	            "left side cleanup after split failed");
+	CheckStatus(memory.Unmap(AdjacentBase + 2 * GuestPage, GuestPage),
+	            GuestMemoryStatus::Success, "right side cleanup after split failed");
+	CheckStatus(memory.ReleaseReservation(AdjacentBase, 3 * GuestPage),
+	            GuestMemoryStatus::Success, "partial-unmap reservation cleanup failed");
+
 	// Two adjacent virtual mappings to consecutive offsets in one backing object
 	// must behave as one contiguous guest byte range.
-	constexpr GuestVirtualAddress AdjacentBase = GuestBase + 0x10000;
 	CheckStatus(memory.Reserve(AdjacentBase, 2 * GuestPage), GuestMemoryStatus::Success,
 	            "adjacent-range reservation failed");
 	CheckStatus(memory.Map(AdjacentBase, backing, 0, GuestPage,
