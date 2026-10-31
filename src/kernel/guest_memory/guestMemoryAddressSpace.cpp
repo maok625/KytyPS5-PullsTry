@@ -246,6 +246,9 @@ GuestMemoryStatus GuestMemoryModel::Map(GuestVirtualAddress guest_base, GuestBac
 	    (size & (m_guest_page_size - 1)) != 0) {
 		return GuestMemoryStatus::InvalidAlignment;
 	}
+	if (m_guest_page_size == 0 || (backing_offset & (m_guest_page_size - 1)) != 0) {
+		return GuestMemoryStatus::InvalidAlignment;
+	}
 	if (AddOverflows(backing_offset, size)) {
 		return GuestMemoryStatus::BackingRangeOutOfBounds;
 	}
