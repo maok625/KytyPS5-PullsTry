@@ -655,6 +655,20 @@ add_executable(guest_memory_map_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/kernel/guestMemoryMap.cpp")
 target_include_directories(guest_memory_map_tests PRIVATE "${KYTY_SOURCE_DIR}")
 
+# The alias-capable memory model is a test-only reference implementation. It is
+# deliberately not linked into the live emulator yet.
+add_executable(guest_memory_address_space_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/GuestMemoryAddressSpaceTests.cpp"
+	"${KYTY_SOURCE_DIR}/kernel/guest_memory/guestMemoryAddressSpace.cpp")
+target_include_directories(guest_memory_address_space_tests PRIVATE "${KYTY_SOURCE_DIR}")
+
+# Safe, diagnostic-only probe for the macOS host VM layout. It never overwrites
+# an existing mapping and runs its fixed-address attempt in a child process.
+if(APPLE)
+	add_executable(macos_guest_address_probe EXCLUDE_FROM_ALL
+		"${KYTY_TESTS_DIR}/macosGuestAddressProbe.cpp")
+endif()
+
 # These tests use exceptions.
 if(NOT KYTY_CLANG_CL)
 	foreach(kyty_exception_test scalar_provenance_tests resource_tracking_tests
@@ -732,6 +746,8 @@ if(BUILD_TESTING)
 	add_test(NAME virtual_memory_allocation
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests>)
 	add_test(NAME guest_memory_map COMMAND $<TARGET_FILE:guest_memory_map_tests>)
+	add_test(NAME guest_memory_address_space
+		COMMAND $<TARGET_FILE:guest_memory_address_space_tests>)
 	add_test(NAME trinity_mode
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --trinity-only)
 	add_test(NAME psml COMMAND $<TARGET_FILE:psml_tests>)
@@ -803,6 +819,7 @@ if(BUILD_TESTING)
 		sync_on_address_tests
 		shader_recompiler_compute_tests
 		guest_memory_map_tests
+		guest_memory_address_space_tests
 		virtual_memory_allocation_tests
 		audio_out2_port_tests
 		audio_out_timing_tests
@@ -820,6 +837,13 @@ if(BUILD_TESTING)
 		save_data_dialog_tests
 		http_uri_parse_tests
 	)
+endif()
+
+# Diagnostic probe for the M4/macOS guest-address mapping constraints.
+if(APPLE AND BUILD_TESTING)
+	add_test(NAME macos_guest_address_probe
+		COMMAND $<TARGET_FILE:macos_guest_address_probe>)
+	add_dependencies(kyty_tests macos_guest_address_probe)
 endif()
 
 # Test Darwin signal-context restoration for SSE4a instructions.
