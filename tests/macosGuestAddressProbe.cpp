@@ -22,7 +22,7 @@ namespace {
 
 constexpr mach_vm_address_t ProbeAddress = 0x15b1400000ull;
 
-uint64_t ReadHostPageSize() {
+uint64_t ReadSysctlPageSize() {
 	uint64_t value = 0;
 	size_t size = sizeof(value);
 	if (sysctlbyname("hw.pagesize", &value, &size, nullptr, 0) != 0) {
@@ -136,7 +136,10 @@ int main() {
 	}
 	PrintArchitecture();
 
-	const uint64_t sysctl_page_size = ReadHostPageSize();
+	const uint64_t sysctl_page_size = ReadSysctlPageSize();
+	// host_page_size() is the authoritative granularity for Mach VM operations.
+	// hw.pagesize is reported separately because it can differ on some macOS
+	// runner configurations (for example, x86_64 CI).
 	vm_size_t mach_page_size = 0;
 	const kern_return_t mach_page_result = host_page_size(mach_host_self(), &mach_page_size);
 	std::printf("sysctl_hw_pagesize=%" PRIu64 "\n", sysctl_page_size);
@@ -147,10 +150,14 @@ int main() {
 		std::printf("mach_host_page_size_error=%s (%d)\n",
 		            mach_error_string(mach_page_result), mach_page_result);
 	}
-	if (sysctl_page_size == 0 || mach_page_result != KERN_SUCCESS ||
-	    sysctl_page_size != static_cast<uint64_t>(mach_page_size)) {
-		std::fprintf(stderr, "host page-size sources disagree or are unavailable\n");
+	if (mach_page_result != KERN_SUCCESS || mach_page_size == 0) {
+		std::fprintf(stderr, "Mach host page size is unavailable\n");
 		return 2;
+	}
+	if (sysctl_page_size == 0) {
+		std::printf("sysctl_page_size_status=unavailable; using Mach host page size\n");
+	} else if (sysctl_page_size != static_cast<uint64_t>(mach_page_size)) {
+		std::printf("page_size_sources_differ=using_mach_host_page_size\n");
 	}
 
 	std::fflush(stdout);
@@ -160,7 +167,7 @@ int main() {
 		return 2;
 	}
 	if (child == 0) {
-		const int result = RunFixedAddressProbe(sysctl_page_size);
+		const int result = RunFixedAddressProbe(static_cast<uint64_t>(mach_page_size));
 		std::fflush(stdout);
 		_exit(result);
 	}
