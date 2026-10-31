@@ -78,7 +78,7 @@ void PrintTargetRegionState() {
 }
 
 int RunFixedAddressProbe(uint64_t expected_page_size) {
-	mach_vm_size_t vm_page_size = 0;
+	vm_size_t vm_page_size = 0;
 	const kern_return_t page_result = host_page_size(mach_host_self(), &vm_page_size);
 	if (page_result != KERN_SUCCESS || vm_page_size == 0) {
 		std::fprintf(stderr, "host_page_size failed: %s (%d)\n",
@@ -137,7 +137,7 @@ int main() {
 	PrintArchitecture();
 
 	const uint64_t sysctl_page_size = ReadHostPageSize();
-	mach_vm_size_t mach_page_size = 0;
+	vm_size_t mach_page_size = 0;
 	const kern_return_t mach_page_result = host_page_size(mach_host_self(), &mach_page_size);
 	std::printf("sysctl_hw_pagesize=%" PRIu64 "\n", sysctl_page_size);
 	if (mach_page_result == KERN_SUCCESS) {
