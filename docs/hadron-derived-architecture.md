@@ -107,9 +107,14 @@ A translation returns the first contiguous backing span only. Callers loop when 
 a mapping boundary. Aliasing is represented by mapping the same backing identifier/offset at
 multiple guest virtual addresses.
 
-The initial API contract is in
-`src/kernel/guest_memory/guestMemoryAddressSpace.h`. It is intentionally abstract: it does not
-pick a page size, host mapping mechanism or storage container before those decisions are tested.
+The interfaces and initial reference implementation are in
+`src/kernel/guest_memory/guestMemoryAddressSpace.h` and
+`src/kernel/guest_memory/guestMemoryAddressSpace.cpp`. `GuestMemoryModel` stores bytes in
+host-owned vectors and uses guest addresses only as map keys. It supports shared backing aliases,
+partial unmap/protect, permissions and map generations. It is deliberately a correctness-first
+test model, not a performant physical-memory backend or a drop-in replacement for
+`GuestBackingStore`. The guest page size is supplied explicitly by the caller; it is not
+automatically set to the host page size.
 
 ### D. Guest access facade and consumers
 
@@ -157,15 +162,18 @@ software expecting smaller guest pages. Our GTA-related test address `0x15b14000
 that numeric range. This is strong supporting evidence for the direction of our investigation,
 not proof that every M4/macOS build behaves identically.
 
-Add a small, non-destructive host capability probe that records:
-- `uname -m`, macOS version and `sysctl -n hw.pagesize`;
-- actual host page size from the VM API;
-- success/failure and returned address for a non-overwriting fixed-map probe in a child process;
-- whether a requested address was honoured, relocated or rejected;
-- map/protect/unmap errors and exact requested ranges.
+`tests/macosGuestAddressProbe.cpp` is the first diagnostic probe. It records:
+- process architecture and macOS kernel release;
+- host page size from sysctl and Mach;
+- the region state around `0x15b1400000`;
+- the result of a fixed Mach VM allocation at that address from a child process.
 
-Never use `MAP_FIXED` in a diagnostic probe if it could overwrite an existing mapping. Run risky
-address-space experiments in a child process and deallocate every successful probe mapping.
+The allocation uses `VM_FLAGS_FIXED` without `VM_FLAGS_OVERWRITE`; XNU documents the latter as
+the flag that permits replacing existing mappings. Successful allocations are deallocated before
+the child exits. The probe does not use `MAP_FIXED` and does not alter Kyty's allocator.
+
+It only classifies one exact mapping request. Run additional probes only when needed, keep them
+in child processes, and deallocate every successful mapping.
 
 ## Explicitly out of scope for this scaffold
 
