@@ -395,11 +395,13 @@ GuestMemoryStatus GuestMemoryModel::Translate(GuestVirtualAddress guest_address,
                                               GuestMemorySize minimum_size,
                                               GuestMemoryPermission required,
                                               GuestMemoryTranslation* out) const {
-	if (out == nullptr || guest_address == 0 || minimum_size == 0 ||
-	    AddOverflows(guest_address, minimum_size)) {
+	if (out == nullptr) {
 		return GuestMemoryStatus::InvalidArgument;
 	}
 	*out = {};
+	if (guest_address == 0 || minimum_size == 0 || AddOverflows(guest_address, minimum_size)) {
+		return GuestMemoryStatus::InvalidArgument;
+	}
 	std::lock_guard lock(m_mutex);
 	auto mapping = FindMappingUnlocked(guest_address);
 	if (mapping == m_mappings.end()) {
