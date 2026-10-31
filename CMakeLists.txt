@@ -334,6 +334,13 @@ list(APPEND kyty_emulator_src
 )
 list(REMOVE_DUPLICATES kyty_emulator_src)
 
+# The original guest-memory map is a standalone experiment, not part of Kyty's
+# live memory implementation. Keep it in its focused test target below; adding
+# it to kyty_emulator would compile it with the emulator's -fno-exceptions flags.
+list(REMOVE_ITEM kyty_emulator_src
+	"${KYTY_SOURCE_DIR}/kernel/guestMemoryMap.cpp"
+	"${KYTY_SOURCE_DIR}/kernel/guestMemoryMap.h")
+
 if (KYTY_CLANG_CL)
 	set_source_files_properties(${kyty_emulator_src} PROPERTIES COMPILE_FLAGS "-Wno-pragma-pack -Wno-deprecated-declarations -D_TIMESPEC_DEFINED")
 endif()
