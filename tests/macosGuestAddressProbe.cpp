@@ -2,6 +2,7 @@
 #include <mach/mach_vm.h>
 #include <mach/vm_map.h>
 #include <mach/vm_region.h>
+#include <mach/vm_statistics.h>
 #include <sys/sysctl.h>
 #include <sys/types.h>
 #include <sys/utsname.h>
@@ -149,6 +150,7 @@ int main() {
 		return 2;
 	}
 
+	std::fflush(stdout);
 	const pid_t child = fork();
 	if (child < 0) {
 		std::perror("fork");
