@@ -50,6 +50,7 @@ enum class GuestMemoryStatus : uint8_t {
 	InvalidArgument,
 	InvalidAlignment,
 	AddressAlreadyMapped,
+	AddressAlreadyReserved,
 	AddressNotReserved,
 	AddressNotMapped,
 	AddressStillMapped,
