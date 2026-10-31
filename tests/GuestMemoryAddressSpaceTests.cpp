@@ -63,6 +63,47 @@ int main() {
 
 	CheckStatus(memory.Write(AliasBase + 0x118, &marker, sizeof(marker)),
 	            GuestMemoryStatus::PermissionDenied, "read-only alias allowed a CPU write");
+	GuestMemoryTranslation denied_translation {};
+	CheckStatus(memory.Translate(AliasBase + 0x118, sizeof(marker),
+	                             GuestMemoryPermission::CpuExecute, &denied_translation),
+	            GuestMemoryStatus::PermissionDenied, "alias allowed CPU execution without permission");
+	CheckStatus(memory.Translate(AliasBase + 0x118, sizeof(marker),
+	                             GuestMemoryPermission::GpuWrite, &denied_translation),
+	            GuestMemoryStatus::PermissionDenied, "alias allowed GPU writes without permission");
+
+	// Two adjacent virtual mappings to consecutive offsets in one backing object
+	// must behave as one contiguous guest byte range.
+	constexpr GuestVirtualAddress AdjacentBase = GuestBase + 0x10000;
+	CheckStatus(memory.Reserve(AdjacentBase, 2 * GuestPage), GuestMemoryStatus::Success,
+	            "adjacent-range reservation failed");
+	CheckStatus(memory.Map(AdjacentBase, backing, 0, GuestPage,
+	                       GuestMemoryPermission::CpuRead | GuestMemoryPermission::CpuWrite),
+	            GuestMemoryStatus::Success, "first adjacent mapping failed");
+	CheckStatus(memory.Map(AdjacentBase + GuestPage, backing, GuestPage, GuestPage,
+	                       GuestMemoryPermission::CpuRead | GuestMemoryPermission::CpuWrite),
+	            GuestMemoryStatus::Success, "second adjacent mapping failed");
+	const std::array<uint8_t, 8> boundary_bytes {9, 8, 7, 6, 5, 4, 3, 2};
+	std::array<uint8_t, 8> boundary_result {};
+	CheckStatus(memory.Write(AdjacentBase + GuestPage - 4, boundary_bytes.data(),
+	                         boundary_bytes.size()),
+	            GuestMemoryStatus::Success, "write across adjacent mappings failed");
+	CheckStatus(memory.Read(AdjacentBase + GuestPage - 4, boundary_result.data(),
+	                        boundary_result.size()),
+	            GuestMemoryStatus::Success, "read across adjacent mappings failed");
+	Check(boundary_result == boundary_bytes, "adjacent mapping read-back differs");
+	GuestMemoryTranslation adjacent_translation {};
+	CheckStatus(memory.Translate(AdjacentBase + GuestPage - 4, boundary_bytes.size(),
+	                             GuestMemoryPermission::CpuRead, &adjacent_translation),
+	            GuestMemoryStatus::Success, "translation did not span compatible adjacent maps");
+	Check(adjacent_translation.contiguous_size >= boundary_bytes.size(),
+	      "adjacent translation did not combine contiguous backing offsets");
+	CheckStatus(memory.Unmap(AdjacentBase, GuestPage), GuestMemoryStatus::Success,
+	            "first adjacent mapping cleanup failed");
+	CheckStatus(memory.Unmap(AdjacentBase + GuestPage, GuestPage), GuestMemoryStatus::Success,
+	            "second adjacent mapping cleanup failed");
+	CheckStatus(memory.ReleaseReservation(AdjacentBase, 2 * GuestPage),
+	            GuestMemoryStatus::Success, "adjacent-range reservation cleanup failed");
+
 	GuestMemoryTranslation translation {};
 	CheckStatus(memory.Translate(AliasBase + 0x118, sizeof(marker),
 	                             GuestMemoryPermission::GpuRead, &translation),
