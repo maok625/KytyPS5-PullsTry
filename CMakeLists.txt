@@ -648,6 +648,13 @@ target_include_directories(psml_tests PRIVATE ${inc_headers})
 target_compile_definitions(virtual_memory_allocation_tests PRIVATE
 	KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS=1)
 
+# Experimental guest-to-host memory translation is kept independent of the emulator
+# until its behavior has been validated on each supported host platform.
+add_executable(guest_memory_map_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/GuestMemoryMapTests.cpp"
+	"${KYTY_SOURCE_DIR}/kernel/guestMemoryMap.cpp")
+target_include_directories(guest_memory_map_tests PRIVATE "${KYTY_SOURCE_DIR}")
+
 # These tests use exceptions.
 if(NOT KYTY_CLANG_CL)
 	foreach(kyty_exception_test scalar_provenance_tests resource_tracking_tests
@@ -724,6 +731,7 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-offset-only)
 	add_test(NAME virtual_memory_allocation
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests>)
+	add_test(NAME guest_memory_map COMMAND $<TARGET_FILE:guest_memory_map_tests>)
 	add_test(NAME trinity_mode
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --trinity-only)
 	add_test(NAME psml COMMAND $<TARGET_FILE:psml_tests>)
@@ -794,6 +802,7 @@ if(BUILD_TESTING)
 		kernel_file_system_tests
 		sync_on_address_tests
 		shader_recompiler_compute_tests
+		guest_memory_map_tests
 		virtual_memory_allocation_tests
 		audio_out2_port_tests
 		audio_out_timing_tests
