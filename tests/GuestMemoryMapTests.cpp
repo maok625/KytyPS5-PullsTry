@@ -29,6 +29,7 @@ int main() {
 	Check(memory.IsMapped(GuestBase, GuestSize), "new mapping is not reported as mapped");
 	Check(!memory.Map(GuestBase + GuestMemoryMap::PageSize, GuestMemoryMap::PageSize),
 	      "overlapping mapping was accepted");
+	Check(!memory.Map(0, GuestMemoryMap::PageSize), "zero guest address was accepted");
 	Check(!memory.Map(GuestBase + 1, GuestMemoryMap::PageSize),
 	      "unaligned guest address was accepted");
 	Check(!memory.Map(GuestBase, GuestMemoryMap::PageSize + 1),
@@ -69,13 +70,13 @@ int main() {
 	const auto gap_start = second_region + GuestMemoryMap::PageSize;
 	Check(memory.Map(gap_start + GuestMemoryMap::PageSize, GuestMemoryMap::PageSize),
 	      "mapping after the test gap failed");
-	const uint32_t sentinel = 0xaabbccdd;
-	Check(memory.Write(second_region, &sentinel, sizeof(sentinel)), "sentinel setup failed");
 	const uint64_t spanning_gap = second_region + GuestMemoryMap::PageSize - 4;
+	const uint32_t sentinel = 0xaabbccdd;
+	Check(memory.Write(spanning_gap, &sentinel, sizeof(sentinel)), "sentinel setup failed");
 	Check(!memory.Write(spanning_gap, across_mappings.data(), across_mappings.size()),
 	      "write spanning an unmapped gap unexpectedly succeeded");
 	uint32_t sentinel_after = 0;
-	Check(memory.Read(second_region, &sentinel_after, sizeof(sentinel_after)),
+	Check(memory.Read(spanning_gap, &sentinel_after, sizeof(sentinel_after)),
 	      "could not read sentinel after failed write");
 	Check(sentinel_after == sentinel, "failed write partially modified mapped memory");
 
