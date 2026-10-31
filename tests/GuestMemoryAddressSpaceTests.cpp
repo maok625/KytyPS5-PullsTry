@@ -174,7 +174,6 @@ int main() {
 	            GuestMemoryStatus::Success, "second backing allocation failed");
 	CheckStatus(memory.Reserve(GuestBase, 3 * GuestPage), GuestMemoryStatus::Success,
 	            "second reservation failed");
-	const auto read_write = GuestMemoryPermission::CpuRead | GuestMemoryPermission::CpuWrite;
 	CheckStatus(memory.Map(GuestBase, second_backing, 0, GuestPage, read_write),
 	            GuestMemoryStatus::Success, "first page mapping failed");
 	CheckStatus(memory.Map(GuestBase + 2 * GuestPage, second_backing, GuestPage, GuestPage,
