@@ -116,9 +116,8 @@ bool MacOSHostAddressArena::MapShared(uint64_t arena_offset, int backing_fd,
 	                          MAP_SHARED | MAP_FIXED, backing_fd,
 	                          static_cast<off_t>(backing_offset));
 	if (mapped == MAP_FAILED || mapped != address) {
-		// Keep the arena owned even when a file view could not be installed.
-		(void)mmap(address, static_cast<size_t>(size), PROT_NONE,
-		           MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
+		// A failed MAP_FIXED call leaves the previous view in place. Do not
+		// replace it with a placeholder because this arena is shared by all maps.
 		return false;
 	}
 	return true;

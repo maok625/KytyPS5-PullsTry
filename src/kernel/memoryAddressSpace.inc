@@ -122,10 +122,12 @@ public:
 	                             std::shared_ptr<GuestMemory::MacOSGuestAddressSpace> extended_host_space
 #endif
 	                           )
-	    : m_size(size)
 #if defined(KYTY_MACOS_NATIVE_ARM64)
-	    , m_standard_host_space(std::move(standard_host_space))
+	    : m_standard_host_space(std::move(standard_host_space))
 	    , m_extended_host_space(std::move(extended_host_space))
+	    , m_size(size)
+#else
+	    : m_size(size)
 #endif
 	{
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -411,42 +413,8 @@ public:
 		}
 
 		std::lock_guard lock(m_mutex);
-		struct PreviousView {
-			uint64_t start;
-			uint64_t size;
-			uint64_t backing_offset;
-			VirtualMemory::Mode mode;
-		};
-		std::vector<PreviousView> previous_views;
-		const auto map_end = vaddr + size;
-		auto it = m_maps.upper_bound(vaddr);
-		if (it != m_maps.begin()) {
-			--it;
-		}
-		for (; it != m_maps.end() && it->second.vaddr < map_end; ++it) {
-			const auto& old = it->second;
-			const auto overlap_start = std::max(vaddr, old.vaddr);
-			const auto overlap_end = std::min(map_end, old.vaddr + old.size);
-			if (overlap_start >= overlap_end) {
-				continue;
-			}
-			previous_views.push_back({overlap_start, overlap_end - overlap_start,
-			                          old.backing_offset + overlap_start - old.vaddr, old.mode});
-		}
-		size_t unmapped = 0;
-		for (const auto& old: previous_views) {
-			if (!host_space->Unmap(old.start, old.size)) {
-				while (unmapped != 0) {
-					const auto& restore = previous_views[--unmapped];
-					EXIT_IF(!host_space->MapShared(
-					    restore.start, m_fd, restore.backing_offset, restore.size,
-					    ToHostMemoryProtection(restore.mode)));
-				}
-				SetFailure(failure_reason, FailureReason::FixedMapViewFailed);
-				return false;
-			}
-			++unmapped;
-		}
+		// MapShared replaced exactly this interval inside our permanently owned
+		// host arena. Update the guest-address bookkeeping after the host map succeeds.
 		RemoveMappingsUnlocked(vaddr, size);
 		EXIT_IF(!m_maps.emplace(
 		    vaddr, MapEntry {vaddr, size, backing_offset, mode}).second);
