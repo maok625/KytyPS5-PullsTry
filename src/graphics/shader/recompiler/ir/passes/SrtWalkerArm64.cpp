@@ -462,7 +462,7 @@ private:
 				const auto reg = RegIndex(inst.Arg(0).ScalarRegister());
 				if (reg < m_plan.user_data_base) return {};
 				const auto index = reg - m_plan.user_data_base;
-				if (index >= m_runtime.user_data.size()) return {};
+				if (index >= m_plan.user_data_count || index >= m_runtime.user_data.size()) return {};
 				return m_runtime.user_data[index];
 			}
 			case ValueOpcode::GetShaderBase:
