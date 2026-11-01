@@ -366,28 +366,12 @@ std::vector<WalkerOutput> CollectOutputs(const ResourcePlan& plan, std::span<con
 		outputs[index].gates.push_back(gate);
 	};
 	const auto& sources = plan.descriptor_sources;
-	std::vector<std::vector<uint32_t>> unused_gates(sources.size());
 	const auto consume = [&](uint32_t root) {
-		if (root >= sources.size()) return;
-		const auto& indirect = sources[root].indirect_descriptor;
-		if (!indirect) {
-			unused_gates[root].push_back(root);
-			return;
-		}
-		const auto add_source = [&](uint32_t source) {
-			if (source < sources.size()) unused_gates[source].push_back(root);
-		};
-		if (indirect->sources.empty()) {
-			add_source(indirect->table_source);
-			if (indirect->selector) {
-				add_source(indirect->selector->source);
-				if (indirect->selector->rows) add_source(indirect->selector->rows->source);
-			}
-		}
-		for (const auto source: indirect->sources) add_source(source);
-		add_output(indirect->key_count, root);
-		add_output(indirect->selector_first, root);
-		add_output(indirect->selector_mask, root);
+		if (root >= sources.size() || !sources[root].indirect_descriptor) return;
+		const auto& indirect = *sources[root].indirect_descriptor;
+		add_output(indirect.key_count, root);
+		add_output(indirect.selector_first, root);
+		add_output(indirect.selector_mask, root);
 	};
 	for (const auto& buffer: plan.info.buffers) consume(buffer.source);
 	for (const auto& image: plan.info.images) consume(image.source);
