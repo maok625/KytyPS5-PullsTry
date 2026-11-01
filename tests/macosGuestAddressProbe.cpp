@@ -337,7 +337,6 @@ int RunContiguousUserArenaProbes(uint64_t page_size) {
 
 
 int RunArenaBackingAliasProbe(uint64_t page_size) {
-	constexpr mach_vm_address_t arena_start = 0x0000007bec000000ull;
 	constexpr uint64_t gib = 1024ull * 1024ull * 1024ull;
 	constexpr mach_vm_size_t arena_size = 512ull * gib;
 	constexpr uint64_t first_offset = 0x01000000ull;
@@ -349,19 +348,21 @@ int RunArenaBackingAliasProbe(uint64_t page_size) {
 		return 2;
 	}
 
-	mach_vm_address_t arena = arena_start;
+	// Prefer a dynamically selected host VA. This is the behavior wanted by
+	// the ARM64 backend: reserve host space without assuming it equals a guest VA.
+	mach_vm_address_t arena = 0;
 	const kern_return_t reserve_result =
-	    mach_vm_allocate(mach_task_self(), &arena, arena_size, VM_FLAGS_FIXED);
-	if (reserve_result != KERN_SUCCESS || arena != arena_start) {
+	    mach_vm_allocate(mach_task_self(), &arena, arena_size, VM_FLAGS_ANYWHERE);
+	if (reserve_result != KERN_SUCCESS || arena == 0 || arena % page_size != 0) {
 		std::printf("arena_backing_alias_probe=skipped_reservation_unavailable\n");
 		std::printf("arena_backing_alias_reserve_result=%d message=%s\n",
 		            reserve_result, mach_error_string(reserve_result));
-		if (reserve_result == KERN_SUCCESS) {
+		if (reserve_result == KERN_SUCCESS && arena != 0) {
 			(void)mach_vm_deallocate(mach_task_self(), arena, arena_size);
 		}
 		return 0;
 	}
-	std::printf("arena_backing_alias_arena=reserved start=0x%016" PRIx64
+	std::printf("arena_backing_alias_arena=reserved_anywhere start=0x%016" PRIx64
 	            " size=%" PRIu64 "\n",
 	            static_cast<uint64_t>(arena), static_cast<uint64_t>(arena_size));
 
@@ -399,7 +400,7 @@ int RunArenaBackingAliasProbe(uint64_t page_size) {
 		} else {
 			backing = static_cast<uint8_t*>(mapped_backing);
 			const auto map_view = [&](uint64_t offset) -> void* {
-				void* address = reinterpret_cast<void*>(arena_start + offset);
+				void* address = reinterpret_cast<void*>(arena + offset);
 				void* mapped = mmap(address, page_size, PROT_READ | PROT_WRITE,
 				                    MAP_SHARED | MAP_FIXED, fd, 0);
 				if (mapped == MAP_FAILED || mapped != address) {
