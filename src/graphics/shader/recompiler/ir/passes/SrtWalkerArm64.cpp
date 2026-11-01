@@ -810,15 +810,16 @@ bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<ui
 	std::vector<uint8_t> reachable(plan.control_flow.size(), 0u);
 	if (!reachable.empty()) {
 		reachable[0] = 1u;
-		RuntimeEvaluator evaluator(plan, runtime, reachable, reads);
 		for (size_t pass = 0; pass <= plan.control_flow.size(); ++pass) {
-			evaluator.Reset();
+			std::vector<std::pair<uint64_t, uint64_t>> pass_reads;
+			RuntimeEvaluator pass_evaluator(plan, runtime, reachable,
+			                               reads != nullptr ? &pass_reads : nullptr);
 			bool changed = false;
 			for (uint32_t block = 0; block < plan.control_flow.size(); ++block) {
 				if (reachable[block] == 0u) continue;
 				const auto& successors = plan.control_flow[block].successors;
 				if (successors.empty()) continue;
-				const auto condition = evaluator.Evaluate(plan.control_flow[block].condition);
+				const auto condition = pass_evaluator.Evaluate(plan.control_flow[block].condition);
 				const auto mark = [&](uint32_t target) {
 					if (target >= reachable.size()) return false;
 					if (reachable[target] != 0u) return true;
@@ -834,7 +835,14 @@ bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<ui
 					}
 				}
 			}
-			if (!changed) break;
+			if (!changed) {
+				// Match the JIT's reset behavior: only capture reads from the stable, final
+				// reachability pass, not speculative reads from earlier passes.
+				if (reads != nullptr) {
+					reads->insert(reads->end(), pass_reads.begin(), pass_reads.end());
+				}
+				break;
+			}
 			if (pass == plan.control_flow.size()) return false;
 		}
 	}
