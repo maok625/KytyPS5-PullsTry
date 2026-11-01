@@ -126,6 +126,59 @@ int RunFixedAddressProbe(uint64_t expected_page_size) {
 	return exact ? 0 : 4;
 }
 
+
+int ProbeMachFixedRange(const char* label, mach_vm_address_t start,
+                        mach_vm_address_t end, uint64_t page_size) {
+	if (end <= start || page_size == 0 || start % page_size != 0 ||
+	    (end - start) % page_size != 0) {
+		std::fprintf(stderr, "%s has invalid page alignment or size\\n", label);
+		return 2;
+	}
+
+	const mach_vm_size_t size = end - start;
+	mach_vm_address_t actual = start;
+	const kern_return_t result =
+	    mach_vm_allocate(mach_task_self(), &actual, size, VM_FLAGS_FIXED);
+	if (result != KERN_SUCCESS) {
+		std::printf("%s=unavailable\\n", label);
+		std::printf("%s_start=0x%016" PRIx64 " size=%" PRIu64 "\\n",
+		            label, static_cast<uint64_t>(start), static_cast<uint64_t>(size));
+		std::printf("%s_mach_result=%d message=%s\\n",
+		            label, result, mach_error_string(result));
+		return 0; // A refused non-overwriting probe is diagnostic, not a test failure.
+	}
+
+	if (actual != start) {
+		std::fprintf(stderr, "%s returned an unexpected address\\n", label);
+		const kern_return_t cleanup = mach_vm_deallocate(mach_task_self(), actual, size);
+		return cleanup == KERN_SUCCESS ? 4 : 3;
+	}
+
+	std::printf("%s=available\\n", label);
+	std::printf("%s_start=0x%016" PRIx64 " size=%" PRIu64 "\\n",
+	            label, static_cast<uint64_t>(start), static_cast<uint64_t>(size));
+	const kern_return_t cleanup = mach_vm_deallocate(mach_task_self(), actual, size);
+	if (cleanup != KERN_SUCCESS) {
+		std::fprintf(stderr, "%s cleanup failed: %s (%d)\\n",
+		             label, mach_error_string(cleanup), cleanup);
+		return 3;
+	}
+	std::printf("%s_cleanup=success\\n", label);
+	return 0;
+}
+
+int RunCandidateRegionProbes(uint64_t page_size) {
+	// These are the macOS x86_64 layout boundaries already defined by Kyty.
+	// Probe them without overwrite before considering their use on native ARM64.
+	const int system_result = ProbeMachFixedRange(
+	    "candidate_system_region", 0x0000040000ull, 0x0fc0000000ull, page_size);
+	if (system_result != 0) {
+		return system_result;
+	}
+	return ProbeMachFixedRange(
+	    "candidate_user_region", 0x7000000000ull, 0xfc00000000ull, page_size);
+}
+
 } // namespace
 
 int main() {
@@ -167,7 +220,10 @@ int main() {
 		return 2;
 	}
 	if (child == 0) {
-		const int result = RunFixedAddressProbe(static_cast<uint64_t>(mach_page_size));
+		int result = RunFixedAddressProbe(static_cast<uint64_t>(mach_page_size));
+		if (result == 0) {
+			result = RunCandidateRegionProbes(static_cast<uint64_t>(mach_page_size));
+		}
 		std::fflush(stdout);
 		_exit(result);
 	}
