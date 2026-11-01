@@ -105,7 +105,13 @@ elseif(CLANG OR GCC)
 	else()
 		set(KYTY_CPP_FLAGS "${KYTY_CPP_FLAGS} -fno-exceptions -fdiagnostics-color=always -finput-charset=UTF-8 -fexec-charset=UTF-8 -static-libgcc -static-libstdc++ -g -fno-strict-aliasing -fno-omit-frame-pointer -Wall -Wno-unused-value -fmessage-length=0")
 	endif()
-	set(KYTY_CPP_FLAGS "${KYTY_CPP_FLAGS} -march=x86-64-v3 -ffp-contract=off")
+	if(APPLE AND (CMAKE_OSX_ARCHITECTURES STREQUAL "arm64" OR
+    	(NOT CMAKE_OSX_ARCHITECTURES AND
+     	 CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)$")))
+    	set(KYTY_CPP_FLAGS "${KYTY_CPP_FLAGS} -ffp-contract=off")
+	else()
+    	set(KYTY_CPP_FLAGS "${KYTY_CPP_FLAGS} -march=x86-64-v3 -ffp-contract=off")
+	endif()
 	
     if(KYTY_WARNINGS_ARE_ERRORS)
         #set(KYTY_CPP_FLAGS "${KYTY_CPP_FLAGS} -Werror")
