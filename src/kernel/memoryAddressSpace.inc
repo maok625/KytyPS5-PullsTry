@@ -591,12 +591,8 @@ public:
 			return false;
 		}
 		*host_address = nullptr;
-		MapEntry entry {};
-		{
-			std::shared_lock lock(m_mutex);
-			if (!FindContainingUnlocked(vaddr, size, &entry)) {
-				return false;
-			}
+		if (!Contains(vaddr, size)) {
+			return false;
 		}
 #if defined(KYTY_MACOS_NATIVE_ARM64)
 		auto host_space = FindHostSpaceForRange(
@@ -1164,16 +1160,23 @@ public:
 	bool TranslateToHost(uint64_t vaddr, uint64_t size, void** host_address) {
 		if (host_address == nullptr) return false;
 		*host_address = nullptr;
-		std::shared_lock lock(m_mutex);
-		auto next = m_mapped.upper_bound(vaddr);
-		if (next == m_mapped.begin()) return false;
-		const auto& region = std::prev(next)->second;
-		if (vaddr < region.vaddr || size == 0 || UINT64_MAX - vaddr < size ||
-		    size > region.vaddr + region.size - vaddr) return false;
-#if defined(KYTY_MACOS_NATIVE_ARM64)
-		if (region.type == MappingType::Backing) {
-			return m_backing->TranslateToHost(vaddr, size, host_address);
+		if (host_address == nullptr || size == 0 || UINT64_MAX - vaddr < size) {
+			return false;
 		}
+		*host_address = nullptr;
+		{
+			std::shared_lock lock(m_mutex);
+			auto current = vaddr;
+			const auto end = vaddr + size;
+			while (current < end) {
+				const auto it = FindMappedContainingUnlocked(current);
+				if (it == m_mapped.end()) {
+					return false;
+				}
+				current = std::min(end, it->second.vaddr + it->second.size);
+			}
+		}
+#if defined(KYTY_MACOS_NATIVE_ARM64)
 		auto host_space = FindHostSpaceForRange(
 		    m_standard_host_space, m_extended_host_space, vaddr, size);
 		return host_space != nullptr &&
@@ -1410,15 +1413,17 @@ private:
 		}};
 
 #if defined(KYTY_MACOS_NATIVE_ARM64)
-		for (const auto& [start, end]: regions) {
-			const auto aligned_start = AlignUp(start, PageSize());
-			const auto aligned_end = AlignDown(end, PageSize());
-			if (aligned_start == 0 || aligned_end <= aligned_start) {
-				continue;
-			}
-			AddFreeUnlocked(aligned_start, aligned_end - aligned_start);
-			m_owned.emplace_back(aligned_start, aligned_end - aligned_start);
-		}
+		// The system-managed/reserved and user intervals are adjacent on native
+		// Apple Silicon. Track their combined span as one logical owned range so
+		// reads/writes may cross that boundary without false ownership failures.
+		const auto standard_start = static_cast<uint64_t>(HOST_SYSTEM_MANAGED_MIN);
+		const auto standard_end = HOST_USER_MAX + 1u;
+		AddFreeUnlocked(standard_start, standard_end - standard_start);
+		m_owned.emplace_back(standard_start, standard_end - standard_start);
+
+		const auto extended_start = kExtendedMemoryBase;
+		AddFreeUnlocked(extended_start, kExtendedMemorySize);
+		m_owned.emplace_back(extended_start, kExtendedMemorySize);
 #elif KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		constexpr uint64_t MinimumRegionSize = 0x1000000;
 		const auto         process           = GetCurrentProcess();

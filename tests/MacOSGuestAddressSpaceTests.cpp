@@ -129,6 +129,41 @@ int main() {
 	Check(address_space.Release(), "guest address-space release failed");
 	Check(!address_space.IsReserved(), "guest address space remained reserved after release");
 
+#if defined(__aarch64__) || defined(__arm64__)
+	// This mirrors the two persistent arenas used by the live allocator.
+	// Reservation consumes virtual address space only, not 1.5 TiB of RAM.
+	{
+		constexpr uint64_t StandardBase = 0x0000040000ull;
+		constexpr uint64_t StandardEnd = 0xfc00000000ull;
+		constexpr uint64_t ExtendedBase = 0x080000000000ull;
+		constexpr uint64_t ExtendedSize = 512ull * 1024ull * 1024ull * 1024ull;
+		MacOSGuestAddressSpace standard;
+		MacOSGuestAddressSpace extended;
+
+		Check(standard.Reserve(StandardBase, StandardEnd - StandardBase),
+		      "persistent standard host arena reservation failed");
+		Check(extended.Reserve(ExtendedBase, ExtendedSize),
+		      "persistent extended host arena reservation failed");
+		Check(standard.HostBase() != extended.HostBase(),
+		      "standard and extended host arenas unexpectedly share a base");
+
+		void* base_pointer = nullptr;
+		void* interior_pointer = nullptr;
+		const uint64_t guest_offset = 0x15b1400000ull - StandardBase;
+		Check(standard.TranslateToHost(StandardBase, standard.PageSize(), &base_pointer),
+		      "persistent standard arena base translation failed");
+		Check(standard.TranslateToHost(StandardBase + guest_offset,
+		                               standard.PageSize(), &interior_pointer),
+		      "persistent standard arena interior translation failed");
+		Check(reinterpret_cast<uintptr_t>(interior_pointer) ==
+		          reinterpret_cast<uintptr_t>(base_pointer) + guest_offset,
+		      "persistent standard arena lost guest-relative pointer continuity");
+		Check(extended.IsReserved(), "persistent extended arena was not retained");
+		Check(extended.Release(), "persistent extended arena release failed");
+		Check(standard.Release(), "persistent standard arena release failed");
+	}
+#endif
+
 	std::puts("MacOSGuestAddressSpaceTests: all tests passed");
 	return 0;
 }
