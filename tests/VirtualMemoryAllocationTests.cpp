@@ -5845,17 +5845,17 @@ int main(int argc, char** argv) {
 	if (argc == 2 && std::strcmp(argv[1], "--trinity-only") == 0) {
 		return RunTrinityTests();
 	}
-	InitSubsystems();
-	if (argc == 2 && std::strcmp(argv[1], "--native-guest-translation-only") == 0) {
-		RunTest(TestNativeGuestToHostTranslation);
-		return g_failed_tests == 0 ? 0 : 1;
-	}
 #if defined(__arm64__) || defined(__aarch64__)
 	if (argc == 2 && std::strcmp(argv[1], "--native-arm64-srt-walker-only") == 0) {
 		RunTest(TestNativeArm64SrtWalker);
 		return g_failed_tests == 0 ? 0 : 1;
 	}
 #endif
+	InitSubsystems();
+	if (argc == 2 && std::strcmp(argv[1], "--native-guest-translation-only") == 0) {
+		RunTest(TestNativeGuestToHostTranslation);
+		return g_failed_tests == 0 ? 0 : 1;
+	}
 	if (argc == 2 && std::strcmp(argv[1], "--memory-bottlenecks-only") == 0) {
 		RunTest(TestFlexibleZeroingTracksBackingLifetime);
 		RunTest(TestFlexibleMemoryReuseIsZeroFilled);
