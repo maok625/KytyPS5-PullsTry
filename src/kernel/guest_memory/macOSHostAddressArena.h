@@ -28,14 +28,15 @@ public:
 	MacOSHostAddressArena& operator=(const MacOSHostAddressArena&) = delete;
 
 	// Reserves a contiguous, dynamically selected host virtual-address range.
+	// The returned base is a host address, never a guest virtual address.
 	// This reserves address space only; it does not commit physical memory.
 	[[nodiscard]] bool Reserve(uint64_t size) noexcept;
 
 	// Releases the entire arena, including any views that are still mapped in it.
 	[[nodiscard]] bool Release() noexcept;
 
-	// Maps a shared file descriptor view into a range owned by this arena.
-	// The descriptor must remain open while the view is in use.
+	// Replaces an owned placeholder (or existing arena view) with a shared file
+	// descriptor view. The descriptor must remain open while the view is in use.
 	[[nodiscard]] bool MapShared(uint64_t arena_offset, int backing_fd,
 	                             uint64_t backing_offset, uint64_t size,
 	                             HostMemoryProtection protection) noexcept;
