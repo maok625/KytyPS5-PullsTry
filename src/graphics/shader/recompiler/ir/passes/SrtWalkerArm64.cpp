@@ -508,7 +508,15 @@ private:
 				const auto left = Evaluate(inst.Arg(0), context);
 				if (left && ((*left == 0u) == conjunction)) return uint64_t {!conjunction};
 				const auto right = Evaluate(inst.Arg(1), context);
-				if (!left || !right) return {};
+				if (right && ((*right == 0u) == conjunction)) return uint64_t {!conjunction};
+				if (!left) {
+					if (conjunction && right && *right != 0u) {
+						const auto refined = Evaluate(inst.Arg(1), Context(inst.Arg(0)));
+						if (refined && *refined == 0u) return 0u;
+					}
+					return {};
+				}
+				if (!right) return {};
 				return uint64_t {conjunction ? (*left != 0u && *right != 0u)
 				                             : (*left != 0u || *right != 0u)};
 			}
@@ -516,6 +524,18 @@ private:
 				break;
 		}
 
+		if (op == ValueOpcode::ULessThan32 || op == ValueOpcode::ULessThanEqual32) {
+			const auto left = Evaluate(inst.Arg(0), context);
+			const auto right = Evaluate(inst.Arg(1), context);
+			if (op == ValueOpcode::ULessThan32 && right && static_cast<uint32_t>(*right) == 0u)
+				return 0u;
+			if (op == ValueOpcode::ULessThanEqual32 && left && static_cast<uint32_t>(*left) == 0u)
+				return 1u;
+			if (!left || !right) return {};
+			return uint64_t {op == ValueOpcode::ULessThan32
+			                     ? static_cast<uint32_t>(*left) < static_cast<uint32_t>(*right)
+			                     : static_cast<uint32_t>(*left) <= static_cast<uint32_t>(*right)};
+		}
 		if (!IsRuntimeUniformOp(op) || inst.NumArgs() > 4u) return {};
 		std::array<uint64_t, 4> args {};
 		for (size_t index = 0; index < inst.NumArgs(); ++index) {
@@ -554,6 +574,11 @@ private:
 	std::optional<uint64_t> EvaluateRead(const Inst& inst, uint32_t context) {
 		if (!IsRawRead(m_plan, inst) || m_runtime.read_specialization_memory == nullptr) return {};
 		const auto op = inst.GetOpcode();
+		if (op == ValueOpcode::LoadBufferU32) {
+			const auto guard = Evaluate(inst.Arg(4), context);
+			if (!guard) return {};
+			if (*guard == 0u) return 0u;
+		}
 		const auto* handle = inst.NumArgs() != 0 ? inst.Arg(0).ResolveInstruction() : nullptr;
 		const auto expected = op == ValueOpcode::LoadAddressU32
 		                          ? ValueOpcode::GetAddressResource
@@ -601,9 +626,11 @@ private:
 		}
 
 		std::array<uint32_t, 1> word {};
-		if (!m_runtime.read_specialization_memory(m_runtime.userdata, address, word)) return {};
+		// The x86 walker treats a guest load fault as a zero read and resumes after the load.
+		// A failed backing-store probe is the native ARM64 equivalent.
+		const bool available = m_runtime.read_specialization_memory(m_runtime.userdata, address, word);
 		if (m_reads != nullptr) m_reads->emplace_back(address, sizeof(uint32_t));
-		return word[0];
+		return available ? std::optional<uint64_t>(word[0]) : std::optional<uint64_t>(0u);
 	}
 
 	std::optional<uint64_t> EvaluateOperation(const Inst& inst, std::span<const uint64_t> a) {
