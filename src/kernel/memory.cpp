@@ -11,6 +11,11 @@
 #include "libs/libs.h"
 #include "loader/systemContent.h"
 
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+#define KYTY_MACOS_NATIVE_ARM64 1
+#include "kernel/guest_memory/macOSGuestAddressSpace.h"
+#endif
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -3295,6 +3300,11 @@ bool ProtectGuestMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode,
 bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
 	return g_guest_address_space != nullptr &&
 	       g_guest_address_space->ProtectTransient(vaddr, size, mode);
+}
+
+bool TranslateGuestAddress(uint64_t guest_address, uint64_t minimum_size, void** host_address) {
+	return g_guest_address_space != nullptr &&
+	       g_guest_address_space->TranslateToHost(guest_address, minimum_size, host_address);
 }
 
 bool FreeGuestMemory(uint64_t vaddr, uint64_t size) {

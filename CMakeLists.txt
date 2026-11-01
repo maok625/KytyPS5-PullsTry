@@ -890,6 +890,11 @@ if(APPLE AND (CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64" OR
 endif()
 
 add_executable(kyty_emulator "${KYTY_SOURCE_DIR}/main.cpp" ${kyty_emulator_src})
+if(APPLE)
+	target_sources(kyty_emulator PRIVATE
+		"${KYTY_SOURCE_DIR}/kernel/guest_memory/macOSHostAddressArena.cpp"
+		"${KYTY_SOURCE_DIR}/kernel/guest_memory/macOSGuestAddressSpace.cpp")
+endif()
 configure_macos_guest_address_space(kyty_emulator)
 
 set(KYTY_TROPHY_UNLOCK_SOUND "${CMAKE_CURRENT_SOURCE_DIR}/assets/sounds/trophy-unlock.wav")

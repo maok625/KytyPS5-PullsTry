@@ -157,7 +157,7 @@ struct PageManager::Impl {
 			      static_cast<uint32_t>(info.dwPageSize));
 		}
 #elif defined(__APPLE__)
-		// Under Rosetta the host page size is 4 KB, matching TRACKER_PAGE_SIZE.
+		// Rosetta uses 4 KiB pages; native Apple Silicon uses 16 KiB tracking pages.
 		if (static_cast<uint64_t>(getpagesize()) != PAGE_SIZE) {
 			Fatal("unsupported host page size 0x%08" PRIx32, static_cast<uint32_t>(getpagesize()));
 		}
