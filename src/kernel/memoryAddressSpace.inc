@@ -592,7 +592,7 @@ public:
 #endif
 	}
 
-	bool TranslateToHost(uint64_t vaddr, uint64_t size, void** host_address) const {
+	bool TranslateToHost(uint64_t vaddr, uint64_t size, void** host_address) {
 		if (host_address == nullptr) {
 			return false;
 		}
@@ -1155,7 +1155,7 @@ public:
 		return true;
 	}
 
-	bool TranslateToHost(uint64_t vaddr, uint64_t size, void** host_address) const {
+	bool TranslateToHost(uint64_t vaddr, uint64_t size, void** host_address) {
 		if (host_address == nullptr) return false;
 		*host_address = nullptr;
 		std::shared_lock lock(m_mutex);
