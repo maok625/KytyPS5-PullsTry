@@ -357,14 +357,13 @@ public:
 		bool             ok = true;
 		ForEachSparseRange(
 		    m_maps, vaddr, size,
-		    [&](const auto& entry, uint64_t start, uint64_t bytes) {
+		    [&](const auto&, uint64_t start, uint64_t bytes) {
 #if defined(KYTY_MACOS_NATIVE_ARM64)
 			    const auto host_space = FindHostSpaceForRange(
 			        m_standard_host_space, m_extended_host_space, start, bytes);
 			    ok = ok && host_space != nullptr &&
 			         host_space->Protect(start, bytes, ToHostMemoryProtection(mode));
 #else
-			    (void)entry;
 			    ok = ok && VirtualMemory::Protect(start, bytes, mode);
 #endif
 		    },
@@ -568,12 +567,12 @@ public:
 		m_maps.emplace(old.vaddr, old);
 		return false;
 #elif defined(KYTY_MACOS_NATIVE_ARM64)
+		std::lock_guard lock(m_mutex);
 		auto host_space = FindHostSpaceForRange(
 		    m_standard_host_space, m_extended_host_space, vaddr, size);
 		if (host_space == nullptr || !host_space->Unmap(vaddr, size)) {
 			return false;
 		}
-		std::lock_guard lock(m_mutex);
 		RemoveMappingsUnlocked(vaddr, size);
 		return true;
 #else
