@@ -356,16 +356,19 @@ int RunArenaBackingAliasProbe(uint64_t page_size) {
 		std::printf("arena_backing_alias_probe=skipped_reservation_unavailable\n");
 		std::printf("arena_backing_alias_reserve_result=%d message=%s\n",
 		            reserve_result, mach_error_string(reserve_result));
+		if (reserve_result == KERN_SUCCESS) {
+			(void)mach_vm_deallocate(mach_task_self(), arena, arena_size);
+		}
 		return 0;
 	}
 	std::printf("arena_backing_alias_arena=reserved start=0x%016" PRIx64
 	            " size=%" PRIu64 "\n",
 	            static_cast<uint64_t>(arena), static_cast<uint64_t>(arena_size));
 
-	char shm_name[96] {};
+	char shm_name[64] {};
 	const int name_size = std::snprintf(
-	    shm_name, sizeof(shm_name), "/kyty-arena-alias-%d-%llx", static_cast<int>(getpid()),
-	    static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(&arena)));
+	    shm_name, sizeof(shm_name), "/ka-%d-%x", static_cast<int>(getpid()),
+	    static_cast<unsigned int>(reinterpret_cast<uintptr_t>(&arena) & 0xffffffffu));
 	if (name_size < 0 || static_cast<size_t>(name_size) >= sizeof(shm_name)) {
 		(void)mach_vm_deallocate(mach_task_self(), arena, arena_size);
 		std::fprintf(stderr, "could not format shared-memory name\n");
@@ -414,8 +417,8 @@ int RunArenaBackingAliasProbe(uint64_t page_size) {
 			}
 			if (view_a != MAP_FAILED && view_b != MAP_FAILED) {
 				static constexpr char pattern[] = "KytyPS5 shared backing alias probe";
-				std::memcpy(backing, pattern, sizeof(pattern));
-				const bool alias_a_matches = std::memcmp(view_a, pattern, sizeof(pattern)) == 0;
+				std::memcpy(view_a, pattern, sizeof(pattern));
+				const bool alias_a_matches = std::memcmp(backing, pattern, sizeof(pattern)) == 0;
 				const bool alias_b_matches = std::memcmp(view_b, pattern, sizeof(pattern)) == 0;
 				std::printf("arena_backing_alias_coherence=%s first=%s second=%s\n",
 				            alias_a_matches && alias_b_matches ? "success" : "failed",
