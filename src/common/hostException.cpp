@@ -147,9 +147,10 @@ static std::atomic_uint32_t g_install_state {0};
 static_assert(decltype(g_handler)::is_always_lock_free);
 static_assert(decltype(g_install_state)::is_always_lock_free);
 
+#if defined(__x86_64__)
 // Translate the x86-64 page-fault error code (mcontext __es.__err) into an access type.
 // bit 1 (0x2) = write, bit 4 (0x10) = instruction fetch, otherwise a read.
-static AccessViolationType DecodeAccess(uint64_t err) {
+static AccessViolationType DecodeAccessX86(uint64_t err) {
 	if ((err & 0x10u) != 0) {
 		return AccessViolationType::Execute;
 	}
@@ -158,6 +159,25 @@ static AccessViolationType DecodeAccess(uint64_t err) {
 	}
 	return AccessViolationType::Read;
 }
+#elif defined(__arm64__) || defined(__aarch64__)
+// Decode the ARMv8 exception syndrome register (ESR_ELx).
+// EC 0x20/0x21 = instruction abort; EC 0x24/0x25 = data abort.
+// For data aborts, ISS bit 6 (WnR) distinguishes writes from reads.
+static AccessViolationType DecodeAccessArm64(uint32_t esr) {
+	const auto exception_class = (esr >> 26u) & 0x3fu;
+	switch (exception_class) {
+		case 0x20: // Instruction abort from a lower exception level.
+		case 0x21: // Instruction abort from the current exception level.
+			return AccessViolationType::Execute;
+		case 0x24: // Data abort from a lower exception level.
+		case 0x25: // Data abort from the current exception level.
+			return (esr & (1u << 6u)) != 0 ? AccessViolationType::Write : AccessViolationType::Read;
+		default: return AccessViolationType::Unknown;
+	}
+}
+#else
+#error "Unsupported macOS architecture in HostException"
+#endif
 
 // POSIX signal handler that mirrors the Windows vectored handler: build an ExceptionInfo
 // from the mcontext and dispatch. A resolved fault (handler returns true) simply returns,
@@ -169,18 +189,29 @@ static void SignalHandler(int sig, siginfo_t* si, void* uctx) {
 	const auto& ss = mc->__ss;
 
 	ExceptionInfo info {};
+#if defined(__x86_64__)
 	info.exception_address = ss.__rip;
-	info.native_code       = static_cast<uint32_t>(si->si_code);
-	info.native_context    = uctx;
+#elif defined(__arm64__) || defined(__aarch64__)
+	// Use Apple's accessor so this also works when ARM64 thread-state pointers are
+	// represented by pointer-authenticated opaque fields in the SDK headers.
+	info.exception_address = __darwin_arm_thread_state64_get_pc(ss);
+#endif
+	info.native_code    = static_cast<uint32_t>(si->si_code);
+	info.native_context = uctx;
 
 	if (sig == SIGILL) {
 		info.type = ExceptionType::IllegalInstruction;
 	} else {
-		info.type                   = ExceptionType::AccessViolation;
-		info.access_violation_type  = DecodeAccess(mc->__es.__err);
+		info.type = ExceptionType::AccessViolation;
+#if defined(__x86_64__)
+		info.access_violation_type = DecodeAccessX86(mc->__es.__err);
+#elif defined(__arm64__) || defined(__aarch64__)
+		info.access_violation_type = DecodeAccessArm64(mc->__es.__esr);
+#endif
 		info.access_violation_vaddr = reinterpret_cast<uint64_t>(si->si_addr);
 	}
 
+#if defined(__x86_64__)
 	info.rax = ss.__rax;
 	info.rbx = ss.__rbx;
 	info.rcx = ss.__rcx;
@@ -197,6 +228,10 @@ static void SignalHandler(int sig, siginfo_t* si, void* uctx) {
 	info.r13 = ss.__r13;
 	info.r14 = ss.__r14;
 	info.r15 = ss.__r15;
+#else
+	// ExceptionInfo's rax-r15 members describe x86-64 registers. On ARM64 they
+	// remain zero; the complete native register state is available via native_context.
+#endif
 
 	const auto handler = g_handler.load(std::memory_order_acquire);
 	if (handler != nullptr && handler(info)) {

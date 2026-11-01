@@ -5,6 +5,7 @@
 #include "common/threads.h"
 #include "common/virtualMemory.h"
 #include "kernel/memory.h"
+#include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "loader/elf.h"
@@ -1410,6 +1411,136 @@ void TestFlexibleReplacementRollbackPreservesMetadata() {
 		      "restored flexible range remained marked as a free placeholder");
 	}
 	CheckOk(test, KernelMunmap(base, 3 * page), "release restored flexible range");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+#if defined(__arm64__) || defined(__aarch64__)
+struct NativeSrtReadProbe {
+	uint64_t expected_address = 0;
+	uint32_t value = 0;
+	bool     called = false;
+};
+
+bool ReadNativeSrtProbe(void* userdata, uint64_t address, std::span<uint32_t> values) {
+	auto& probe = *static_cast<NativeSrtReadProbe*>(userdata);
+	if (address != probe.expected_address || values.size() != 1u) return false;
+	probe.called = true;
+	values[0] = probe.value;
+	return true;
+}
+
+void TestNativeArm64SrtWalker() {
+	using namespace Libs::Graphics::ShaderRecompiler::IR;
+	const char* test = "NativeArm64SrtWalker";
+
+	ResourcePlan arithmetic;
+	auto& sum = arithmetic.value_storage.emplace_back(ValueOpcode::IAdd32);
+	sum.SetArg(0, Value(uint32_t {20}));
+	sum.SetArg(1, Value(uint32_t {22}));
+	auto& extract = arithmetic.value_storage.emplace_back(ValueOpcode::BitFieldUExtract);
+	extract.SetArg(0, Value(uint32_t {0x0000ab00}));
+	extract.SetArg(1, Value(uint32_t {8}));
+	extract.SetArg(2, Value(uint32_t {8}));
+	arithmetic.uniform_fill.fill.words = 2;
+	arithmetic.uniform_fill.values[0] = Value(&sum);
+	arithmetic.uniform_fill.values[1] = Value(&extract);
+
+	CompileSrtWalker(arithmetic);
+	SrtRuntime arithmetic_runtime {};
+	std::vector<uint32_t> flat;
+	Check(test, WalkSrt(arithmetic, arithmetic_runtime, flat, nullptr),
+	      "arithmetic SRT walk failed");
+	uint32_t sum_value = 0;
+	uint32_t extract_value = 0;
+	Check(test, WalkedValue(arithmetic, Value(&sum), sum_value) && sum_value == 42u,
+	      "IAdd32 output was not evaluated correctly");
+	Check(test, WalkedValue(arithmetic, Value(&extract), extract_value) && extract_value == 0xabu,
+	      "BitFieldUExtract output was not evaluated correctly");
+
+	ResourcePlan memory;
+	MemoryInfo address_memory {};
+	address_memory.kind = ResourceKind::ScalarAddress;
+	memory.memory_info.push_back(address_memory);
+
+	auto& address = memory.value_storage.emplace_back(ValueOpcode::GetAddressResource);
+	address.SetArg(0, Value(uint32_t {0x12345000}));
+	address.SetArg(1, Value(uint32_t {0}));
+	auto& load = memory.value_storage.emplace_back(ValueOpcode::LoadAddressU32);
+	load.SetArg(0, Value(&address));
+	load.SetArg(1, Value(uint32_t {0}));
+	load.SetArg(2, Value(uint32_t {0}));
+	load.SetArg(3, Value(false));
+	MemoryFlags flags {};
+	flags.index = 0;
+	load.SetFlags(flags);
+	memory.srt_reads.push_back({Value(&load), 0});
+
+	NativeSrtReadProbe probe {
+	    .expected_address = 0x12345000,
+	    .value = 0xdecafbad,
+	};
+	SrtRuntime memory_runtime {
+	    .userdata = &probe,
+	    .read_specialization_memory = ReadNativeSrtProbe,
+	};
+	std::vector<std::pair<uint64_t, uint64_t>> reads;
+	CompileSrtWalker(memory);
+	Check(test, WalkSrt(memory, memory_runtime, flat, &reads),
+	      "guest-backed SRT read failed");
+	Check(test, probe.called && flat.size() == 1u && flat[0] == probe.value,
+	      "guest-backed SRT read returned the wrong DWORD");
+	Check(test, reads.size() == 1u && reads[0] == std::pair<uint64_t, uint64_t> {
+	                                                    probe.expected_address, sizeof(uint32_t)},
+	      "guest-backed SRT read dependency was not captured");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+#endif
+
+void TestNativeGuestToHostTranslation() {
+	const char* test = "NativeGuestToHostTranslation";
+	constexpr uint64_t PageSize = SceKernelPageSize;
+
+	const auto first = Libs::LibKernel::Memory::AllocateRuntimeMemory(
+	    0, PageSize, Common::VirtualMemory::Mode::ReadWrite, "native_translation_first");
+	Check(test, first != 0, "first private guest allocation failed");
+
+	const auto second = Libs::LibKernel::Memory::AllocateRuntimeMemory(
+	    first + PageSize, PageSize, Common::VirtualMemory::Mode::ReadWrite,
+	    "native_translation_second", true);
+	Check(test, second == first + PageSize, "adjacent fixed guest allocation failed");
+
+	void* first_host = nullptr;
+	void* second_host = nullptr;
+	void* combined_host = nullptr;
+	Check(test, Libs::LibKernel::Memory::TranslateGuestAddress(first, PageSize, &first_host),
+	      "first guest translation failed");
+	Check(test, Libs::LibKernel::Memory::TranslateGuestAddress(second, PageSize, &second_host),
+	      "second guest translation failed");
+	Check(test, Libs::LibKernel::Memory::TranslateGuestAddress(first, PageSize * 2, &combined_host),
+	      "translation across adjacent guest mappings failed");
+	Check(test, combined_host == first_host,
+	      "combined translation did not begin at the first host mapping");
+	Check(test, reinterpret_cast<uintptr_t>(second_host) ==
+	                reinterpret_cast<uintptr_t>(first_host) + PageSize,
+	      "adjacent guest mappings are not adjacent in host memory");
+
+	constexpr std::array<uint8_t, 8> BoundaryPattern {0x4b, 0x59, 0x54, 0x59, 0x50, 0x53, 0x35, 0x21};
+	auto* const combined_bytes = static_cast<uint8_t*>(combined_host);
+	std::memcpy(combined_bytes + PageSize - 4, BoundaryPattern.data(), BoundaryPattern.size());
+	Check(test, std::memcmp(static_cast<uint8_t*>(first_host) + PageSize - 4,
+	                        BoundaryPattern.data(), 4) == 0,
+	      "the first guest mapping did not retain its boundary bytes");
+	Check(test, std::memcmp(second_host, BoundaryPattern.data() + 4, 4) == 0,
+	      "the second guest mapping did not observe contiguous host writes");
+
+	Check(test, Libs::LibKernel::Memory::FreeGuestMemory(first, PageSize * 2),
+	      "combined adjacent guest free failed");
+	void* stale_host = nullptr;
+	Check(test, !Libs::LibKernel::Memory::TranslateGuestAddress(first, PageSize, &stale_host) &&
+	                stale_host == nullptr,
+	      "freed guest range still translated to a host pointer");
+
 	std::printf("[host]    %-48s ok\n", test);
 }
 
@@ -5714,7 +5845,17 @@ int main(int argc, char** argv) {
 	if (argc == 2 && std::strcmp(argv[1], "--trinity-only") == 0) {
 		return RunTrinityTests();
 	}
+#if defined(__arm64__) || defined(__aarch64__)
+	if (argc == 2 && std::strcmp(argv[1], "--native-arm64-srt-walker-only") == 0) {
+		RunTest(TestNativeArm64SrtWalker);
+		return g_failed_tests == 0 ? 0 : 1;
+	}
+#endif
 	InitSubsystems();
+	if (argc == 2 && std::strcmp(argv[1], "--native-guest-translation-only") == 0) {
+		RunTest(TestNativeGuestToHostTranslation);
+		return g_failed_tests == 0 ? 0 : 1;
+	}
 	if (argc == 2 && std::strcmp(argv[1], "--memory-bottlenecks-only") == 0) {
 		RunTest(TestFlexibleZeroingTracksBackingLifetime);
 		RunTest(TestFlexibleMemoryReuseIsZeroFilled);

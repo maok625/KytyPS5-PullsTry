@@ -12,6 +12,24 @@ static constexpr uint64_t HOST_USER_MIN            = 0x1000000000ull;
 #endif
 static constexpr uint64_t HOST_USER_MAX = 0xfbffffffffull;
 
+#if defined(KYTY_MACOS_NATIVE_ARM64)
+static GuestMemory::HostMemoryProtection ToHostMemoryProtection(VirtualMemory::Mode mode) {
+	using Protection = GuestMemory::HostMemoryProtection;
+	switch (mode) {
+		case VirtualMemory::Mode::Read: return Protection::Read;
+		case VirtualMemory::Mode::Write: return Protection::Write;
+		case VirtualMemory::Mode::ReadWrite: return Protection::Read | Protection::Write;
+		case VirtualMemory::Mode::Execute: return Protection::Execute;
+		case VirtualMemory::Mode::ExecuteRead: return Protection::Execute | Protection::Read;
+		case VirtualMemory::Mode::ExecuteWrite: return Protection::Execute | Protection::Write;
+		case VirtualMemory::Mode::ExecuteReadWrite:
+			return Protection::Execute | Protection::Read | Protection::Write;
+		case VirtualMemory::Mode::NoAccess:
+		default: return Protection::None;
+	}
+}
+#endif
+
 static bool GuestFreeRangeContains(uint64_t base, uint64_t range_size, uint64_t candidate,
                                    uint64_t size) {
 	if (UINT64_MAX - base < range_size || candidate < base) {
@@ -20,6 +38,23 @@ static bool GuestFreeRangeContains(uint64_t base, uint64_t range_size, uint64_t 
 	const auto range_end = base + range_size;
 	return candidate <= range_end && size <= range_end - candidate;
 }
+
+#if defined(KYTY_MACOS_NATIVE_ARM64)
+static std::shared_ptr<GuestMemory::MacOSGuestAddressSpace> FindHostSpaceForRange(
+    const std::shared_ptr<GuestMemory::MacOSGuestAddressSpace>& standard_space,
+    const std::shared_ptr<GuestMemory::MacOSGuestAddressSpace>& extended_space,
+    uint64_t guest_address, uint64_t size) {
+	if (standard_space && GuestFreeRangeContains(
+	        standard_space->GuestBase(), standard_space->Size(), guest_address, size)) {
+		return standard_space;
+	}
+	if (extended_space && GuestFreeRangeContains(
+	        extended_space->GuestBase(), extended_space->Size(), guest_address, size)) {
+		return extended_space;
+	}
+	return {};
+}
+#endif
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 static bool CoalescePlaceholders(uint64_t vaddr, uint64_t size) {
@@ -81,7 +116,20 @@ public:
 		AddressRangeUnavailable,
 	};
 
-	explicit GuestBackingStore(uint64_t size): m_size(size) {
+	explicit GuestBackingStore(uint64_t size
+#if defined(KYTY_MACOS_NATIVE_ARM64)
+	                           , std::shared_ptr<GuestMemory::MacOSGuestAddressSpace> standard_host_space,
+	                             std::shared_ptr<GuestMemory::MacOSGuestAddressSpace> extended_host_space
+#endif
+	                           )
+#if defined(KYTY_MACOS_NATIVE_ARM64)
+	    : m_standard_host_space(std::move(standard_host_space))
+	    , m_extended_host_space(std::move(extended_host_space))
+	    , m_size(size)
+#else
+	    : m_size(size)
+#endif
+	{
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		m_handle = CreateFileMappingA(
 		    INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_COMMIT,
@@ -149,6 +197,20 @@ public:
 		}
 		if (m_handle != nullptr) {
 			CloseHandle(m_handle);
+		}
+#elif defined(KYTY_MACOS_NATIVE_ARM64)
+		for (const auto& [_, entry]: m_maps) {
+			const auto host_space =
+			    FindHostSpaceForRange(m_standard_host_space, m_extended_host_space,
+			                          entry.vaddr, entry.size);
+			EXIT_IF(host_space == nullptr || !host_space->Unmap(entry.vaddr, entry.size));
+		}
+		m_maps.clear();
+		if (m_backing_base != nullptr) {
+			munmap(m_backing_base, m_size);
+		}
+		if (m_fd >= 0) {
+			close(m_fd);
 		}
 #elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 		for (const auto& [_, entry]: m_maps) {
@@ -296,7 +358,14 @@ public:
 		ForEachSparseRange(
 		    m_maps, vaddr, size,
 		    [&](const auto&, uint64_t start, uint64_t bytes) {
+#if defined(KYTY_MACOS_NATIVE_ARM64)
+			    const auto host_space = FindHostSpaceForRange(
+			        m_standard_host_space, m_extended_host_space, start, bytes);
+			    ok = ok && host_space != nullptr &&
+			         host_space->Protect(start, bytes, ToHostMemoryProtection(mode));
+#else
 			    ok = ok && VirtualMemory::Protect(start, bytes, mode);
+#endif
 		    },
 		    [&](uint64_t, uint64_t) { ok = false; });
 		return ok;
@@ -324,6 +393,32 @@ public:
 			std::lock_guard lock(m_mutex);
 			EXIT_IF(!m_maps.emplace(vaddr, MapEntry {vaddr, size, backing_offset, mode}).second);
 		}
+		SetFailure(failure_reason, FailureReason::None);
+		return true;
+#elif defined(KYTY_MACOS_NATIVE_ARM64)
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+		if (const auto callback = g_test_before_backing_map) {
+			g_test_before_backing_map = nullptr;
+			callback(vaddr, size);
+		}
+#endif
+		auto host_space = FindHostSpaceForRange(
+		    m_standard_host_space, m_extended_host_space, vaddr, size);
+		if (host_space == nullptr) {
+			SetFailure(failure_reason, FailureReason::FixedMapViewFailed);
+			return false;
+		}
+		std::lock_guard lock(m_mutex);
+		if (!host_space->MapShared(vaddr, m_fd, backing_offset, size,
+		                           ToHostMemoryProtection(mode))) {
+			SetFailure(failure_reason, FailureReason::FixedMapViewFailed);
+			return false;
+		}
+		// MapShared replaced exactly this interval inside our permanently owned
+		// host arena. Update the guest-address bookkeeping after the host map succeeds.
+		RemoveMappingsUnlocked(vaddr, size);
+		EXIT_IF(!m_maps.emplace(
+		    vaddr, MapEntry {vaddr, size, backing_offset, mode}).second);
 		SetFailure(failure_reason, FailureReason::None);
 		return true;
 #else
@@ -471,16 +566,42 @@ public:
 		std::lock_guard lock(m_mutex);
 		m_maps.emplace(old.vaddr, old);
 		return false;
+#elif defined(KYTY_MACOS_NATIVE_ARM64)
+		std::lock_guard lock(m_mutex);
+		auto host_space = FindHostSpaceForRange(
+		    m_standard_host_space, m_extended_host_space, vaddr, size);
+		if (host_space == nullptr || !host_space->Unmap(vaddr, size)) {
+			return false;
+		}
+		RemoveMappingsUnlocked(vaddr, size);
+		return true;
 #else
 		// Replace only the requested range so concurrent accesses and GPU watch
 		// protections on the surviving mappings remain intact.
 		if (!UnmapViewPreservePlaceholder(reinterpret_cast<void*>(vaddr), size)) {
 			return false;
 		}
-
 		std::lock_guard lock(m_mutex);
 		RemoveMappingsUnlocked(vaddr, size);
+		return true;
+#endif
+	}
 
+	bool TranslateToHost(uint64_t vaddr, uint64_t size, void** host_address) {
+		if (host_address == nullptr) {
+			return false;
+		}
+		*host_address = nullptr;
+		if (!Contains(vaddr, size)) {
+			return false;
+		}
+#if defined(KYTY_MACOS_NATIVE_ARM64)
+		auto host_space = FindHostSpaceForRange(
+		    m_standard_host_space, m_extended_host_space, vaddr, size);
+		return host_space != nullptr &&
+		       host_space->TranslateToHost(vaddr, size, host_address);
+#else
+		*host_address = reinterpret_cast<void*>(vaddr);
 		return true;
 #endif
 	}
@@ -672,9 +793,13 @@ private:
 	int m_fd = -1;
 #endif
 
-	uint8_t*                     m_backing_base = nullptr;
-	uint64_t                     m_size         = 0;
-	std::shared_mutex            m_mutex;
+#if defined(KYTY_MACOS_NATIVE_ARM64)
+	std::shared_ptr<GuestMemory::MacOSGuestAddressSpace> m_standard_host_space;
+	std::shared_ptr<GuestMemory::MacOSGuestAddressSpace> m_extended_host_space;
+#endif
+	uint8_t*          m_backing_base = nullptr;
+	uint64_t          m_size = 0;
+	std::shared_mutex m_mutex;
 	std::map<uint64_t, MapEntry> m_maps;
 };
 
@@ -686,8 +811,26 @@ public:
 		GetSystemInfo(&info);
 		m_granularity = info.dwAllocationGranularity;
 #endif
+#if defined(KYTY_MACOS_NATIVE_ARM64)
+		try {
+			m_standard_host_space = std::make_shared<GuestMemory::MacOSGuestAddressSpace>();
+			m_extended_host_space = std::make_shared<GuestMemory::MacOSGuestAddressSpace>();
+		} catch (const std::bad_alloc&) {
+			EXIT("could not allocate macOS guest host-space descriptors\n");
+		}
+		const auto standard_size =
+		    HOST_USER_MAX + 1u - static_cast<uint64_t>(HOST_SYSTEM_MANAGED_MIN);
+		if (!m_standard_host_space->Reserve(HOST_SYSTEM_MANAGED_MIN, standard_size) ||
+		    !m_extended_host_space->Reserve(kExtendedMemoryBase, kExtendedMemorySize)) {
+			EXIT("could not reserve dynamic macOS host arenas for guest memory\n");
+		}
+#endif
 		ReserveGuestRegions();
-		m_backing = new GuestBackingStore(backing_size);
+		m_backing = new GuestBackingStore(backing_size
+#if defined(KYTY_MACOS_NATIVE_ARM64)
+		                                  , m_standard_host_space, m_extended_host_space
+#endif
+		                                  );
 		if (!m_backing->IsAvailable()) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 			EXIT("could not reserve %" PRIu64 " MB for guest direct memory. Windows commits\n"
@@ -724,6 +867,8 @@ public:
 				current = region_end;
 			}
 		}
+#elif defined(KYTY_MACOS_NATIVE_ARM64)
+		// m_owned holds logical guest ranges only; live mappings own separate host arenas.
 #else
 		for (const auto& [start, size]: m_owned) {
 			munmap(reinterpret_cast<void*>(start), size);
@@ -796,7 +941,16 @@ public:
 				    CopySparseRange(m_mapped, start, destination, bytes,
 				                    [](const auto& region, uint64_t address) {
 					                    EXIT_IF(region.type != MappingType::Private);
+#if defined(KYTY_MACOS_NATIVE_ARM64)
+					                    void* host_address = nullptr;
+					                    auto host_space = FindHostSpaceForRange(
+					                        m_standard_host_space, m_extended_host_space, address, 1);
+					                    EXIT_IF(host_space == nullptr ||
+					                            !host_space->TranslateToHost(address, 1, &host_address));
+					                    return host_address;
+#else
 					                    return reinterpret_cast<const void*>(address);
+#endif
 				                    },
 				                    zero);
 			    } else {
@@ -936,6 +1090,20 @@ public:
 		}
 		EXIT_IF(!AddMappedUnlocked(vaddr, size, MappingType::Private));
 		return true;
+#elif defined(KYTY_MACOS_NATIVE_ARM64)
+		auto host_space = FindHostSpaceForRange(
+		    m_standard_host_space, m_extended_host_space, vaddr, size);
+		if (host_space == nullptr ||
+		    !host_space->CommitAnonymous(vaddr, size, ToHostMemoryProtection(host_mode))) {
+			AddFreeUnlocked(vaddr, size);
+			return false;
+		}
+		if (!AddMappedUnlocked(vaddr, size, MappingType::Private)) {
+			(void)host_space->Unmap(vaddr, size);
+			AddFreeUnlocked(vaddr, size);
+			return false;
+		}
+		return true;
 #else
 		if (VirtualMemory::Protect(vaddr, size, host_mode)) {
 			EXIT_IF(!AddMappedUnlocked(vaddr, size, MappingType::Private));
@@ -968,8 +1136,18 @@ public:
 			EXIT_IF(VirtualFree(reinterpret_cast<void*>(region_vaddr), region_size,
 			                    MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) == 0);
 		}
-		// ReleaseCommitted also publishes the aggregate span as one logical free range.
 		EXIT_IF(regions.size() > 1 && !CoalescePlaceholders(vaddr, size));
+#elif defined(KYTY_MACOS_NATIVE_ARM64)
+		current = vaddr;
+		while (current < end) {
+			const auto it = FindMappedContainingUnlocked(current);
+			EXIT_IF(it == m_mapped.end());
+			const auto part_end = std::min(end, it->second.vaddr + it->second.size);
+			auto host_space = FindHostSpaceForRange(
+			    m_standard_host_space, m_extended_host_space, current, part_end - current);
+			EXIT_IF(host_space == nullptr || !host_space->Unmap(current, part_end - current));
+			current = part_end;
+		}
 #else
 		for (const auto& [region_vaddr, region_size]: regions) {
 			RestorePlaceholder(region_vaddr, region_size);
@@ -978,6 +1156,34 @@ public:
 		EXIT_IF(!RemoveMappedUnlocked(vaddr, size, MappingType::Private));
 		AddFreeUnlocked(vaddr, size);
 		return true;
+	}
+
+	bool TranslateToHost(uint64_t vaddr, uint64_t size, void** host_address) {
+		if (host_address == nullptr || size == 0 || UINT64_MAX - vaddr < size) {
+			return false;
+		}
+		*host_address = nullptr;
+		{
+			std::shared_lock lock(m_mutex);
+			auto current = vaddr;
+			const auto end = vaddr + size;
+			while (current < end) {
+				const auto it = FindMappedContainingUnlocked(current);
+				if (it == m_mapped.end()) {
+					return false;
+				}
+				current = std::min(end, it->second.vaddr + it->second.size);
+			}
+		}
+#if defined(KYTY_MACOS_NATIVE_ARM64)
+		auto host_space = FindHostSpaceForRange(
+		    m_standard_host_space, m_extended_host_space, vaddr, size);
+		return host_space != nullptr &&
+		       host_space->TranslateToHost(vaddr, size, host_address);
+#else
+		*host_address = reinterpret_cast<void*>(vaddr);
+		return true;
+#endif
 	}
 
 	bool SelfTest() {
@@ -992,8 +1198,16 @@ public:
 			return false;
 		}
 
+#if defined(KYTY_MACOS_NATIVE_ARM64)
+		void* host_address = nullptr;
+		if (!TranslateToHost(addr, sizeof(uint64_t), &host_address)) {
+			return false;
+		}
+		auto* ptr = static_cast<uint64_t*>(host_address);
+#else
 		auto* ptr = reinterpret_cast<uint64_t*>(addr);
-		*ptr      = 0x4b59545950484f4cull; // "KYTYPHOL"
+#endif
+		*ptr = 0x4b59545950484f4cull; // "KYTYPHOL"
 
 		if (!ReleaseCommitted(addr, PageSize())) {
 			LOGF_COLOR(Log::Color::Red,
@@ -1046,7 +1260,22 @@ private:
 			if (range_start >= range_end) {
 				continue;
 			}
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#if defined(KYTY_MACOS_NATIVE_ARM64)
+			if (region.type == MappingType::Backing) {
+				if (!m_backing->ProtectViews(range_start, range_end - range_start, mode)) {
+					return false;
+				}
+			} else {
+				auto host_space = FindHostSpaceForRange(
+				    m_standard_host_space, m_extended_host_space,
+				    range_start, range_end - range_start);
+				if (host_space == nullptr ||
+				    !host_space->Protect(range_start, range_end - range_start,
+				                         ToHostMemoryProtection(mode))) {
+					return false;
+				}
+			}
+#elif KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 			// Rollback can split a backing view without changing the owner interval.
 			// Windows protection calls must stay within each actual view.
 			if (region.type == MappingType::Backing) {
@@ -1056,9 +1285,11 @@ private:
 				continue;
 			}
 #endif
+#if !defined(KYTY_MACOS_NATIVE_ARM64)
 			if (!VirtualMemory::Protect(range_start, range_end - range_start, mode)) {
 				return false;
 			}
+#endif
 		}
 		return true;
 	}
@@ -1180,7 +1411,19 @@ private:
 		    {kExtendedMemoryBase, kExtendedMemoryBase + kExtendedMemorySize},
 		}};
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#if defined(KYTY_MACOS_NATIVE_ARM64)
+		// The system-managed/reserved and user intervals are adjacent on native
+		// Apple Silicon. Track their combined span as one logical owned range so
+		// reads/writes may cross that boundary without false ownership failures.
+		const auto standard_start = static_cast<uint64_t>(HOST_SYSTEM_MANAGED_MIN);
+		const auto standard_end = HOST_USER_MAX + 1u;
+		AddFreeUnlocked(standard_start, standard_end - standard_start);
+		m_owned.emplace_back(standard_start, standard_end - standard_start);
+
+		const auto extended_start = kExtendedMemoryBase;
+		AddFreeUnlocked(extended_start, kExtendedMemorySize);
+		m_owned.emplace_back(extended_start, kExtendedMemorySize);
+#elif KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		constexpr uint64_t MinimumRegionSize = 0x1000000;
 		const auto         process           = GetCurrentProcess();
 		for (const auto& [guest_start, guest_end]: regions) {
@@ -1445,6 +1688,10 @@ private:
 	}
 
 	std::shared_mutex                          m_mutex;
+#if defined(KYTY_MACOS_NATIVE_ARM64)
+	std::shared_ptr<GuestMemory::MacOSGuestAddressSpace> m_standard_host_space;
+	std::shared_ptr<GuestMemory::MacOSGuestAddressSpace> m_extended_host_space;
+#endif
 	std::map<uint64_t, uint64_t>               m_free;
 	std::map<uint64_t, MappedRegion>            m_mapped;
 	std::vector<std::pair<uint64_t, uint64_t>> m_owned;

@@ -67,8 +67,8 @@ bool ValidateRuntimeValue(const ResourcePlan& program, Value value,
 // Uniform across a compute wave, including values derived from its workgroup ID.
 // This does not imply that the host can evaluate the value.
 bool ValidateWaveUniformValue(const ResourcePlan& program, Value value);
-// Compiles the plan's x86 walker. Without values it walks the plan's resources; otherwise it
-// only evaluates the values, with every block reachable.
+// Prepares the plan's SRT evaluator. Without values it walks the plan's resources; otherwise it
+// evaluates the supplied values, with every block reachable.
 void CompileSrtWalker(ResourcePlan& plan, std::span<const Value> values = {});
 // Runs the walker. flat receives the scalar reads of reachable blocks and reads, when non-null,
 // one DWORD range per guest load. False when a reachable read is unknown.

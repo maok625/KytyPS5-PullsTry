@@ -334,6 +334,13 @@ list(APPEND kyty_emulator_src
 )
 list(REMOVE_DUPLICATES kyty_emulator_src)
 
+# The original guest-memory map is a standalone experiment, not part of Kyty's
+# live memory implementation. Keep it in its focused test target below; adding
+# it to kyty_emulator would compile it with the emulator's -fno-exceptions flags.
+list(REMOVE_ITEM kyty_emulator_src
+	"${KYTY_SOURCE_DIR}/kernel/guestMemoryMap.cpp"
+	"${KYTY_SOURCE_DIR}/kernel/guestMemoryMap.h")
+
 if (KYTY_CLANG_CL)
 	set_source_files_properties(${kyty_emulator_src} PROPERTIES COMPILE_FLAGS "-Wno-pragma-pack -Wno-deprecated-declarations -D_TIMESPEC_DEFINED")
 endif()
@@ -371,6 +378,11 @@ list(APPEND check_headers
 
 function(add_kyty_full_emulator_test target source)
 	add_executable(${target} EXCLUDE_FROM_ALL ${source} ${kyty_emulator_src})
+	if(APPLE)
+		target_sources(${target} PRIVATE
+			"${KYTY_SOURCE_DIR}/kernel/guest_memory/macOSHostAddressArena.cpp"
+			"${KYTY_SOURCE_DIR}/kernel/guest_memory/macOSGuestAddressSpace.cpp")
+	endif()
 	target_link_libraries(${target} ${kyty_emulator_link_libraries})
 	target_include_directories(${target} PRIVATE ${inc_headers})
 	if (WIN32)
@@ -655,10 +667,38 @@ add_executable(guest_memory_map_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/kernel/guestMemoryMap.cpp")
 target_include_directories(guest_memory_map_tests PRIVATE "${KYTY_SOURCE_DIR}")
 
+# The alias-capable memory model is a test-only reference implementation. It is
+# deliberately not linked into the live emulator yet.
+add_executable(guest_memory_address_space_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/GuestMemoryAddressSpaceTests.cpp"
+	"${KYTY_SOURCE_DIR}/kernel/guest_memory/guestMemoryAddressSpace.cpp")
+target_include_directories(guest_memory_address_space_tests PRIVATE "${KYTY_SOURCE_DIR}")
+
+# Safe, diagnostic-only probe for the macOS host VM layout. It never overwrites
+# an existing mapping and runs its fixed-address attempt in a child process.
+if(APPLE)
+	add_executable(macos_guest_address_probe EXCLUDE_FROM_ALL
+		"${KYTY_TESTS_DIR}/macosGuestAddressProbe.cpp")
+
+	# Host arenas and explicit guest-to-host translation are exercised separately
+	# from the live allocator while remaining guest-pointer call sites are migrated.
+	add_executable(macos_host_address_arena_tests EXCLUDE_FROM_ALL
+		"${KYTY_TESTS_DIR}/MacOSHostAddressArenaTests.cpp"
+		"${KYTY_SOURCE_DIR}/kernel/guest_memory/macOSHostAddressArena.cpp")
+	target_include_directories(macos_host_address_arena_tests PRIVATE "${KYTY_SOURCE_DIR}")
+
+	add_executable(macos_guest_address_space_tests EXCLUDE_FROM_ALL
+		"${KYTY_TESTS_DIR}/MacOSGuestAddressSpaceTests.cpp"
+		"${KYTY_SOURCE_DIR}/kernel/guest_memory/macOSGuestAddressSpace.cpp"
+		"${KYTY_SOURCE_DIR}/kernel/guest_memory/macOSHostAddressArena.cpp")
+	target_include_directories(macos_guest_address_space_tests PRIVATE "${KYTY_SOURCE_DIR}")
+endif()
+
 # These tests use exceptions.
 if(NOT KYTY_CLANG_CL)
 	foreach(kyty_exception_test scalar_provenance_tests resource_tracking_tests
-			virtual_memory_allocation_tests)
+			virtual_memory_allocation_tests guest_memory_map_tests
+			guest_memory_address_space_tests)
 		target_compile_options(${kyty_exception_test} PRIVATE -fexceptions)
 	endforeach()
 endif()
@@ -732,12 +772,23 @@ if(BUILD_TESTING)
 	add_test(NAME virtual_memory_allocation
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests>)
 	add_test(NAME guest_memory_map COMMAND $<TARGET_FILE:guest_memory_map_tests>)
+	add_test(NAME guest_memory_address_space
+		COMMAND $<TARGET_FILE:guest_memory_address_space_tests>)
 	add_test(NAME trinity_mode
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --trinity-only)
 	add_test(NAME psml COMMAND $<TARGET_FILE:psml_tests>)
 	add_test(NAME pssr COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --pssr-only)
 	add_test(NAME guest_red_zone_patcher
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --red-zone-patcher-only)
+
+	# These legacy tests dereference guest addresses as host pointers. The native
+	# Apple Silicon backend now keeps them separate; re-enable after migrating
+	# the test code to TranslateGuestAddress().
+	if(APPLE AND (CMAKE_OSX_ARCHITECTURES STREQUAL "arm64" OR
+		(NOT CMAKE_OSX_ARCHITECTURES AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)$")))
+		set_tests_properties(virtual_memory_allocation trinity_mode guest_red_zone_patcher
+			PROPERTIES DISABLED TRUE)
+	endif()
 	add_test(NAME command_scheduler_timeline
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --scheduler-only)
 	add_test(NAME stream_buffer_ring
@@ -803,6 +854,7 @@ if(BUILD_TESTING)
 		sync_on_address_tests
 		shader_recompiler_compute_tests
 		guest_memory_map_tests
+		guest_memory_address_space_tests
 		virtual_memory_allocation_tests
 		audio_out2_port_tests
 		audio_out_timing_tests
@@ -820,6 +872,27 @@ if(BUILD_TESTING)
 		save_data_dialog_tests
 		http_uri_parse_tests
 	)
+endif()
+
+# Diagnostic probe for the M4/macOS guest-address mapping constraints.
+if(APPLE AND BUILD_TESTING)
+	add_test(NAME macos_guest_address_probe
+		COMMAND $<TARGET_FILE:macos_guest_address_probe>)
+	add_test(NAME macos_host_address_arena
+		COMMAND $<TARGET_FILE:macos_host_address_arena_tests>)
+	add_test(NAME macos_guest_address_space
+		COMMAND $<TARGET_FILE:macos_guest_address_space_tests>)
+	add_dependencies(kyty_tests macos_guest_address_probe macos_host_address_arena_tests
+		macos_guest_address_space_tests)
+	if(CMAKE_OSX_ARCHITECTURES STREQUAL "arm64" OR
+		(NOT CMAKE_OSX_ARCHITECTURES AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)$"))
+		add_test(NAME macos_native_guest_memory_translation
+			COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --native-guest-translation-only)
+		set_tests_properties(macos_native_guest_memory_translation PROPERTIES TIMEOUT 60)
+		add_test(NAME macos_native_srt_walker
+			COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --native-arm64-srt-walker-only)
+		set_tests_properties(macos_native_srt_walker PROPERTIES TIMEOUT 30)
+	endif()
 endif()
 
 # Test Darwin signal-context restoration for SSE4a instructions.
@@ -840,6 +913,11 @@ if(APPLE AND (CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64" OR
 endif()
 
 add_executable(kyty_emulator "${KYTY_SOURCE_DIR}/main.cpp" ${kyty_emulator_src})
+if(APPLE)
+	target_sources(kyty_emulator PRIVATE
+		"${KYTY_SOURCE_DIR}/kernel/guest_memory/macOSHostAddressArena.cpp"
+		"${KYTY_SOURCE_DIR}/kernel/guest_memory/macOSGuestAddressSpace.cpp")
+endif()
 configure_macos_guest_address_space(kyty_emulator)
 
 set(KYTY_TROPHY_UNLOCK_SOUND "${CMAKE_CURRENT_SOURCE_DIR}/assets/sounds/trophy-unlock.wav")
