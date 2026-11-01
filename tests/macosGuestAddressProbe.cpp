@@ -19,6 +19,7 @@
 #include <cerrno>
 #include <cinttypes>
 #include <cstdint>
+#include <cstring>
 #include <cstdio>
 #include <cstdlib>
 
