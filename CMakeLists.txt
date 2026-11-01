@@ -378,6 +378,11 @@ list(APPEND check_headers
 
 function(add_kyty_full_emulator_test target source)
 	add_executable(${target} EXCLUDE_FROM_ALL ${source} ${kyty_emulator_src})
+	if(APPLE)
+		target_sources(${target} PRIVATE
+			"${KYTY_SOURCE_DIR}/kernel/guest_memory/macOSHostAddressArena.cpp"
+			"${KYTY_SOURCE_DIR}/kernel/guest_memory/macOSGuestAddressSpace.cpp")
+	endif()
 	target_link_libraries(${target} ${kyty_emulator_link_libraries})
 	target_include_directories(${target} PRIVATE ${inc_headers})
 	if (WIN32)
