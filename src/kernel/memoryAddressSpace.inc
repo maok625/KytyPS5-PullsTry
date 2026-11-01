@@ -405,14 +405,16 @@ public:
 #endif
 		auto host_space = FindHostSpaceForRange(
 		    m_standard_host_space, m_extended_host_space, vaddr, size);
-		if (host_space == nullptr ||
-		    !host_space->MapShared(vaddr, m_fd, backing_offset, size,
+		if (host_space == nullptr) {
+			SetFailure(failure_reason, FailureReason::FixedMapViewFailed);
+			return false;
+		}
+		std::lock_guard lock(m_mutex);
+		if (!host_space->MapShared(vaddr, m_fd, backing_offset, size,
 		                           ToHostMemoryProtection(mode))) {
 			SetFailure(failure_reason, FailureReason::FixedMapViewFailed);
 			return false;
 		}
-
-		std::lock_guard lock(m_mutex);
 		// MapShared replaced exactly this interval inside our permanently owned
 		// host arena. Update the guest-address bookkeeping after the host map succeeds.
 		RemoveMappingsUnlocked(vaddr, size);
