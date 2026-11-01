@@ -289,6 +289,48 @@ int RunCandidateRegionProbes(uint64_t page_size) {
 	return 0;
 }
 
+
+int RunContiguousUserArenaProbes(uint64_t page_size) {
+	// This interval was reported as a large free user-address gap by the M4
+	// probe. Every request is fixed and non-overwriting; successful mappings
+	// are immediately released before the next (larger) request.
+	constexpr mach_vm_address_t arena_start = 0x0000007bec000000ull;
+	constexpr mach_vm_address_t arena_end = 0x000000fc00000000ull;
+	constexpr uint64_t gib = 1024ull * 1024ull * 1024ull;
+	const uint64_t sizes_gib[] = {1, 4, 16, 64, 128, 256, 512};
+
+	std::printf("contiguous_user_arena_start=0x%016" PRIx64
+	            " end=0x%016" PRIx64 " window_bytes=%" PRIu64 "\n",
+	            static_cast<uint64_t>(arena_start),
+	            static_cast<uint64_t>(arena_end),
+	            static_cast<uint64_t>(arena_end - arena_start));
+
+	for (const uint64_t size_gib : sizes_gib) {
+		const mach_vm_size_t size = static_cast<mach_vm_size_t>(size_gib * gib);
+		if (size > arena_end - arena_start) {
+			std::printf("contiguous_user_arena_%" PRIu64 "_gib=skipped_window_too_small\n",
+			            size_gib);
+			continue;
+		}
+
+		char label[64] {};
+		const int label_size = std::snprintf(
+		    label, sizeof(label), "contiguous_user_arena_%llu_gib",
+		    static_cast<unsigned long long>(size_gib));
+		if (label_size < 0 || static_cast<size_t>(label_size) >= sizeof(label)) {
+			std::fprintf(stderr, "could not format contiguous reservation probe label\n");
+			return 2;
+		}
+
+		const int result = ProbeMachFixedRange(label, arena_start,
+		                                       arena_start + size, page_size);
+		if (result != 0) {
+			return result;
+		}
+	}
+	return 0;
+}
+
 } // namespace
 
 int main() {
@@ -333,6 +375,9 @@ int main() {
 		int result = RunFixedAddressProbe(static_cast<uint64_t>(mach_page_size));
 		if (result == 0) {
 			result = RunCandidateRegionProbes(static_cast<uint64_t>(mach_page_size));
+		}
+		if (result == 0) {
+			result = RunContiguousUserArenaProbes(static_cast<uint64_t>(mach_page_size));
 		}
 		std::fflush(stdout);
 		_exit(result);
