@@ -167,16 +167,118 @@ int ProbeMachFixedRange(const char* label, mach_vm_address_t start,
 	return 0;
 }
 
-int RunCandidateRegionProbes(uint64_t page_size) {
-	// These are the macOS x86_64 layout boundaries already defined by Kyty.
-	// Probe them without overwrite before considering their use on native ARM64.
-	const int system_result = ProbeMachFixedRange(
-	    "candidate_system_region", 0x0000040000ull, 0x0fc0000000ull, page_size);
-	if (system_result != 0) {
-		return system_result;
+void PrintMachRangeLayout(const char* label, mach_vm_address_t start,
+                           mach_vm_address_t end) {
+	std::printf("%s_layout_begin=0x%016" PRIx64 " end=0x%016" PRIx64 "\n",
+	            label, static_cast<uint64_t>(start), static_cast<uint64_t>(end));
+	mach_vm_address_t cursor = start;
+	unsigned int      entries = 0;
+
+	while (cursor < end && entries < 64) {
+		mach_vm_address_t region_address = cursor;
+		mach_vm_size_t   region_size = 0;
+		vm_region_basic_info_data_64_t info {};
+		mach_msg_type_number_t info_count = VM_REGION_BASIC_INFO_COUNT_64;
+		mach_port_t object_name = MACH_PORT_NULL;
+
+		const kern_return_t result = mach_vm_region(
+		    mach_task_self(), &region_address, &region_size, VM_REGION_BASIC_INFO_64,
+		    reinterpret_cast<vm_region_info_t>(&info), &info_count, &object_name);
+		if (object_name != MACH_PORT_NULL) {
+			mach_port_deallocate(mach_task_self(), object_name);
+		}
+		if (result == KERN_INVALID_ADDRESS) {
+			std::printf("%s_free=0x%016" PRIx64 " size=%" PRIu64 "\n",
+			            label, static_cast<uint64_t>(cursor),
+			            static_cast<uint64_t>(end - cursor));
+			cursor = end;
+			break;
+		}
+		if (result != KERN_SUCCESS || region_size == 0 ||
+		    UINT64_MAX - region_address < region_size) {
+			std::printf("%s_layout_error=%s (%d) at=0x%016" PRIx64 "\n",
+			            label, mach_error_string(result), result,
+			            static_cast<uint64_t>(cursor));
+			break;
+		}
+
+		if (region_address > cursor) {
+			const auto gap_end = std::min<mach_vm_address_t>(region_address, end);
+			std::printf("%s_free=0x%016" PRIx64 " size=%" PRIu64 "\n",
+			            label, static_cast<uint64_t>(cursor),
+			            static_cast<uint64_t>(gap_end - cursor));
+			cursor = gap_end;
+			if (cursor == end) {
+				break;
+			}
+		}
+
+		const auto region_end = region_address + region_size;
+		if (region_end <= cursor) {
+			std::printf("%s_layout_error=region_scan_did_not_advance at=0x%016" PRIx64 "\n",
+			            label, static_cast<uint64_t>(cursor));
+			break;
+		}
+		const auto occupied_end = std::min<mach_vm_address_t>(region_end, end);
+		std::printf("%s_occupied=0x%016" PRIx64 " size=%" PRIu64 "\n",
+		            label, static_cast<uint64_t>(cursor),
+		            static_cast<uint64_t>(occupied_end - cursor));
+		cursor = occupied_end;
+		++entries;
 	}
-	return ProbeMachFixedRange(
-	    "candidate_user_region", 0x7000000000ull, 0xfc00000000ull, page_size);
+	if (cursor < end) {
+		std::printf("%s_layout_truncated=0x%016" PRIx64 " remaining=%" PRIu64 "\n",
+		            label, static_cast<uint64_t>(cursor),
+		            static_cast<uint64_t>(end - cursor));
+	}
+	std::printf("%s_layout_end\n", label);
+}
+
+int RunCandidateRegionProbes(uint64_t page_size) {
+	// These boundaries mirror Kyty's existing macOS x86_64 linker layout.
+	// First inspect the existing VM map; then probe only individual pages.
+	constexpr mach_vm_address_t managed_start = 0x0000040000ull;
+	constexpr mach_vm_address_t managed_end = 0x07ffffc000ull;
+	constexpr mach_vm_address_t reserved_start = managed_end;
+	constexpr mach_vm_address_t reserved_end = 0x0fc0000000ull;
+	constexpr mach_vm_address_t user_start = 0x7000000000ull;
+	constexpr mach_vm_address_t user_end = 0xfc00000000ull;
+
+	PrintMachRangeLayout("candidate_system_managed", managed_start, managed_end);
+	PrintMachRangeLayout("candidate_system_reserved", reserved_start, reserved_end);
+	PrintMachRangeLayout("candidate_user", user_start, user_end);
+
+	const mach_vm_address_t samples[] = {
+	    managed_start,
+	    managed_start + (managed_end - managed_start) / 2,
+	    managed_end - page_size,
+	    reserved_start,
+	    reserved_start + (reserved_end - reserved_start) / 2,
+	    reserved_end - page_size,
+	    user_start,
+	    user_start + (user_end - user_start) / 2,
+	    user_end - page_size,
+	};
+	const char* labels[] = {
+	    "candidate_managed_first_page",
+	    "candidate_managed_middle_page",
+	    "candidate_managed_last_page",
+	    "candidate_reserved_first_page",
+	    "candidate_reserved_middle_page",
+	    "candidate_reserved_last_page",
+	    "candidate_user_first_page",
+	    "candidate_user_middle_page",
+	    "candidate_user_last_page",
+	};
+
+	for (size_t i = 0; i < sizeof(samples) / sizeof(samples[0]); ++i) {
+		const int result = ProbeMachFixedRange(labels[i], samples[i],
+		                                       samples[i] + page_size, page_size);
+		if (result != 0) {
+			return result;
+		}
+	}
+	return 0;
 }
 
 } // namespace
