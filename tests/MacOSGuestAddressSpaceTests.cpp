@@ -100,6 +100,22 @@ int main() {
 	      "guest-range read-only protection failed");
 	Check(address_space.Protect(first_guest, page_size, read_write),
 	      "guest-range read-write protection restoration failed");
+
+	const uint64_t private_guest = GuestBase + page_size * 12;
+	Check(address_space.CommitAnonymous(private_guest, page_size, read_write),
+	      "private guest mapping commit failed");
+	void* private_address = nullptr;
+	Check(address_space.TranslateToHost(private_guest, page_size, &private_address),
+	      "private guest address translation failed");
+	static constexpr char PrivatePattern[] = "Kyty private guest page";
+	std::memcpy(private_address, PrivatePattern, sizeof(PrivatePattern));
+	Check(std::memcmp(private_address, PrivatePattern, sizeof(PrivatePattern)) == 0,
+	      "private guest mapping did not retain written bytes");
+	Check(address_space.Protect(private_guest, page_size, HostMemoryProtection::Read),
+	      "private guest mapping protection failed");
+	Check(address_space.Unmap(private_guest, page_size),
+	      "private guest mapping unmap failed");
+
 	Check(!address_space.Protect(GuestBase - page_size, page_size, read_write),
 	      "protection outside the guest interval was accepted");
 	Check(!address_space.MapShared(GuestBase + ArenaSize, backing_fd, 0, page_size, read_write),

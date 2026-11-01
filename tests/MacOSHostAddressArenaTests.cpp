@@ -73,6 +73,18 @@ int main() {
 	Check(arena.Protect(first_offset, page_size, read_write),
 	      "read-write protection restoration failed");
 
+	const uint64_t private_offset = page_size * 12;
+	Check(arena.CommitAnonymous(private_offset, page_size, read_write),
+	      "anonymous private mapping failed");
+	static constexpr char PrivatePattern[] = "Kyty private host page";
+	std::memcpy(reinterpret_cast<void*>(arena.Base() + private_offset),
+	            PrivatePattern, sizeof(PrivatePattern));
+	Check(std::memcmp(reinterpret_cast<void*>(arena.Base() + private_offset),
+	                   PrivatePattern, sizeof(PrivatePattern)) == 0,
+	      "anonymous private mapping did not retain written bytes");
+	Check(arena.RestorePlaceholder(private_offset, page_size),
+	      "private placeholder restoration failed");
+
 	Check(arena.RestorePlaceholder(first_offset, page_size),
 	      "first placeholder restoration failed");
 	Check(arena.RestorePlaceholder(second_offset, page_size),

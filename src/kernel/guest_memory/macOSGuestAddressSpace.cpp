@@ -62,6 +62,14 @@ bool MacOSGuestAddressSpace::MapShared(uint64_t guest_base, int backing_fd,
 	       m_arena.MapShared(arena_offset, backing_fd, backing_offset, size, protection);
 }
 
+bool MacOSGuestAddressSpace::CommitAnonymous(uint64_t guest_base, uint64_t size,
+                                                    HostMemoryProtection protection) noexcept {
+	std::lock_guard lock(m_mutex);
+	uint64_t arena_offset = 0;
+	return GuestRangeToOffsetUnlocked(guest_base, size, &arena_offset) &&
+	       m_arena.CommitAnonymous(arena_offset, size, protection);
+}
+
 bool MacOSGuestAddressSpace::Unmap(uint64_t guest_base, uint64_t size) noexcept {
 	std::lock_guard lock(m_mutex);
 	uint64_t arena_offset = 0;

@@ -40,6 +40,8 @@ public:
 	[[nodiscard]] bool MapShared(uint64_t arena_offset, int backing_fd,
 	                             uint64_t backing_offset, uint64_t size,
 	                             HostMemoryProtection protection) noexcept;
+	[[nodiscard]] bool CommitAnonymous(uint64_t arena_offset, uint64_t size,
+	                                   HostMemoryProtection protection) noexcept;
 
 	// Replaces a shared view with an anonymous, inaccessible placeholder.
 	[[nodiscard]] bool RestorePlaceholder(uint64_t arena_offset, uint64_t size) noexcept;

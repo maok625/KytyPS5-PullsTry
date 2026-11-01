@@ -29,6 +29,8 @@ public:
 	[[nodiscard]] bool MapShared(uint64_t guest_base, int backing_fd,
 	                             uint64_t backing_offset, uint64_t size,
 	                             HostMemoryProtection protection) noexcept;
+	[[nodiscard]] bool CommitAnonymous(uint64_t guest_base, uint64_t size,
+	                                   HostMemoryProtection protection) noexcept;
 	[[nodiscard]] bool Unmap(uint64_t guest_base, uint64_t size) noexcept;
 	[[nodiscard]] bool Protect(uint64_t guest_base, uint64_t size,
 	                           HostMemoryProtection protection) noexcept;

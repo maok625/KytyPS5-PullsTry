@@ -124,6 +124,20 @@ bool MacOSHostAddressArena::MapShared(uint64_t arena_offset, int backing_fd,
 	return true;
 }
 
+bool MacOSHostAddressArena::CommitAnonymous(uint64_t arena_offset, uint64_t size,
+                                                    HostMemoryProtection protection) noexcept {
+	std::lock_guard lock(m_mutex);
+	const int native_protection = ToNativeProtection(protection);
+	if (native_protection < 0 || !IsRangeValidUnlocked(arena_offset, size)) {
+		return false;
+	}
+	void* const address = reinterpret_cast<void*>(m_base + arena_offset);
+	void* const committed =
+	    mmap(address, static_cast<size_t>(size), native_protection,
+	         MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
+	return committed != MAP_FAILED && committed == address;
+}
+
 bool MacOSHostAddressArena::RestorePlaceholder(uint64_t arena_offset, uint64_t size) noexcept {
 	std::lock_guard lock(m_mutex);
 	if (!IsRangeValidUnlocked(arena_offset, size)) {
