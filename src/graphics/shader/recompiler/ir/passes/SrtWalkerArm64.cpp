@@ -420,7 +420,8 @@ public:
 		if (value.IsEmpty()) return {};
 		if (value.IsImmediate()) {
 			uint64_t bits = 0;
-			return ImmediateBits(value, bits) ? std::optional<uint64_t>(bits) : std::nullopt;
+			if (!ImmediateBits(value, bits)) return {};
+			return bits;
 		}
 		if (context != 0 && context < m_masks.size() && value == m_masks[context]) return 1u;
 		auto* inst = value.TryInstruction();
@@ -465,8 +466,8 @@ private:
 				return m_runtime.user_data[index];
 			}
 			case ValueOpcode::GetShaderBase:
-				return inst.NumArgs() == 0 ? std::optional<uint64_t>(m_runtime.shader_base)
-				                           : std::nullopt;
+				if (inst.NumArgs() != 0) return {};
+				return m_runtime.shader_base;
 			case ValueOpcode::GetSrtResource:
 				return {};
 			case ValueOpcode::ReadConst: {
@@ -568,7 +569,8 @@ private:
 				return {};
 			}
 		}
-		return have_value ? std::optional<uint64_t>(result) : std::nullopt;
+		if (!have_value) return {};
+		return result;
 	}
 
 	std::optional<uint64_t> EvaluateRead(const Inst& inst, uint32_t context) {
@@ -654,7 +656,7 @@ private:
 				if (offset + width > 32u) return {};
 				const uint32_t mask = width == 32u ? UINT32_MAX
 				                                    : (width == 0u ? 0u : (uint32_t {1} << width) - 1u);
-				uint32_t result = (static_cast<uint32_t>(arg(0)) >> offset) & mask;
+				uint32_t result = width == 0u ? 0u : (static_cast<uint32_t>(arg(0)) >> offset) & mask;
 				if (op == ValueOpcode::BitFieldSExtract && width != 0u &&
 				    (result & (uint32_t {1} << (width - 1u))) != 0u) {
 					result |= ~mask;
@@ -667,9 +669,10 @@ private:
 				if (offset + width > 32u) return {};
 				const uint32_t mask = width == 32u ? UINT32_MAX
 				                                    : (width == 0u ? 0u : (uint32_t {1} << width) - 1u);
-				const uint32_t shifted = mask << offset;
-				return static_cast<uint32_t>((static_cast<uint32_t>(arg(0)) & ~shifted) |
-				                             ((static_cast<uint32_t>(arg(1)) & mask) << offset));
+				if (width == 0u) return static_cast<uint32_t>(arg(0));
+				const uint32_t shifted = offset == 32u ? 0u : mask << offset;
+				const uint32_t inserted = (static_cast<uint32_t>(arg(1)) & mask) << offset;
+				return static_cast<uint32_t>((static_cast<uint32_t>(arg(0)) & ~shifted) | inserted);
 			}
 			case ValueOpcode::IAdd32: return static_cast<uint32_t>(arg(0) + arg(1));
 			case ValueOpcode::IAdd64: return arg(0) + arg(1);
