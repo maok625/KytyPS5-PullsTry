@@ -1,5 +1,7 @@
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
+#if defined(__x86_64__) || defined(_M_X64)
+
 #include "common/abi.h"
 #include "common/assert.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
@@ -1434,3 +1436,5 @@ uint32_t SrtWalkerLoadLength(uint64_t rip) {
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
+
+#endif // x86-64 Xbyak SRT walker
