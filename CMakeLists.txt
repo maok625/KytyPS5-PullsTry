@@ -889,6 +889,9 @@ if(APPLE AND BUILD_TESTING)
 		add_test(NAME macos_native_guest_memory_translation
 			COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --native-guest-translation-only)
 		set_tests_properties(macos_native_guest_memory_translation PROPERTIES TIMEOUT 60)
+		add_test(NAME macos_native_srt_walker
+			COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --native-arm64-srt-walker-only)
+		set_tests_properties(macos_native_srt_walker PROPERTIES TIMEOUT 30)
 	endif()
 endif()
 
