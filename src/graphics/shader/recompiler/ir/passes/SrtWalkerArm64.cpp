@@ -653,7 +653,7 @@ private:
 			case ValueOpcode::BitFieldSExtract: {
 				const auto offset = static_cast<uint32_t>(arg(1));
 				const auto width = static_cast<uint32_t>(arg(2));
-				if (offset + width > 32u) return {};
+				if (static_cast<uint64_t>(offset) + width > 32u) return {};
 				const uint32_t mask = width == 32u ? UINT32_MAX
 				                                    : (width == 0u ? 0u : (uint32_t {1} << width) - 1u);
 				uint32_t result = width == 0u ? 0u : (static_cast<uint32_t>(arg(0)) >> offset) & mask;
@@ -666,7 +666,7 @@ private:
 			case ValueOpcode::BitFieldInsert: {
 				const auto offset = static_cast<uint32_t>(arg(2));
 				const auto width = static_cast<uint32_t>(arg(3));
-				if (offset + width > 32u) return {};
+				if (static_cast<uint64_t>(offset) + width > 32u) return {};
 				const uint32_t mask = width == 32u ? UINT32_MAX
 				                                    : (width == 0u ? 0u : (uint32_t {1} << width) - 1u);
 				if (width == 0u) return static_cast<uint32_t>(arg(0));
