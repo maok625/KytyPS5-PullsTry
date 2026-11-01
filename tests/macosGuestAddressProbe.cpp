@@ -250,10 +250,10 @@ int RunCandidateRegionProbes(uint64_t page_size) {
 
 	const mach_vm_address_t samples[] = {
 	    managed_start,
-	    managed_start + (managed_end - managed_start) / 2,
+	    managed_start + ((managed_end - managed_start) / (2 * page_size)) * page_size,
 	    managed_end - page_size,
 	    reserved_start,
-	    reserved_start + (reserved_end - reserved_start) / 2,
+	    reserved_start + ((reserved_end - reserved_start) / (2 * page_size)) * page_size,
 	    reserved_end - page_size,
 	    user_start,
 	    user_start + (user_end - user_start) / 2,
