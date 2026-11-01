@@ -884,6 +884,12 @@ if(APPLE AND BUILD_TESTING)
 		COMMAND $<TARGET_FILE:macos_guest_address_space_tests>)
 	add_dependencies(kyty_tests macos_guest_address_probe macos_host_address_arena_tests
 		macos_guest_address_space_tests)
+	if(CMAKE_OSX_ARCHITECTURES STREQUAL "arm64" OR
+		(NOT CMAKE_OSX_ARCHITECTURES AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)$"))
+		add_test(NAME macos_native_guest_memory_translation
+			COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --native-guest-translation-only)
+		set_tests_properties(macos_native_guest_memory_translation PROPERTIES TIMEOUT 60)
+	endif()
 endif()
 
 # Test Darwin signal-context restoration for SSE4a instructions.

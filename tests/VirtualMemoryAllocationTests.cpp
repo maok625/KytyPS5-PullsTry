@@ -1413,6 +1413,53 @@ void TestFlexibleReplacementRollbackPreservesMetadata() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+void TestNativeGuestToHostTranslation() {
+	const char* test = "NativeGuestToHostTranslation";
+	constexpr uint64_t PageSize = SceKernelPageSize;
+
+	const auto first = Libs::LibKernel::Memory::AllocateRuntimeMemory(
+	    0, PageSize, Common::VirtualMemory::Mode::ReadWrite, "native_translation_first");
+	Check(test, first != 0, "first private guest allocation failed");
+
+	const auto second = Libs::LibKernel::Memory::AllocateRuntimeMemory(
+	    first + PageSize, PageSize, Common::VirtualMemory::Mode::ReadWrite,
+	    "native_translation_second", true);
+	Check(test, second == first + PageSize, "adjacent fixed guest allocation failed");
+
+	void* first_host = nullptr;
+	void* second_host = nullptr;
+	void* combined_host = nullptr;
+	Check(test, Libs::LibKernel::Memory::TranslateGuestAddress(first, PageSize, &first_host),
+	      "first guest translation failed");
+	Check(test, Libs::LibKernel::Memory::TranslateGuestAddress(second, PageSize, &second_host),
+	      "second guest translation failed");
+	Check(test, Libs::LibKernel::Memory::TranslateGuestAddress(first, PageSize * 2, &combined_host),
+	      "translation across adjacent guest mappings failed");
+	Check(test, combined_host == first_host,
+	      "combined translation did not begin at the first host mapping");
+	Check(test, reinterpret_cast<uintptr_t>(second_host) ==
+	                reinterpret_cast<uintptr_t>(first_host) + PageSize,
+	      "adjacent guest mappings are not adjacent in host memory");
+
+	constexpr std::array<uint8_t, 8> BoundaryPattern {0x4b, 0x59, 0x54, 0x59, 0x50, 0x53, 0x35, 0x21};
+	auto* const combined_bytes = static_cast<uint8_t*>(combined_host);
+	std::memcpy(combined_bytes + PageSize - 4, BoundaryPattern.data(), BoundaryPattern.size());
+	Check(test, std::memcmp(static_cast<uint8_t*>(first_host) + PageSize - 4,
+	                        BoundaryPattern.data(), 4) == 0,
+	      "the first guest mapping did not retain its boundary bytes");
+	Check(test, std::memcmp(second_host, BoundaryPattern.data() + 4, 4) == 0,
+	      "the second guest mapping did not observe contiguous host writes");
+
+	Check(test, Libs::LibKernel::Memory::FreeGuestMemory(first, PageSize * 2),
+	      "combined adjacent guest free failed");
+	void* stale_host = nullptr;
+	Check(test, !Libs::LibKernel::Memory::TranslateGuestAddress(first, PageSize, &stale_host) &&
+	                stale_host == nullptr,
+	      "freed guest range still translated to a host pointer");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestRuntimeMemoryOwnerLifecycle() {
 	const char* test = "RuntimeMemoryOwnerLifecycle";
 	Check(test,
@@ -5715,6 +5762,10 @@ int main(int argc, char** argv) {
 		return RunTrinityTests();
 	}
 	InitSubsystems();
+	if (argc == 2 && std::strcmp(argv[1], "--native-guest-translation-only") == 0) {
+		RunTest(TestNativeGuestToHostTranslation);
+		return g_failed_tests == 0 ? 0 : 1;
+	}
 	if (argc == 2 && std::strcmp(argv[1], "--memory-bottlenecks-only") == 0) {
 		RunTest(TestFlexibleZeroingTracksBackingLifetime);
 		RunTest(TestFlexibleMemoryReuseIsZeroFilled);
