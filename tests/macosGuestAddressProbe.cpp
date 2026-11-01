@@ -175,19 +175,26 @@ void PrintMachRangeLayout(const char* label, mach_vm_address_t start,
 	mach_vm_address_t cursor = start;
 	unsigned int      entries = 0;
 
-	while (cursor < end && entries < 64) {
+	while (cursor < end && entries < 128) {
 		mach_vm_address_t region_address = cursor;
-		mach_vm_size_t   region_size = 0;
-		vm_region_basic_info_data_64_t info {};
-		mach_msg_type_number_t info_count = VM_REGION_BASIC_INFO_COUNT_64;
-		mach_port_t object_name = MACH_PORT_NULL;
+		mach_vm_size_t    region_size = 0;
+		natural_t         depth = 0;
+		vm_region_submap_info_data_64_t info {};
 
-		const kern_return_t result = mach_vm_region(
-		    mach_task_self(), &region_address, &region_size, VM_REGION_BASIC_INFO_64,
-		    reinterpret_cast<vm_region_info_t>(&info), &info_count, &object_name);
-		if (object_name != MACH_PORT_NULL) {
-			mach_port_deallocate(mach_task_self(), object_name);
+		kern_return_t result = KERN_SUCCESS;
+		for (;;) {
+			mach_msg_type_number_t info_count = VM_REGION_SUBMAP_INFO_COUNT_64;
+			result = mach_vm_region_recurse(
+			    mach_task_self(), &region_address, &region_size, &depth,
+			    reinterpret_cast<vm_region_recurse_info_t>(&info), &info_count);
+			if (result != KERN_SUCCESS || !info.is_submap) {
+				break;
+			}
+			// Descend into the returned submap at the first address in our scan range.
+			region_address = std::max(region_address, cursor);
+			++depth;
 		}
+
 		if (result == KERN_INVALID_ADDRESS) {
 			std::printf("%s_free=0x%016" PRIx64 " size=%" PRIu64 "\n",
 			            label, static_cast<uint64_t>(cursor),
