@@ -708,7 +708,7 @@ struct ResourcePlan {
 	bool                                resource_tracking_complete = false;
 	ShaderInfo                          info;
 	UniformFillPlan                     uniform_fill;
-	// x86 walker over the retained SRT, descriptor and condition values.
+	// Optional x86-64 JIT state. Native ARM64 evaluates the same retained plan directly.
 	std::unique_ptr<Xbyak::CodeGenerator> srt_code;
 	uint32_t                              srt_user_data = 0; // User-data DWORDs the walker reads.
 	uint32_t                              srt_captures  = 0; // Scratch offset of loaded addresses.
