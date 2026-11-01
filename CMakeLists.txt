@@ -675,12 +675,18 @@ if(APPLE)
 	add_executable(macos_guest_address_probe EXCLUDE_FROM_ALL
 		"${KYTY_TESTS_DIR}/macosGuestAddressProbe.cpp")
 
-	# Native macOS host-arena implementation is tested separately from the live
-	# guest allocator until the translation layer is ready for integration.
+	# Host arenas and explicit guest-to-host translation are exercised separately
+	# from the live allocator while remaining guest-pointer call sites are migrated.
 	add_executable(macos_host_address_arena_tests EXCLUDE_FROM_ALL
 		"${KYTY_TESTS_DIR}/MacOSHostAddressArenaTests.cpp"
 		"${KYTY_SOURCE_DIR}/kernel/guest_memory/macOSHostAddressArena.cpp")
 	target_include_directories(macos_host_address_arena_tests PRIVATE "${KYTY_SOURCE_DIR}")
+
+	add_executable(macos_guest_address_space_tests EXCLUDE_FROM_ALL
+		"${KYTY_TESTS_DIR}/MacOSGuestAddressSpaceTests.cpp"
+		"${KYTY_SOURCE_DIR}/kernel/guest_memory/macOSGuestAddressSpace.cpp"
+		"${KYTY_SOURCE_DIR}/kernel/guest_memory/macOSHostAddressArena.cpp")
+	target_include_directories(macos_guest_address_space_tests PRIVATE "${KYTY_SOURCE_DIR}")
 endif()
 
 # These tests use exceptions.
@@ -860,7 +866,10 @@ if(APPLE AND BUILD_TESTING)
 		COMMAND $<TARGET_FILE:macos_guest_address_probe>)
 	add_test(NAME macos_host_address_arena
 		COMMAND $<TARGET_FILE:macos_host_address_arena_tests>)
-	add_dependencies(kyty_tests macos_guest_address_probe macos_host_address_arena_tests)
+	add_test(NAME macos_guest_address_space
+		COMMAND $<TARGET_FILE:macos_guest_address_space_tests>)
+	add_dependencies(kyty_tests macos_guest_address_probe macos_host_address_arena_tests
+		macos_guest_address_space_tests)
 endif()
 
 # Test Darwin signal-context restoration for SSE4a instructions.
