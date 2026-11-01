@@ -27,8 +27,10 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <shared_mutex>
 #include <span>
+#include <utility>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
