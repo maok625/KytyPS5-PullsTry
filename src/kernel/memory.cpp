@@ -3305,6 +3305,7 @@ bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode m
 }
 
 bool TranslateGuestAddress(uint64_t guest_address, uint64_t minimum_size, void** host_address) {
+	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
 	return g_guest_address_space != nullptr &&
 	       g_guest_address_space->TranslateToHost(guest_address, minimum_size, host_address);
 }
