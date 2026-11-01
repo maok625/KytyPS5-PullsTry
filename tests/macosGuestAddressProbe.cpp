@@ -6,6 +6,9 @@
 #include <mach/vm_map.h>
 #include <mach/vm_region.h>
 #include <mach/vm_statistics.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/sysctl.h>
 #include <sys/types.h>
 #include <sys/utsname.h>
@@ -331,6 +334,145 @@ int RunContiguousUserArenaProbes(uint64_t page_size) {
 	return 0;
 }
 
+
+int RunArenaBackingAliasProbe(uint64_t page_size) {
+	constexpr mach_vm_address_t arena_start = 0x0000007bec000000ull;
+	constexpr uint64_t gib = 1024ull * 1024ull * 1024ull;
+	constexpr mach_vm_size_t arena_size = 512ull * gib;
+	constexpr uint64_t first_offset = 0x01000000ull;
+	constexpr uint64_t second_offset = 0x02000000ull;
+
+	if (page_size == 0 || first_offset % page_size != 0 ||
+	    second_offset % page_size != 0 || second_offset + page_size > arena_size) {
+		std::fprintf(stderr, "arena backing-alias probe has invalid page alignment\n");
+		return 2;
+	}
+
+	mach_vm_address_t arena = arena_start;
+	const kern_return_t reserve_result =
+	    mach_vm_allocate(mach_task_self(), &arena, arena_size, VM_FLAGS_FIXED);
+	if (reserve_result != KERN_SUCCESS || arena != arena_start) {
+		std::printf("arena_backing_alias_probe=skipped_reservation_unavailable\n");
+		std::printf("arena_backing_alias_reserve_result=%d message=%s\n",
+		            reserve_result, mach_error_string(reserve_result));
+		return 0;
+	}
+	std::printf("arena_backing_alias_arena=reserved start=0x%016" PRIx64
+	            " size=%" PRIu64 "\n",
+	            static_cast<uint64_t>(arena), static_cast<uint64_t>(arena_size));
+
+	char shm_name[96] {};
+	const int name_size = std::snprintf(
+	    shm_name, sizeof(shm_name), "/kyty-arena-alias-%d-%llx", static_cast<int>(getpid()),
+	    static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(&arena)));
+	if (name_size < 0 || static_cast<size_t>(name_size) >= sizeof(shm_name)) {
+		(void)mach_vm_deallocate(mach_task_self(), arena, arena_size);
+		std::fprintf(stderr, "could not format shared-memory name\n");
+		return 2;
+	}
+
+	const int fd = shm_open(shm_name, O_RDWR | O_CREAT | O_EXCL, 0600);
+	if (fd < 0) {
+		std::printf("arena_backing_alias_probe=failed_shm_open errno=%d\n", errno);
+		(void)mach_vm_deallocate(mach_task_self(), arena, arena_size);
+		return 2;
+	}
+	(void)shm_unlink(shm_name);
+
+	int result = 0;
+	uint8_t* backing = nullptr;
+	void* view_a = MAP_FAILED;
+	void* view_b = MAP_FAILED;
+
+	if (ftruncate(fd, static_cast<off_t>(page_size)) != 0) {
+		std::printf("arena_backing_alias_probe=failed_ftruncate errno=%d\n", errno);
+		result = 2;
+	} else {
+		void* mapped_backing = mmap(nullptr, page_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+		if (mapped_backing == MAP_FAILED) {
+			std::printf("arena_backing_alias_probe=failed_backing_map errno=%d\n", errno);
+			result = 2;
+		} else {
+			backing = static_cast<uint8_t*>(mapped_backing);
+			const auto map_view = [&](uint64_t offset) -> void* {
+				void* address = reinterpret_cast<void*>(arena_start + offset);
+				void* mapped = mmap(address, page_size, PROT_READ | PROT_WRITE,
+				                    MAP_SHARED | MAP_FIXED, fd, 0);
+				if (mapped == MAP_FAILED || mapped != address) {
+					std::printf("arena_backing_alias_view=unavailable offset=0x%016" PRIx64
+					            " errno=%d\n",
+					            offset, errno);
+					return MAP_FAILED;
+				}
+				return mapped;
+			};
+
+			view_a = map_view(first_offset);
+			if (view_a != MAP_FAILED) {
+				view_b = map_view(second_offset);
+			}
+			if (view_a != MAP_FAILED && view_b != MAP_FAILED) {
+				static constexpr char pattern[] = "KytyPS5 shared backing alias probe";
+				std::memcpy(backing, pattern, sizeof(pattern));
+				const bool alias_a_matches = std::memcmp(view_a, pattern, sizeof(pattern)) == 0;
+				const bool alias_b_matches = std::memcmp(view_b, pattern, sizeof(pattern)) == 0;
+				std::printf("arena_backing_alias_coherence=%s first=%s second=%s\n",
+				            alias_a_matches && alias_b_matches ? "success" : "failed",
+				            alias_a_matches ? "success" : "failed",
+				            alias_b_matches ? "success" : "failed");
+				if (!alias_a_matches || !alias_b_matches) {
+					result = 1;
+				}
+
+				const int protect_result = mprotect(view_a, page_size, PROT_READ);
+				const int restore_protect_result =
+				    protect_result == 0 ? mprotect(view_a, page_size, PROT_READ | PROT_WRITE) : -1;
+				std::printf("arena_backing_alias_protect=%s restore=%s\n",
+				            protect_result == 0 ? "success" : "failed",
+				            restore_protect_result == 0 ? "success" : "failed");
+				if (protect_result != 0 || restore_protect_result != 0) {
+					result = 1;
+				}
+			} else {
+				result = 1;
+			}
+		}
+	}
+
+	const auto restore_placeholder = [&](void* view, const char* label) {
+		if (view == MAP_FAILED) {
+			return;
+		}
+		void* restored = mmap(view, page_size, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
+		if (restored == MAP_FAILED || restored != view) {
+			std::printf("%s=failed errno=%d\n", label, errno);
+			result = 2;
+		} else {
+			std::printf("%s=success\n", label);
+		}
+	};
+	restore_placeholder(view_a, "arena_backing_alias_restore_first_placeholder");
+	restore_placeholder(view_b, "arena_backing_alias_restore_second_placeholder");
+
+	if (backing != nullptr && munmap(backing, page_size) != 0) {
+		std::printf("arena_backing_alias_unmap_backing=failed errno=%d\n", errno);
+		result = 2;
+	}
+	if (close(fd) != 0) {
+		std::printf("arena_backing_alias_close_fd=failed errno=%d\n", errno);
+		result = 2;
+	}
+	const kern_return_t release_result = mach_vm_deallocate(mach_task_self(), arena, arena_size);
+	std::printf("arena_backing_alias_release=%s\n",
+	            release_result == KERN_SUCCESS ? "success" : "failed");
+	if (release_result != KERN_SUCCESS) {
+		std::printf("arena_backing_alias_release_error=%d message=%s\n",
+		            release_result, mach_error_string(release_result));
+		result = 2;
+	}
+	return result;
+}
+
 } // namespace
 
 int main() {
@@ -378,6 +520,9 @@ int main() {
 		}
 		if (result == 0) {
 			result = RunContiguousUserArenaProbes(static_cast<uint64_t>(mach_page_size));
+		}
+		if (result == 0) {
+			result = RunArenaBackingAliasProbe(static_cast<uint64_t>(mach_page_size));
 		}
 		std::fflush(stdout);
 		_exit(result);
