@@ -33,6 +33,10 @@ struct GraphicContext {
 	bool                               shader_buffer_int64_atomics_enabled   = false;
 	bool                               supports_image_view_min_lod           = true;
 	bool                               shader_cull_distance_enabled          = false;
+	// VK_EXT_image_view_min_lod enabled with its feature: the T# MinLod clamp goes to the image view natively.
+	bool                               has_view_min_lod                      = false;
+	// No native clamp: the T# MinLod is folded into the view base level.
+	bool                               min_lod_remap                         = false;
 	// bool fp64_denorm_preserve = false; // Temporarily disabled.
 	bool                               attachment_feedback_loop_enabled      = false;
 	bool                               provoking_vertex_last_enabled         = false;

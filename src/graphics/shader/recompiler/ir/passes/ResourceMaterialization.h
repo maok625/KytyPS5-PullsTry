@@ -1,6 +1,7 @@
 #ifndef EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_RESOURCEMATERIALIZATION_H_
 #define EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_RESOURCEMATERIALIZATION_H_
 
+#include "graphics/shader/minLodShift.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -34,6 +35,7 @@ struct ResourceSpecialization {
 		bool                          skip_degamma               = false;
 		bool                          fmask                      = false;
 		bool                          heap                       = false;
+		Libs::Graphics::MinLodResinfo min_lod_resinfo;
 		bool                          operator==(const Image&) const = default;
 	};
 
