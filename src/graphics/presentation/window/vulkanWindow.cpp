@@ -313,8 +313,8 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 			for (const char* ext: device_extensions) {
 				if (!HasExtension(available_extensions, ext)) {
 #if defined(__APPLE__)
-					// VK_EXT_image_view_min_lod is optional on MoltenVK; the image-view path
-					// remaps the base level when it is missing.
+	// VK_EXT_image_view_min_lod is optional: if its feature is unavailable, the image-view path
+	// remaps the base level instead.
 					if (std::strcmp(ext, VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME) == 0) {
 						LOGF("image view minLod extension is not supported (MoltenVK fallback)\n");
 						continue;
@@ -482,7 +482,7 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	}
 	graphics.has_view_min_lod = graphics.supports_image_view_min_lod;
 	graphics.min_lod_remap    = !graphics.has_view_min_lod;
-	LOGF("T# MinLod: view min lod feature=%d remap_to_base_level=%d\\n",
+	LOGF("T# MinLod: view min lod feature=%d remap_to_base_level=%d\n",
 	     graphics.has_view_min_lod ? 1 : 0, graphics.min_lod_remap ? 1 : 0);
 	const bool barycentric_supported = barycentric.fragmentShaderBarycentric == VK_TRUE;
 	if (!barycentric_supported) {
