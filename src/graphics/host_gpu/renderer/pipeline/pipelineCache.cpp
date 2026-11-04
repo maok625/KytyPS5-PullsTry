@@ -371,41 +371,6 @@ ShaderModule* PipelineCache::CompileModule(Program& program, const ProgramKey& k
 	}
 	return &module;
 }
-		const auto user_data = std::span(params.user_data).first(params.user_data_count);
-		lookup_key.stage           = stage;
-		lookup_key.hash            = params.hash;
-		lookup_key.user_data_count = params.user_data_count;
-		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
-		BuildStageStaticKey(input_info, lookup_key.static_state);
-		auto                                         entry = programs.find(lookup_key);
-		ShaderRecompiler::IR::SrtRuntime             runtime {
-		    .user_data                  = user_data,
-		    .shader_base                = params.Base(),
-		    .read_specialization_memory = ReadShaderGuestMemory,
-		    .min_lod_remap              = graphics.min_lod_remap,
-		};
-		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
-			runtime.workgroup_counts = input_info.workgroup_counts;
-			runtime.indirect_args_address = input_info.indirect_args_address;
-		}
-		bool source_changed = false;
-		if (entry != programs.end()) {
-			auto& cached = entry->second;
-			if (cached.skip_dispatch) return {};
-			Permutation* permutation = nullptr;
-			if (cached.call_source) {
-				source_changed = cached.RefreshCallSource(runtime);
-				if (!source_changed) permutation = cached.FindPermutation<true>(runtime, push_data_cursor);
-			} else {
-				permutation = cached.FindPermutation<false>(runtime, push_data_cursor);
-			}
-			if (permutation != nullptr) {
-				input_info.stage = {.program = &permutation->program, .resources = &entry->second.resources};
-				permutation->program.bindings.AdvancePushData(push_data_cursor);
-				return permutation->handle;
-			}
-		}
-
 template <typename InputInfo>
 const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputInfo& input_info,
                                               uint32_t& push_data_cursor) {
@@ -415,6 +380,7 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	    .shader_base                = params.Base(),
 	    .read_specialization_memory = ReadShaderGuestMemory,
 	    .image_heap                 = m_image_heap,
+	    .min_lod_remap              = m_graphics.min_lod_remap,
 	};
 	ShaderRecompiler::CompileOptions options {.wave_size = input_info.wave_size};
 	if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
