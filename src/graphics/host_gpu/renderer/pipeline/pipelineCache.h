@@ -26,7 +26,6 @@
 #include <type_traits>
 #include <unordered_map>
 #include <vector>
-#include <unordered_set>
 
 namespace Libs::Graphics {
 
@@ -258,7 +257,9 @@ private:
 	template <typename InputInfo>
 	const ShaderModule* GetProgram(const ShaderParams& params, InputInfo& input_info,
 	                               uint32_t& push_data_cursor);
-	ShaderModule& CompileModule(Program& program, const ProgramKey& key,
+	// Null when the program needs device features the host lacks; the program is then marked
+	// skip_dispatch so later draws fail fast.
+	ShaderModule* CompileModule(Program& program, const ProgramKey& key,
 	                            ShaderRecompiler::CompileOptions  options,
 	                            ShaderRecompiler::TranslateResult translated,
 	                            uint32_t                          push_data_cursor);

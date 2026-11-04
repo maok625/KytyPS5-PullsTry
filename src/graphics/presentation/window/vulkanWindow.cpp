@@ -677,7 +677,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	device_features.shaderClipDistance                   = VK_TRUE;
 #if defined(__APPLE__)
 	device_features.shaderCullDistance =
-	    supported_features2.features.shaderCullDistance == VK_TRUE ? VK_TRUE : VK_FALSE;
+	    supported2.features.shaderCullDistance == VK_TRUE ? VK_TRUE : VK_FALSE;
 #else
 	device_features.shaderCullDistance                   = VK_TRUE;
 #endif
