@@ -519,16 +519,16 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 			translated = ShaderRecompiler::TranslateProgram(current->decoded, options);
 		}
 		const auto user_data = std::span(params.user_data).first(params.user_data_count);
-		lookup_key.stage           = stage;
-		lookup_key.hash            = params.hash;
-		lookup_key.user_data_count = params.user_data_count;
-		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
-		BuildStageStaticKey(input_info, lookup_key.static_state);
-		if (unsupported_programs.contains(lookup_key)) {
+		m_lookup_key.stage           = stage;
+		m_lookup_key.hash            = params.hash;
+		m_lookup_key.user_data_count = params.user_data_count;
+		m_lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
+		BuildStageStaticKey(input_info, m_lookup_key.static_state);
+		if (unsupported_programs.contains(m_lookup_key)) {
 			// A previous compile needed device features the host lacks; fail fast.
 			return ShaderProgram{};
 		}
-		auto                                         entry = programs.find(lookup_key);
+		auto                                         entry = programs.find(m_lookup_key);
 		ShaderRecompiler::IR::SrtRuntime             runtime {
 		    .user_data                  = user_data,
 		    .shader_base                = params.Base(),
@@ -615,7 +615,7 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		}
 		if (entry == programs.end()) {
 			auto retained = source.call ? std::make_unique<ShaderRecompiler::ShaderSource>(std::move(source)) : nullptr;
-			entry = programs.try_emplace(lookup_key,
+			entry = programs.try_emplace(m_lookup_key,
 			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program), std::move(retained)).first;
 			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
 			    entry->second.resource_plan, runtime, entry->second.resources,
@@ -632,7 +632,7 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		                                     entry->second.specialization, push_data_cursor,
 		                                     entry->second.FunctionCode());
 		if (!compiled) {
-			unsupported_programs.insert(lookup_key);
+			unsupported_programs.insert(m_lookup_key);
 			return ShaderProgram{};
 		}
 		entry->second.permutations.push_back(std::move(*compiled));
@@ -682,7 +682,7 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	// Programs whose compiled outputs need device features the host lacks (currently
 	// cull distance). Remembered so later draws fail fast instead of recompiling.
 	std::unordered_set<ProgramKey, ProgramKeyHash> unsupported_programs;
-	ProgramKey                                                  lookup_key;
+	ProgramKey                                                  m_lookup_key;
 	GraphicContext&                                             graphics;
 	uint64_t                                                    next_shader_id = 0;
 };
