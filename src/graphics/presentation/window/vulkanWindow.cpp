@@ -276,7 +276,14 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 #endif
 		check_feature(device_features2.features.largePoints, "largePoints");
 		check_feature(device_features2.features.multiViewport, "multiViewport");
+#if defined(__APPLE__)
+		// KosmicKrisp has no fillModeNonSolid; line/point polygon modes fall back to fill.
+		if (device_features2.features.fillModeNonSolid != VK_TRUE) {
+			LOGF("fillModeNonSolid is not supported\n");
+		}
+#else
 		check_feature(device_features2.features.fillModeNonSolid, "fillModeNonSolid");
+#endif
 		check_feature(device_features2.features.fragmentStoresAndAtomics,
 		              "fragmentStoresAndAtomics");
 
@@ -610,7 +617,8 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	}
 	device_features.largePoints                          = VK_TRUE;
 	device_features.multiViewport                        = VK_TRUE;
-	device_features.fillModeNonSolid                      = VK_TRUE;
+	device_features.fillModeNonSolid                      = supported_features2.features.fillModeNonSolid;
+	graphics.fill_mode_non_solid_enabled                 = (device_features.fillModeNonSolid == VK_TRUE);
 	device_features.vertexPipelineStoresAndAtomics       = VK_TRUE;
 	// Storage image sample counts beyond 1x require the feature.
 	if (!device_features.shaderStorageImageMultisample) {
@@ -973,9 +981,8 @@ void WindowContext::CreateVulkan() {
 
 #if defined(__APPLE__)
 	// MoltenVK lacks VK_EXT_depth_clip_enable and VK_EXT_color_write_enable; the renderer
-	// falls back to default depth clipping and static color-write masks on macOS. It also
-	// requires VK_KHR_portability_subset per the Vulkan portability spec.
-	device_extensions.push_back("VK_KHR_portability_subset");
+	// falls back to default depth clipping and static color-write masks on macOS. A device that
+	// exposes VK_KHR_portability_subset must have it enabled; that is done after device selection.
 #else
 	device_extensions.push_back(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
 	device_extensions.push_back(VK_EXT_COLOR_WRITE_ENABLE_EXTENSION_NAME);
@@ -1019,8 +1026,14 @@ void WindowContext::CreateVulkan() {
 			device_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 			graphic_ctx.memory_budget_ext_enabled = true;
 		}
-		for (const auto* extension: {VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME,
-		                             VK_KHR_MAINTENANCE_8_EXTENSION_NAME,
+#if defined(__APPLE__)
+		// MoltenVK requires VK_KHR_portability_subset; a conformant driver (KosmicKrisp) does not
+		// expose it, and requesting it there fails vkCreateDevice.
+		if (HasExtension(available_extensions, "VK_KHR_portability_subset")) {
+			device_extensions.push_back("VK_KHR_portability_subset");
+		}
+#endif
+		for (const auto* extension: {VK_KHR_MAINTENANCE_8_EXTENSION_NAME,
 		                             VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,
 		                             VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
 		                             VK_EXT_MESH_SHADER_EXTENSION_NAME,
