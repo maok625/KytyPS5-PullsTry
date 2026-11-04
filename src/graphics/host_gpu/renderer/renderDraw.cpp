@@ -846,13 +846,40 @@ static bool ResolvePrimitiveRestart(const CommandBuffer& buffer,
 }
 
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
-                                            DrawRenderState& state) {
-	m_context.GetImageHeap().BeginDraw();
-	m_context.GetPipelineCache().GetGraphicsPrograms(buffer, state);
-	// Vertex programs beyond the host mesh limits or with unsupported call targets are not
-	// compiled.
-	if (state.vertex_info[0].stage.module == nullptr) {
+                                            uint32_t            render_target_slice_offset,
+	                                        DrawRenderState& state) {
+	const auto& shader_regs       = buffer.GetRegisters().GetShaderRegisters();
+	const auto  color_output_mask = DrawColorOutputMask(buffer.GetRegisters());
+	state.ps_active = buffer.GetShaders().GetPs().ps_regs.data_addr != 0 &&
+	                  (color_output_mask != 0 ||
+	                   PixelShaderHasDepthOrCoverageSideEffects(shader_regs));
+	RefreshShaders(buffer, draw, color_output_mask, state);
+	const bool tess_active =
+	    buffer.GetUserConfig().GetPrimType() == Prospero::PrimitiveType::kPatch;
+	if (!state.programs.vertex[0] ||
+	    (tess_active && (!state.programs.vertex[1] || !state.programs.vertex[2])) ||
+	    (state.ps_active && !state.programs.pixel)) {
+		// A shader needs device features the host lacks (e.g. cull distance); the
+		// program was dropped before SPIR-V emission, so skip the draw.
+		static std::atomic_uint log_count {0};
+		if (log_count.fetch_add(1, std::memory_order_relaxed) < 8) {
+			LOGF("Draw %s: shader program uses unsupported device features; skipping\n",
+			     draw.Name());
+		}
 		return false;
+	}
+	uint32_t mrt_mask = 0;
+	if (state.ps_active) {
+		for (const auto& output: state.ps_input_info.stage.program->info.outputs) {
+			if (output.kind == ShaderRecompiler::IR::StageOutputKind::Mrt ||
+			    output.kind == ShaderRecompiler::IR::StageOutputKind::ObjectPrimitiveId) {
+				mrt_mask |= 1u << output.location;
+			}
+		}
+	}
+	mrt_mask &= color_output_mask;
+	if (draw.IsIndexed()) {
+		LogDrawPhase(draw.Name(), "ResolveRenderColorTarget");
 	}
 	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
 		if ((state.mrt_mask & (1u << slot)) != 0) {

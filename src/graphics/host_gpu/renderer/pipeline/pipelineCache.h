@@ -26,6 +26,7 @@
 #include <type_traits>
 #include <unordered_map>
 #include <vector>
+#include <unordered_set>
 
 namespace Libs::Graphics {
 
