@@ -191,8 +191,7 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 			continue;
 		}
 
-		vk::PhysicalDeviceImageViewMinLodFeaturesEXT  min_lod {};
-		vk::PhysicalDeviceColorWriteEnableFeaturesEXT color_write {.pNext = &min_lod};
+		vk::PhysicalDeviceColorWriteEnableFeaturesEXT color_write {};
 		vk::PhysicalDeviceDepthClipEnableFeaturesEXT  clip_enable {.pNext = &color_write};
 		vk::PhysicalDeviceDepthClipControlFeaturesEXT clip_control {.pNext = &clip_enable};
 		vk::PhysicalDeviceRobustness2FeaturesEXT      robustness2 {.pNext = &clip_control};
@@ -220,15 +219,7 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 #else
 		check_feature(color_write.colorWriteEnable, "colorWriteEnable");
 #endif
-		// VK_EXT_image_view_min_lod is optional: without it the T# MinLod is folded into the view base level.
-
-#if defined(__APPLE__)
-		if (min_lod.minLod != VK_TRUE) {
-			LOGF("image view minLod is not supported (MoltenVK); falling back to base-level remap\n");
-		}
-#else
-		check_feature(min_lod.minLod, "image view minLod");
-#endif
+		// VK_EXT_image_view_min_lod is optional; VulkanCreateDevice queries and enables it when available.
 
 		check_feature(clip_control.depthClipControl, "depthClipControl");
 #if defined(__APPLE__)
