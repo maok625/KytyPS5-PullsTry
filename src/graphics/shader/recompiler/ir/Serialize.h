@@ -55,6 +55,8 @@ template <template <class...> class Of, class... A> constexpr bool IsA<Of<A...>,
 template <class T, class U> concept Is = std::is_same_v<std::remove_const_t<T>, U>;
 
 template <class S, class T> void Io(S& io, T& value);
+// MinLodResinfo has a C-array member, so its five values need an explicit field-wise encoding.
+template <class S, Is<Libs::Graphics::MinLodResinfo> T> void Io(S& io, T& value);
 
 template <class S, class... T> void IoAll(S& io, T&&... values) {
 	(Io(io, values), ...);
@@ -141,6 +143,12 @@ template <class S, class T> void Io(S& io, T& value) {
 	}
 }
 
+// MinLodResinfo is shared by ImageResource and ResourceSpecialization::Image. Serialize the
+// extent array element-by-element so the cache format never depends on struct padding.
+template <class S, Is<Libs::Graphics::MinLodResinfo> T> void Io(S& io, T& value) {
+	IoAll(io, value.shift, value.extent[0], value.extent[1], value.extent[2], value.levels);
+}
+
 // Binds every field, so that a field added later fails to compile until it is listed.
 #define KYTY_IO_FIELDS(Struct, ...)                                                                \
 	template <class S, Is<Struct> T> void Io(S& io, T& object) {                                   \
@@ -149,7 +157,7 @@ template <class S, class T> void Io(S& io, T& value) {
 	}
 KYTY_IO_FIELDS(MemoryInfo, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x, y)
 KYTY_IO_FIELDS(BufferResource, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q)
-KYTY_IO_FIELDS(ImageResource, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x, y)
+KYTY_IO_FIELDS(ImageResource, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x, y, z, aa)
 KYTY_IO_FIELDS(SamplerResource, a, b, c, d, e, f, g, h, i, j, k)
 KYTY_IO_FIELDS(SampledResourcePair, a, b, c)
 KYTY_IO_FIELDS(StageInput, a, b, c, d, e)
@@ -169,7 +177,7 @@ KYTY_IO_FIELDS(ResourceBlock, a, b, c, d, e)
 KYTY_IO_FIELDS(UniformFill, a, b, c, d, e, f)
 KYTY_IO_FIELDS(UniformFillPlan, a, b, c, d)
 KYTY_IO_FIELDS(ResourceSpecialization::Buffer, a, b, c, d, e, f, g, h)
-KYTY_IO_FIELDS(ResourceSpecialization::Image, a, b, c, d, e, f, g, h, i, j, k, l, m)
+KYTY_IO_FIELDS(ResourceSpecialization::Image, a, b, c, d, e, f, g, h, i, j, k, l, m, n)
 KYTY_IO_FIELDS(ResourceSpecialization::Sampler, a, b, c)
 KYTY_IO_FIELDS(ResourceSpecialization, a, b, c)
 KYTY_IO_FIELDS(Bindings, a, b, c, d, e)
