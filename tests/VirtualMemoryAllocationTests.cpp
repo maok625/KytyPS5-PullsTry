@@ -59,9 +59,6 @@
 #endif
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
 #include <windows.h>
 #ifdef DeleteFile
 #undef DeleteFile
@@ -176,7 +173,6 @@ void InitSubsystems() {
 	}
 
 	static Common::Subsystems subsystems;
-	Common::VirtualMemory::Init();
 	Common::InitializeThreads();
 	subsystems.Initialize<Config::Lifecycle>();
 
@@ -1812,6 +1808,12 @@ void TestCopySparseMemoryMappings() {
 	                !CopySparseMemory(base, &canary, 0) &&
 	                !CopySparseMemory(base, nullptr, sizeof(canary)) && canary == UINT64_MAX,
 	      "invalid sparse copy accepted its range or changed its destination");
+	Check(test, !TryReadBacking(UINT64_MAX - 3, &canary, sizeof(canary)) &&
+	                !TryReadBacking(base, &canary, 0) && canary == UINT64_MAX,
+	      "invalid backing read accepted its range or changed its destination");
+	Check(test, !TryWriteBacking(UINT64_MAX - 3, &canary, sizeof(canary)) &&
+	                !TryWriteBacking(base, &canary, 0),
+	      "invalid backing write accepted its range");
 	CheckOk(test, KernelMunmap(base, SceKernelPageSize), "unmap shared first page");
 	for (const auto page : {1u, 3u}) {
 		Check(test, FreeGuestMemory(base + page * SceKernelPageSize, SceKernelPageSize),

@@ -120,6 +120,10 @@ int KYTY_SYSV_ABI NetPoolDestroy(int memid) {
 	return FinishNetCall(Net::NetPoolDestroy(memid));
 }
 
+int KYTY_SYSV_ABI NetGetMemoryPoolStats(int memid, Net::NetMemoryPoolStats* stats) {
+	return FinishNetCall(Net::NetGetMemoryPoolStats(memid, stats));
+}
+
 int KYTY_SYSV_ABI NetResolverCreate(const char* name, int memid, int flags) {
 	return FinishNetCall(Net::NetResolverCreate(name, memid, flags));
 }
@@ -246,6 +250,7 @@ LIB_DEFINE(InitNet_1_Net) {
 	LIB_FUNC("OXXX4mUk3uk", LibNet::NetConnect);
 	LIB_FUNC("dgJBaeJnGpo", LibNet::NetPoolCreate);
 	LIB_FUNC("K7RlrTkI-mw", LibNet::NetPoolDestroy);
+	LIB_FUNC("rMyh97BU5pY", LibNet::NetGetMemoryPoolStats);
 	LIB_FUNC("C4UgDHHPvdw", LibNet::NetResolverCreate);
 	LIB_FUNC("kJlYH5uMAWI", LibNet::NetResolverDestroy);
 	LIB_FUNC("AzqoBha7js4", LibNet::NetResolverAbort);
@@ -1182,6 +1187,10 @@ static int KYTY_SYSV_ABI Http2SetResolveTimeOut(int id, uint32_t usec) {
 	return 0;
 }
 
+static int KYTY_SYSV_ABI Http2SetResolveRetry(int, int) {
+	return 0;
+}
+
 static int KYTY_SYSV_ABI Http2SetTimeOut(int id, uint32_t usec) {
 	PRINT_NAME();
 
@@ -1504,6 +1513,7 @@ LIB_DEFINE(InitNet_1_Http2) {
 	LIB_FUNC("-HIO4VT87v8", LibHttp2::Http2SetConnectTimeOut);
 	LIB_FUNC("n8hMLe31OPA", LibHttp2::Http2SetConnectionWaitTimeOut);
 	LIB_FUNC("ACjtE27aErY", LibHttp2::Http2SetResolveTimeOut);
+	LIB_FUNC("Gcjh+CisAZM", LibHttp2::Http2SetResolveRetry);
 	LIB_FUNC("VYMxTcBqSE0", LibHttp2::Http2SetTimeOut);
 	LIB_FUNC("YrWX+DhPHQY", LibHttp2::Http2SetSslCallback);
 	LIB_FUNC("rbqZig38AT8", LibHttp2::Http2SendRequest);
