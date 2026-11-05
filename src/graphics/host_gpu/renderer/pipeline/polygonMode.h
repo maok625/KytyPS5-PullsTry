@@ -17,11 +17,11 @@ inline vk::PolygonMode ResolvePolygonMode(const HW::ModeControl& mode, bool cull
 	if (cull_front && cull_back) {
 		return vk::PolygonMode::eFill;
 	}
-	if (!cull_front && !cull_back && mode.polymode_front_ptype != mode.polymode_back_ptype) {
-		EXIT("Pipeline: different polygon modes for two visible faces are unsupported\n");
-	}
 	if (!fill_mode_non_solid) {
 		return vk::PolygonMode::eFill;
+	}
+	if (!cull_front && !cull_back && mode.polymode_front_ptype != mode.polymode_back_ptype) {
+		EXIT("Pipeline: different polygon modes for two visible faces are unsupported\n");
 	}
 	// Vulkan has one polygon mode. A culled face does not constrain that mode.
 	const auto polygon_mode = cull_front ? mode.polymode_back_ptype : mode.polymode_front_ptype;
