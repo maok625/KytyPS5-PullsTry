@@ -39,6 +39,8 @@ void TestFallbackWithoutFeature() {
 	      "line mode does not fall back to fill without fillModeNonSolid");
 	Check(ResolvePolygonMode(Mode(1, 2), false, true, false) == vk::PolygonMode::eFill,
 	      "culled-face line mode does not fall back to fill");
+	Check(ResolvePolygonMode(Mode(0, 1), false, false, false) == vk::PolygonMode::eFill,
+	      "different visible-face modes do not fall back to fill without fillModeNonSolid");
 }
 
 void TestDisabledAndCulledAreFill() {
