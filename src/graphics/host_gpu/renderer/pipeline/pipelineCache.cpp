@@ -56,28 +56,6 @@ uint8_t RemapSourceAlphaFactor(uint8_t factor) {
 	}
 }
 
-vk::PolygonMode ResolvePolygonMode(const HW::ModeControl& mode, bool cull_front, bool cull_back) {
-	// PA_SU_SC_MODE_CNTL.POLY_MODE disables both per-face modes when it is zero.
-	if (mode.poly_mode == 0) {
-		return vk::PolygonMode::eFill;
-	}
-	EXIT_NOT_IMPLEMENTED(mode.poly_mode != 1);
-	if (cull_front && cull_back) {
-		return vk::PolygonMode::eFill;
-	}
-	if (!cull_front && !cull_back && mode.polymode_front_ptype != mode.polymode_back_ptype) {
-		EXIT("Pipeline: different polygon modes for two visible faces are unsupported\n");
-	}
-	// Vulkan has one polygon mode. A culled face does not constrain that mode.
-	const auto polygon_mode = cull_front ? mode.polymode_back_ptype : mode.polymode_front_ptype;
-	switch (polygon_mode) {
-		case 0: return vk::PolygonMode::ePoint;
-		case 1: return vk::PolygonMode::eLine;
-		case 2: return vk::PolygonMode::eFill;
-		default: EXIT("Pipeline: invalid polygon mode %u\n", polygon_mode);
-	}
-}
-
 std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties) {
 	constexpr char hex[] = "0123456789abcdef";
 	std::string    uuid(VK_UUID_SIZE * 2, '0');
@@ -1030,7 +1008,8 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 	const bool rect_list = Prospero::IsRectList(command.GetUserConfig().GetPrimType());
 	static_params.provoking_vtx_last = mc.provoking_vtx_last;
 	static_params.polygon_mode =
-	    ResolvePolygonMode(mc, !rect_list && mc.cull_front, !rect_list && mc.cull_back);
+	    ResolvePolygonMode(mc, !rect_list && mc.cull_front, !rect_list && mc.cull_back,
+		                   m_graphics.fill_mode_non_solid_enabled);
 	if (tessellation) {
 		static_params.patch_control_points = vs_input_info.tess.input_control_points;
 	} else if (!mesh && static_params.topology == vk::PrimitiveTopology::ePatchList) {
