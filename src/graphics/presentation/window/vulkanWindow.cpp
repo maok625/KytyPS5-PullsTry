@@ -482,7 +482,10 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 		physical_device.getFeatures2(&query_features);
 		graphics.supports_image_view_min_lod = query_min_lod.minLod == VK_TRUE;
 	}
-	if (!graphics.supports_image_view_min_lod) {
+	if (graphics.supports_image_view_min_lod) {
+		// Enable the extension only when both the extension and its minLod feature are supported.
+		EXIT_IF(!add(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME));
+	} else {
 		std::erase_if(device_extensions, [](const char* ext) {
 			return std::strcmp(ext, VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME) == 0;
 		});
@@ -617,7 +620,7 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	}
 	device_features.largePoints                          = VK_TRUE;
 	device_features.multiViewport                        = VK_TRUE;
-	device_features.fillModeNonSolid                      = supported_features2.features.fillModeNonSolid;
+	device_features.fillModeNonSolid                      = supported2.features.fillModeNonSolid;
 	graphics.fill_mode_non_solid_enabled                 = (device_features.fillModeNonSolid == VK_TRUE);
 	device_features.vertexPipelineStoresAndAtomics       = VK_TRUE;
 	// Storage image sample counts beyond 1x require the feature.
