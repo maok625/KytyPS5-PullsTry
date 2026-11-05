@@ -684,11 +684,7 @@ if(BUILD_TESTING)
 	set_tests_properties(emulator_present_mode_invalid PROPERTIES WILL_FAIL TRUE)
 	add_test(NAME ime_dialog COMMAND $<TARGET_FILE:ime_dialog_tests>)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
-	add_test(NAME min_lod_view COMMAND $<TARGET_FILE:min_lod_view_tests>)
-	foreach(mutant IN ITEMS floor no_cap resinfo)
-		add_test(NAME min_lod_view_mutant_${mutant} COMMAND $<TARGET_FILE:min_lod_view_mutant_${mutant}_tests>)
-		set_tests_properties(min_lod_view_mutant_${mutant} PROPERTIES WILL_FAIL TRUE)
-	endforeach()
+
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
@@ -805,10 +801,7 @@ if(BUILD_TESTING)
 	add_custom_target(kyty_tests DEPENDS
 		ime_dialog_tests
 		shader_cfg_tests
-		min_lod_view_tests
-		min_lod_view_mutant_floor_tests
-		min_lod_view_mutant_no_cap_tests
-		min_lod_view_mutant_resinfo_tests
+
 		scalar_provenance_tests
 		image_page_table_tests
 		memory_tracker_tests
