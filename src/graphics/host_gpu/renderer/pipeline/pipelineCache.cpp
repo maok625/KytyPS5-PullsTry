@@ -1008,7 +1008,8 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 	const bool rect_list = Prospero::IsRectList(command.GetUserConfig().GetPrimType());
 	static_params.provoking_vtx_last = mc.provoking_vtx_last;
 	static_params.polygon_mode =
-	    ResolvePolygonMode(mc, !rect_list && mc.cull_front, !rect_list && mc.cull_back,\n\t\t                   m_graphics.fill_mode_non_solid_enabled);
+	    ResolvePolygonMode(mc, !rect_list && mc.cull_front, !rect_list && mc.cull_back,
+		                   m_graphics.fill_mode_non_solid_enabled);
 	if (tessellation) {
 		static_params.patch_control_points = vs_input_info.tess.input_control_points;
 	} else if (!mesh && static_params.topology == vk::PrimitiveTopology::ePatchList) {
