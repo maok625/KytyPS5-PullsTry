@@ -710,14 +710,16 @@ private:
 };
 
 void CompileSrtWalkerNative(ResourcePlan& plan, std::span<const Value> values) {
-	plan.srt_native = std::make_shared<NativeSrtWalker>(plan, values);
+	plan.srt_native_values.assign(values.begin(), values.end());
+	plan.srt_native = std::make_shared<NativeSrtWalker>(plan, plan.srt_native_values);
 }
 
 bool WalkSrtNative(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<uint32_t>& flat,
                    std::vector<std::pair<uint64_t, uint64_t>>* reads) {
 	auto& mutable_plan = const_cast<ResourcePlan&>(plan);
 	if (!mutable_plan.srt_native || !mutable_plan.srt_native->Matches(plan)) {
-		mutable_plan.srt_native = std::make_shared<NativeSrtWalker>(mutable_plan, {});
+		mutable_plan.srt_native =
+		    std::make_shared<NativeSrtWalker>(mutable_plan, mutable_plan.srt_native_values);
 	}
 	auto walker = mutable_plan.srt_native;
 	// The runtime is supplied per dispatch; don't retain it in the cached program.
