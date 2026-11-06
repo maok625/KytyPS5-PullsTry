@@ -452,7 +452,9 @@ private:
 		const auto& memory = m_plan->memory_info[inst.Flags<MemoryFlags>().index];
 		const auto immediate_signed =
 		    static_cast<int64_t>(static_cast<int32_t>(memory.offset)) & ~int64_t {3};
-		if (buffer && immediate_signed < 0) return {};
+		// The JIT's unsigned buffer-bounds comparison routes a negative immediate
+		// to its zero-read path; it is not an unknown address.
+		if (buffer && immediate_signed < 0) return {0u, true};
 
 		const auto low = Eval(handle->Arg(0), context);
 		const auto high = Eval(handle->Arg(1), context);
