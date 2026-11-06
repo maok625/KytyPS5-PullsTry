@@ -4,7 +4,7 @@
 #include "common/assert.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
-#if defined(__x86_64__) || defined(_M_X64)
+#if (defined(__x86_64__) || defined(_M_X64)) && !defined(__arm64__) && !defined(__aarch64__) && !defined(__ARM64__)
 #include <xbyak/xbyak.h>
 #endif
 
@@ -173,7 +173,7 @@ const uint8_t* Scratch(const ResourcePlan& plan) {
 	return reinterpret_cast<const uint8_t*>(plan.srt_scratch.data());
 }
 
-#if defined(__x86_64__) || defined(_M_X64)
+#if (defined(__x86_64__) || defined(_M_X64)) && !defined(__arm64__) && !defined(__aarch64__) && !defined(__ARM64__)
 thread_local const Xbyak::CodeGenerator* t_running_walker = nullptr;
 
 // Every guest load is mov eax, [r10] (41 8b 02), so a fault completes it as a zero read.
@@ -375,7 +375,7 @@ private:
 };
 
 
-#if defined(__x86_64__) || defined(_M_X64)
+#if (defined(__x86_64__) || defined(_M_X64)) && !defined(__arm64__) && !defined(__aarch64__) && !defined(__ARM64__)
 // Emits one x86 function per plan. Each value, per EXEC-mask context, is a memoized thunk with a
 // state byte (0 unevaluated, 1 unknown or in progress, 2 known, 3 a control Phi holding its first
 // value) and a qword slot; a reference is `call thunk; cmp state, 2`. Operands that are unknown,
@@ -1378,7 +1378,7 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 } // namespace
 
 void CompileSrtWalker(ResourcePlan& plan, std::span<const Value> values) {
-#if defined(__x86_64__) || defined(_M_X64)
+#if (defined(__x86_64__) || defined(_M_X64)) && !defined(__arm64__) && !defined(__aarch64__) && !defined(__ARM64__)
 	plan.srt_native.reset();
 	plan.srt_code = std::make_unique<Xbyak::CodeGenerator>(4096, Xbyak::AutoGrow);
 	WalkerCompiler(plan, *plan.srt_code).Compile(values);
@@ -1389,7 +1389,7 @@ void CompileSrtWalker(ResourcePlan& plan, std::span<const Value> values) {
 
 bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<uint32_t>& flat,
              std::vector<std::pair<uint64_t, uint64_t>>* reads) {
-#if defined(__x86_64__) || defined(_M_X64)
+#if (defined(__x86_64__) || defined(_M_X64)) && !defined(__arm64__) && !defined(__aarch64__) && !defined(__ARM64__)
 	if (plan.srt_code == nullptr || runtime.user_data.size() < plan.srt_user_data) return false;
 	flat.assign(plan.srt_reads.size(), 0u);
 	using Walker = const uint64_t* KYTY_SYSV_ABI (*)(const uint32_t*, uint32_t*, uint64_t*, uint64_t);
@@ -1452,7 +1452,7 @@ bool ValidateWaveUniformValue(const ResourcePlan& program, Value value) {
 }
 
 uint32_t SrtWalkerLoadLength(uint64_t rip) {
-#if defined(__x86_64__) || defined(_M_X64)
+#if (defined(__x86_64__) || defined(_M_X64)) && !defined(__arm64__) && !defined(__aarch64__) && !defined(__ARM64__)
 	if (t_running_walker == nullptr ||
 	    rip - reinterpret_cast<uint64_t>(t_running_walker->getCode()) >= t_running_walker->getSize())
 		return 0;
