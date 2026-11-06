@@ -411,6 +411,7 @@ add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 )
 target_link_libraries(scalar_provenance_tests fmt::fmt xbyak::xbyak)
 target_include_directories(scalar_provenance_tests PRIVATE ${inc_headers})
+endif()
 
 add_executable(build_flags_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/BuildFlagsTests.cpp")
 
@@ -487,6 +488,7 @@ add_executable(shader_vertex_metadata_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(shader_vertex_metadata_tests PRIVATE ${inc_headers})
 
+if(KYTY_BUILD_X86_64_SRT_TESTS)
 add_executable(resource_materialization_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ResourceMaterializationTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"
@@ -495,7 +497,9 @@ add_executable(resource_materialization_tests EXCLUDE_FROM_ALL
 )
 target_link_libraries(resource_materialization_tests fmt::fmt xbyak::xbyak)
 target_include_directories(resource_materialization_tests PRIVATE ${inc_headers})
+endif()
 
+if(KYTY_BUILD_X86_64_SRT_TESTS)
 add_executable(resource_tracking_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ResourceTrackingTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"
