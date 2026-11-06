@@ -7,14 +7,6 @@
 #include "common/logging/log.h"
 #include "common/virtualMemory.h"
 
-#if (defined(__x86_64__) || defined(_M_X64)) && !defined(__arm64__) && !defined(__aarch64__) && !defined(__ARM64__)
-#if (defined(__x86_64__) || defined(_M_X64)) && !defined(__arm64__) && !defined(__aarch64__) && !defined(__ARM64__)
-#include <Zydis/Zydis.h>
-#include <xbyak/xbyak.h>
-#include <xbyak/xbyak_util.h>
-using namespace Xbyak::util;
-#endif
-
 #include <algorithm>
 #include <array>
 #include <bitset>
@@ -28,6 +20,14 @@ using namespace Xbyak::util;
 #include <set>
 #include <unordered_set>
 #include <vector>
+
+#if (defined(__x86_64__) || defined(_M_X64)) && !defined(__arm64__) && !defined(__aarch64__) && !defined(__ARM64__)
+#include <Zydis/Zydis.h>
+#include <xbyak/xbyak.h>
+#include <xbyak/xbyak_util.h>
+using namespace Xbyak::util;
+#endif
+
 namespace Loader {
 
 using u8  = uint8_t;
@@ -39,6 +39,7 @@ using s32 = int32_t;
 using u64 = uint64_t;
 using s64 = int64_t;
 
+#if (defined(__x86_64__) || defined(_M_X64)) && !defined(__arm64__) && !defined(__aarch64__) && !defined(__ARM64__)
 #define ASSERT(condition) EXIT_IF(!(condition))
 
 constexpr size_t NearJumpSize = 5;
@@ -1616,16 +1617,11 @@ GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment
 
 #else
 
-// The current guest-instruction patcher emits x86-64 host trampolines. On ARM64,
-// instruction execution must use the native translator path instead; never emit
-// x86 machine code into an ARM64 process.
+// This module currently emits x86-64 host trampolines. ARM64 must use the native
+// translator path instead; never emit x86 machine code into an ARM64 process.
 GuestInstructionHostFeatures GetGuestInstructionHostFeatures() {
 	return {};
 }
-
-void RegisterGuestInstructionPatchModule(void*, uint64_t, void*, uint64_t) {}
-
-void UnregisterGuestInstructionPatchModule(void*) {}
 
 GuestInstructionPatchResult PatchGuestInstructions(
     uint64_t, uint64_t, std::span<const uintptr_t>, bool, bool,
@@ -1810,6 +1806,7 @@ bool DecodeEhFrameFunctionStarts(uint64_t eh_frame_header_addr, uint64_t eh_fram
 	return true;
 }
 
+#if (defined(__x86_64__) || defined(_M_X64)) && !defined(__arm64__) && !defined(__aarch64__) && !defined(__ARM64__)
 void RegisterGuestInstructionPatchModule(void* module_ptr, uint64_t module_size,
                                          void* trampoline_area_ptr, uint64_t trampoline_area_size) {
 	EXIT_IF(module_ptr == nullptr || module_size == 0 || trampoline_area_ptr == nullptr ||
@@ -1825,6 +1822,10 @@ void RegisterGuestInstructionPatchModule(void* module_ptr, uint64_t module_size,
 void UnregisterGuestInstructionPatchModule(void* module_ptr) {
 	g_patch_modules.erase(reinterpret_cast<u64>(module_ptr));
 }
+#else
+void RegisterGuestInstructionPatchModule(void*, uint64_t, void*, uint64_t) {}
+void UnregisterGuestInstructionPatchModule(void*) {}
+#endif
 
 #undef ASSERT
 
