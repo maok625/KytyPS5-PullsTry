@@ -237,6 +237,7 @@ static KYTY_SYSV_ABI void RunEntry(uint64_t addr, EntryParams* params, atexit_fu
 		guest_root_frame[0]    = 0;
 		guest_root_frame[1]    = 0;
 
+#if defined(__x86_64__)
 #if defined(__APPLE__)
 		// Clang on macOS can allocate plain "r" inputs to r12/r13, which the template
 		// clobbers before consuming them. Pin the inputs to registers the SysV guest
@@ -315,6 +316,16 @@ static KYTY_SYSV_ABI void RunEntry(uint64_t addr, EntryParams* params, atexit_fu
 		               "xmm9", "xmm10", "xmm11", "xmm12", "xmm13", "xmm14", "xmm15");
 #endif
 		return;
+#else
+	// ARM64: Guest entry not implemented
+	(void)func;
+	(void)params;
+	(void)atexit_func;
+	(void)guest_rsp;
+	(void)guest_rbp;
+	(void)stack_top;
+	return;
+#endif
 	}
 
 	uintptr_t guest_root_frame[2] = {};
@@ -374,8 +385,9 @@ struct MainEntryStackTestState {
 };
 
 static KYTY_SYSV_ABI void TestMainEntryStackCallback(EntryParams* params,
-                                                     atexit_func_t /*atexit_func*/) {
+                                                      atexit_func_t /*atexit_func*/) {
 	auto* state = reinterpret_cast<MainEntryStackTestState*>(const_cast<char*>(params->argv[0]));
+#if defined(__x86_64__)
 	asm volatile("pushq %%r15\n\t"
 	             "pushq %%r14\n\t"
 	             "popq %%r14\n\t"
@@ -390,6 +402,9 @@ static KYTY_SYSV_ABI void TestMainEntryStackCallback(EntryParams* params,
 	             : "=r"(state->teb_stack_base), "=r"(state->teb_stack_limit)
 	             :
 	             : "memory");
+#endif
+#else
+	(void)state;
 #endif
 	state->called = true;
 }
@@ -919,6 +934,29 @@ static void ForEachRelocation(Program* program, auto&& func) {
 	}
 	for (uint32_t i = 0; i < info.jmprela_table_size / sizeof(Elf64_Rela); ++i) {
 		func(info.jmprela_table + i, i, true);
+}
+
+__attribute__((naked)) static KYTY_SYSV_ABI void RelocateHandlerReturnStub() {
+#if defined(__x86_64__) || defined(_M_X64)
+	asm volatile("addq $8, %rsp\n\t"
+	             "retq\n");
+#else
+	// ARM64: not implemented - this stub is x86_64 only
+	asm volatile("ret\n");
+#endif
+}
+
+static KYTY_SYSV_ABI uint64_t RelocateHandler(RelocateHandlerStack s) {
+	auto*       stack     = s.stack;
+	auto*       program   = reinterpret_cast<Program*>(stack[-1]);
+	auto        rel_index = stack[0];
+	std::string name      = "<unknown function>";
+
+	if (program != nullptr && program->dynamic_info != nullptr &&
+	    program->dynamic_info->jmprela_table != nullptr) {
+		auto ri = GetRelocationInfo(program->dynamic_info->jmprela_table + rel_index, program);
+
+		name = ri.name.c_str();
 	}
 }
 

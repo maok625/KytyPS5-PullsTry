@@ -139,6 +139,7 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 
 #else
 
+<<<<<<< HEAD
 // x86-64 page-fault error code: bit 4 = instruction fetch, bit 1 = write, otherwise a read.
 static AccessViolationType DecodeAccess(const ucontext_t* context) {
 #if defined(__APPLE__)
@@ -147,6 +148,33 @@ static AccessViolationType DecodeAccess(const ucontext_t* context) {
 	const auto error = static_cast<uint64_t>(context->uc_mcontext.gregs[REG_ERR]);
 #endif
 	if ((error & 0x10u) != 0) {
+=======
+static std::atomic<Handler> g_handler {nullptr};
+static std::atomic_uint32_t g_install_state {0};
+
+static_assert(decltype(g_handler)::is_always_lock_free);
+static_assert(decltype(g_install_state)::is_always_lock_free);
+
+#if defined(__aarch64__) || defined(__arm64__)
+// Translate the ARM64 ESR (Exception Syndrome Register) into an access type.
+// EC (bits 31:26): 0x20/0x21 = Instruction Abort, 0x24/0x25 = Data Abort.
+// WnR (bit 6): 1 = Write, 0 = Read.
+static AccessViolationType DecodeAccess(uint32_t esr) {
+	const uint32_t ec = (esr >> 26u) & 0x3fu;
+	if (ec == 0x20u || ec == 0x21u) {
+		return AccessViolationType::Execute;
+	}
+	if ((esr & (1u << 6u)) != 0) {
+		return AccessViolationType::Write;
+	}
+	return AccessViolationType::Read;
+}
+#else
+// Translate the x86-64 page-fault error code (mcontext __es.__err) into an access type.
+// bit 1 (0x2) = write, bit 4 (0x10) = instruction fetch, otherwise a read.
+static AccessViolationType DecodeAccess(uint64_t err) {
+	if ((err & 0x10u) != 0) {
+>>>>>>> pr/63
 		return AccessViolationType::Execute;
 	}
 	if ((error & 0x2u) != 0) {
@@ -154,6 +182,7 @@ static AccessViolationType DecodeAccess(const ucontext_t* context) {
 	}
 	return AccessViolationType::Read;
 }
+#endif
 
 // A resolved fault returns and retries the instruction; an unresolved one restores the default
 // action so the retry terminates the process.
@@ -161,6 +190,7 @@ static void SignalHandler(int signal_number, siginfo_t* signal_info, void* nativ
 	auto* context = static_cast<ucontext_t*>(native_context);
 
 	ExceptionInfo info {};
+<<<<<<< HEAD
 #if defined(__APPLE__)
 	const auto& registers  = context->uc_mcontext->__ss;
 	info.exception_address = registers.__rip;
@@ -203,6 +233,42 @@ static void SignalHandler(int signal_number, siginfo_t* signal_info, void* nativ
 	info.native_code    = static_cast<uint32_t>(signal_number);
 	info.native_context = context;
 	if (signal_number == SIGILL) {
+=======
+	info.native_code    = static_cast<uint32_t>(si->si_code);
+	info.native_context = uctx;
+
+#if defined(__aarch64__) || defined(__arm64__)
+	info.exception_address = ss.__pc;
+
+	if (sig == SIGILL) {
+		info.type = ExceptionType::IllegalInstruction;
+	} else {
+		info.type                   = ExceptionType::AccessViolation;
+		info.access_violation_type  = DecodeAccess(mc->__es.__esr);
+		info.access_violation_vaddr = reinterpret_cast<uint64_t>(si->si_addr);
+	}
+
+	info.rdi = ss.__x[0];
+	info.rsi = ss.__x[1];
+	info.rdx = ss.__x[2];
+	info.rcx = ss.__x[3];
+	info.rax = ss.__x[4];
+	info.rbx = ss.__x[5];
+	info.rbp = ss.__x[6];
+	info.r8  = ss.__x[8];
+	info.r9  = ss.__x[9];
+	info.r10 = ss.__x[10];
+	info.r11 = ss.__x[11];
+	info.r12 = ss.__x[12];
+	info.r13 = ss.__x[13];
+	info.r14 = ss.__x[14];
+	info.r15 = ss.__x[15];
+	info.rsp = ss.__sp;
+#else
+	info.exception_address = ss.__rip;
+
+	if (sig == SIGILL) {
+>>>>>>> pr/63
 		info.type = ExceptionType::IllegalInstruction;
 	} else {
 		info.type                   = ExceptionType::AccessViolation;
@@ -210,6 +276,27 @@ static void SignalHandler(int signal_number, siginfo_t* signal_info, void* nativ
 		info.access_violation_vaddr = reinterpret_cast<uint64_t>(signal_info->si_addr);
 	}
 
+<<<<<<< HEAD
+=======
+	info.rax = ss.__rax;
+	info.rbx = ss.__rbx;
+	info.rcx = ss.__rcx;
+	info.rdx = ss.__rdx;
+	info.rsi = ss.__rsi;
+	info.rdi = ss.__rdi;
+	info.rbp = ss.__rbp;
+	info.rsp = ss.__rsp;
+	info.r8  = ss.__r8;
+	info.r9  = ss.__r9;
+	info.r10 = ss.__r10;
+	info.r11 = ss.__r11;
+	info.r12 = ss.__r12;
+	info.r13 = ss.__r13;
+	info.r14 = ss.__r14;
+	info.r15 = ss.__r15;
+#endif
+
+>>>>>>> pr/63
 	const auto handler = g_handler.load(std::memory_order_acquire);
 	if (handler != nullptr && handler(info)) {
 		return;

@@ -91,7 +91,7 @@ jobs:
           ninja --version
           clang-cl --version
           glslangValidator --version
-          echo Qt6_DIR=%Qt6_DIR%
+          echo QT_ROOT_DIR=%QT_ROOT_DIR%
 
       - name: Configure
         shell: cmd
@@ -107,7 +107,7 @@ jobs:
             -DCMAKE_CXX_COMPILER=clang-cl ^
             -DCMAKE_C_COMPILER_LAUNCHER=sccache ^
             -DCMAKE_CXX_COMPILER_LAUNCHER=sccache ^
-            -DCMAKE_PREFIX_PATH="%Qt6_DIR%"
+            -DCMAKE_PREFIX_PATH="%QT_ROOT_DIR%"
 
       - name: Build
         shell: cmd
@@ -190,11 +190,11 @@ jobs:
           cmake -S . -B _Build/macos \
             -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON \
+            -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=OFF \
             -DKYTY_BUILD_ORIGIN="$KYTY_BUILD_ORIGIN" \
             -DKYTY_BUILD_REPOSITORY="$KYTY_BUILD_REPOSITORY" \
             -DKYTY_RELEASE_TAG="${{ needs.metadata.outputs.release_tag }}" \
-            -DCMAKE_OSX_ARCHITECTURES=x86_64 \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
             -DCMAKE_C_COMPILER=clang \
             -DCMAKE_CXX_COMPILER=clang++ \
             -DCMAKE_C_COMPILER_LAUNCHER=sccache \
@@ -209,7 +209,7 @@ jobs:
               memory_tracker_tests page_manager_tests shader_recompiler_compute_tests \
               resource_tracking_tests scalar_provenance_tests \
               resource_materialization_tests shader_vertex_metadata_tests archive_file_tests avplayer_file_tests \
-            --parallel
+            --parallel 4
 
       - name: Test
         shell: bash
@@ -263,7 +263,7 @@ jobs:
             "$app_dir/Contents/MacOS/kyty_updater" \
             "$app_dir/Contents/Frameworks/libMoltenVK.dylib"; do
             file "$binary"
-            lipo "$binary" -verify_arch x86_64
+            lipo "$binary" -verify_arch arm64
           done
           for binary in \
             "$install_dir/kyty_emulator" \
@@ -280,7 +280,7 @@ jobs:
         shell: bash
         run: |
           install_dir="_Build/macos/install"
-          archive="$RUNNER_TEMP/KytyPS5-macOS-x86_64.zip"
+          archive="$RUNNER_TEMP/KytyPS5-macOS-arm64.zip"
           (
             cd "$install_dir"
             zip -qry "$archive" .
@@ -290,8 +290,8 @@ jobs:
       - name: Upload macOS artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: KytyPS5-macOS-x86_64
-          path: ${{ runner.temp }}/KytyPS5-macOS-x86_64.zip
+          name: KytyPS5-macOS-arm64
+          path: ${{ runner.temp }}/KytyPS5-macOS-arm64.zip
           if-no-files-found: error
 
   linux:
@@ -352,7 +352,7 @@ jobs:
           clang++ --version
           ld.lld --version
           glslangValidator --version
-          echo "Qt6_DIR=$Qt6_DIR"
+          echo "QT_ROOT_DIR=$QT_ROOT_DIR"
 
       - name: Configure
         shell: bash
@@ -369,7 +369,7 @@ jobs:
             -DCMAKE_CXX_COMPILER=clang++ \
             -DCMAKE_C_COMPILER_LAUNCHER=sccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=sccache \
-            -DCMAKE_PREFIX_PATH="$Qt6_DIR" 2>&1 | tee _Build/configure.log
+            -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR" 2>&1 | tee _Build/configure.log
           exit "${PIPESTATUS[0]}"
 
       - name: Verify SDL3 backends
@@ -466,8 +466,8 @@ jobs:
         if: needs.macos.result == 'success'
         uses: actions/download-artifact@v4
         with:
-          name: KytyPS5-macOS-x86_64
-          path: artifacts/KytyPS5-macOS-x86_64
+          name: KytyPS5-macOS-arm64
+          path: artifacts/KytyPS5-macOS-arm64
 
       - name: Download Linux build
         if: needs.linux.result == 'success'
@@ -491,9 +491,9 @@ jobs:
         if: needs.macos.result == 'success'
         shell: bash
         run: |
-          macos_archive="artifacts/KytyPS5-macOS-x86_64/KytyPS5-macOS-x86_64.zip"
+          macos_archive="artifacts/KytyPS5-macOS-arm64/KytyPS5-macOS-arm64.zip"
           test -f "$macos_archive"
-          cp "$macos_archive" "$RELEASE_NAME-macOS-x86_64.zip"
+          cp "$macos_archive" "$RELEASE_NAME-macOS-arm64.zip"
 
       - name: Package Linux build
         if: needs.linux.result == 'success'
@@ -516,7 +516,7 @@ jobs:
           assets=()
           for artifact in \
             "$RELEASE_NAME-Windows-x64.zip" \
-            "$RELEASE_NAME-macOS-x86_64.zip" \
+            "$RELEASE_NAME-macOS-arm64.zip" \
             "$RELEASE_NAME-Linux-x86_64.tar.gz"; do
             if [[ -f "$artifact" ]]; then
               assets+=("$artifact")

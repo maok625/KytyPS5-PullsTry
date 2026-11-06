@@ -47,6 +47,11 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 #endif
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#endif
+
 
 namespace Libs::LibKernel::Memory {
 

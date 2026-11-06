@@ -7,6 +7,9 @@
 #include <filesystem>
 #include <iterator>
 #include <memory>
+#include <mutex>
+#include <spdlog/async.h>
+#include <spdlog/formatter.h>
 #include <spdlog/logger.h>
 #include <spdlog/pattern_formatter.h>
 #include <spdlog/sinks/basic_file_sink.h>
