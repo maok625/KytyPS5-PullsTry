@@ -1011,18 +1011,12 @@ private:
 			}
 		}
 #else
-		const std::array<std::pair<uint64_t, uint64_t>, 3> regions {{
-		    {HOST_SYSTEM_MANAGED_MIN, HOST_SYSTEM_MANAGED_MAX + 1u},
-		    {HOST_SYSTEM_RESERVED_MIN, HOST_SYSTEM_RESERVED_MAX + 1u},
-		    {HOST_USER_MIN, HOST_USER_MAX + 1u},
-		}};
-
-	size_t region_start_idx = 0;
+		size_t region_start_idx = 0;
 
 #if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
 		// On macOS ARM64, skip low system regions (below 4GB) which the kernel
-		// rejects for fixed mmap. Start guest address space from HOST_USER_MIN (64GB).
-		region_start_idx = 2;
+		// rejects for fixed mmap. Skip the low system region and start at HOST_USER_MIN.
+		region_start_idx = 1;
 #endif
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
@@ -1122,8 +1116,8 @@ private:
 			region_addr = mapping_end;
 		}
 
-		// Start from HOST_USER_MIN (64GB) to avoid low system regions
-		region_start_idx = 2;
+		// Start at the user region; the lower system region is intentionally skipped.
+		region_start_idx = 1;
 
 		auto reserve_range = [this](uint64_t start, uint64_t end) {
 			start = AlignUp(start, PageSize());
