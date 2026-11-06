@@ -7,7 +7,14 @@
 #include "common/logging/log.h"
 #include "common/virtualMemory.h"
 
+#if (defined(__x86_64__) || defined(_M_X64)) && !defined(__arm64__) && !defined(__aarch64__) && !defined(__ARM64__)
+#if (defined(__x86_64__) || defined(_M_X64)) && !defined(__arm64__) && !defined(__aarch64__) && !defined(__ARM64__)
 #include <Zydis/Zydis.h>
+#include <xbyak/xbyak.h>
+#include <xbyak/xbyak_util.h>
+using namespace Xbyak::util;
+#endif
+
 #include <algorithm>
 #include <array>
 #include <bitset>
@@ -21,11 +28,6 @@
 #include <set>
 #include <unordered_set>
 #include <vector>
-#include <xbyak/xbyak.h>
-#include <xbyak/xbyak_util.h>
-
-using namespace Xbyak::util;
-
 namespace Loader {
 
 using u8  = uint8_t;
@@ -1611,6 +1613,27 @@ GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment
 	}
 	return result;
 }
+
+#else
+
+// The current guest-instruction patcher emits x86-64 host trampolines. On ARM64,
+// instruction execution must use the native translator path instead; never emit
+// x86 machine code into an ARM64 process.
+GuestInstructionHostFeatures GetGuestInstructionHostFeatures() {
+	return {};
+}
+
+void RegisterGuestInstructionPatchModule(void*, uint64_t, void*, uint64_t) {}
+
+void UnregisterGuestInstructionPatchModule(void*) {}
+
+GuestInstructionPatchResult PatchGuestInstructions(
+    uint64_t, uint64_t, std::span<const uintptr_t>, bool, bool,
+    GuestInstructionHostFeatures, uint64_t) {
+	return {};
+}
+
+#endif
 
 namespace {
 
