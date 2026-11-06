@@ -414,6 +414,14 @@ target_link_libraries(scalar_provenance_tests fmt::fmt xbyak::xbyak)
 target_include_directories(scalar_provenance_tests PRIVATE ${inc_headers})
 endif()
 
+add_executable(srt_walker_native_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/SrtWalkerNativeTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalkerNative.cpp"
+)
+target_link_libraries(srt_walker_native_tests fmt::fmt xbyak::xbyak)
+target_include_directories(srt_walker_native_tests PRIVATE ${inc_headers})
+
 add_executable(build_flags_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/BuildFlagsTests.cpp")
 
 add_executable(page_manager_tests EXCLUDE_FROM_ALL
@@ -677,7 +685,7 @@ target_include_directories(gpu_blit_shader_tests PRIVATE ${inc_headers})
 
 # These tests use exceptions.
 if(NOT KYTY_CLANG_CL)
-	set(kyty_exception_test_targets virtual_memory_allocation_tests)
+	set(kyty_exception_test_targets virtual_memory_allocation_tests srt_walker_native_tests)
 	if(KYTY_BUILD_X86_64_SRT_TESTS)
 		list(APPEND kyty_exception_test_targets scalar_provenance_tests resource_tracking_tests)
 	endif()
@@ -703,6 +711,7 @@ if(BUILD_TESTING)
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
 	endif()
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
+	add_test(NAME srt_walker_native COMMAND $<TARGET_FILE:srt_walker_native_tests>)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
 	add_test(NAME build_flags COMMAND $<TARGET_FILE:build_flags_tests>)
@@ -818,6 +827,7 @@ if(BUILD_TESTING)
 	add_custom_target(kyty_tests DEPENDS
 		ime_dialog_tests
 		shader_cfg_tests
+		srt_walker_native_tests
 		image_page_table_tests
 		memory_tracker_tests
 		page_manager_tests
