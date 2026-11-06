@@ -6,8 +6,7 @@
 #include <cstring>
 #include <iostream>
 #include <span>
-#include <stdexcept>
-#include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -22,7 +21,10 @@ namespace {
 using namespace Libs::Graphics::ShaderRecompiler::IR;
 
 void Check(bool condition, const char* message) {
-	if (!condition) throw std::runtime_error(message);
+	if (!condition) {
+		std::cerr << "NativeSrtWalkerTests: " << message << '\n';
+		std::abort();
+	}
 }
 
 Value Emit(ResourcePlan& plan, ValueOpcode opcode, std::initializer_list<Value> args = {},
@@ -151,21 +153,17 @@ void TestControlFlowAndPhi() {
 namespace Common {
 void DbgExitIfHandler(const char*, const char*, int) { std::abort(); }
 void DbgExitHandler(const char*, int, std::string_view message) {
-	throw std::runtime_error(std::string(message));
+	std::cerr << message << '\n';
+	std::abort();
 }
 } // namespace Common
 
 int main() {
-	try {
-		TestArithmeticAndUserData();
-		TestGuestReadAndCapturedRange();
-		TestControlFlowAndPhi();
-		std::cout << "NativeSrtWalkerTests: all cases passed\n";
-		return 0;
-	} catch (const std::exception& error) {
-		std::cerr << "NativeSrtWalkerTests: failed: " << error.what() << '\n';
-		return 1;
-	}
+	TestArithmeticAndUserData();
+	TestGuestReadAndCapturedRange();
+	TestControlFlowAndPhi();
+	std::cout << "NativeSrtWalkerTests: all cases passed\\n";
+	return 0;
 }
 
 #include "../src/graphics/shader/recompiler/ir/Block.cpp"

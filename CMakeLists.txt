@@ -685,7 +685,7 @@ target_include_directories(gpu_blit_shader_tests PRIVATE ${inc_headers})
 
 # These tests use exceptions.
 if(NOT KYTY_CLANG_CL)
-	set(kyty_exception_test_targets virtual_memory_allocation_tests srt_walker_native_tests)
+	set(kyty_exception_test_targets virtual_memory_allocation_tests)
 	if(KYTY_BUILD_X86_64_SRT_TESTS)
 		list(APPEND kyty_exception_test_targets scalar_provenance_tests resource_tracking_tests)
 	endif()
