@@ -201,6 +201,24 @@ jobs:
             -DCMAKE_CXX_COMPILER_LAUNCHER=sccache \
             -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR"
 
+      - name: Print CMake configure diagnostics
+        if: failure()
+        shell: bash
+        run: |
+          for log in \
+            _Build/macos/CMakeFiles/CMakeError.log \
+            _Build/macos/CMakeFiles/CMakeOutput.log \
+            _Build/macos/CMakeFiles/CMakeConfigureLog.yaml; do
+            if [[ -f "$log" ]]; then
+              echo "===== $log ====="
+              if [[ "$log" == *CMakeConfigureLog.yaml ]]; then
+                grep -n -A 45 -B 8 -E 'CMAKE_HAVE_LIBC_PTHREAD|pthread_create|compiler accepts -pthread' "$log" || true
+              else
+                tail -n 400 "$log"
+              fi
+            fi
+          done
+
       - name: Build
         shell: bash
         run: |
