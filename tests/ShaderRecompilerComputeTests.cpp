@@ -42373,15 +42373,22 @@ void CheckRuntimeBufferRecords(VulkanHarness &vulkan) {
   struct CountMemory { u32 value = 72; u32 reads = 0; bool readable = true; } memory;
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
+  const auto read_count_memory = +[](void *data, uint64_t address,
+                                     std::span<u32> words) {
+    auto &memory = *static_cast<CountMemory *>(data);
+    ++memory.reads;
+    if (!memory.readable || address != count_address) return false;
+    words[0] = memory.value;
+    return true;
+  };
   const auto materialize = [&] {
-    FakeGuestMemory fake(+[](void *data, uint64_t address, std::span<u32> words) {
-      auto &memory = *static_cast<CountMemory *>(data);
-      ++memory.reads;
-      if (!memory.readable || address != count_address) return false;
-      words[0] = memory.value;
-      return true;
-    }, &memory);
-    return MaterializeResources(plan, {.user_data = test.user_data}, snapshot, specialization);
+    FakeGuestMemory fake(read_count_memory, &memory);
+    const SrtRuntime runtime{
+        .user_data = test.user_data,
+        .userdata = &memory,
+        .read_specialization_memory = read_count_memory,
+    };
+    return MaterializeResources(plan, runtime, snapshot, specialization);
   };
   // An unreadable count reads as zero, which leaves no records.
   memory.readable = false;
@@ -51486,7 +51493,11 @@ void CheckResourcePlanHandoff() {
     auto plan = ExtractResourcePlan(translated.program);
     ResourceSnapshot snapshot;
     ResourceSpecialization specialization;
-    const SrtRuntime runtime{.user_data = user_data};
+    const SrtRuntime runtime{
+        .user_data = user_data,
+        .userdata = &memory,
+        .read_specialization_memory = ReadTestMemory,
+    };
     FakeGuestMemory fake(ReadTestMemory, &memory);
     Require(name, "initial descriptors",
             MaterializeResources(plan, runtime, snapshot, specialization) &&
