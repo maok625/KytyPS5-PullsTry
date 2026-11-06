@@ -3,7 +3,7 @@
 
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
-#if defined(__x86_64__) || defined(_M_X64)
+#if (defined(__x86_64__) || defined(_M_X64)) && !defined(__arm64__) && !defined(__aarch64__) && !defined(__ARM64__)
 #define KYTY_SRTWALKER_TEST_X64_HOST
 #include <xbyak/xbyak.h>
 #endif
@@ -101,10 +101,6 @@ private:
 #endif
 };
 
-#ifdef KYTY_SRTWALKER_TEST_X64_HOST
-#undef KYTY_SRTWALKER_TEST_X64_HOST
-#endif
-
 // Evaluates one value through a walker compiled for it, keeping the plan's resource walker.
 inline bool EvaluateSrtValue(Libs::Graphics::ShaderRecompiler::IR::ResourcePlan &plan,
                              const Libs::Graphics::ShaderRecompiler::IR::SrtRuntime &runtime,
@@ -112,7 +108,7 @@ inline bool EvaluateSrtValue(Libs::Graphics::ShaderRecompiler::IR::ResourcePlan 
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   const auto *inst = value.Resolve().TryInstruction();
   const auto output = inst != nullptr ? inst->WalkOutput() : UINT32_MAX;
-#if defined(__x86_64__) || defined(_M_X64)
+#if defined(KYTY_SRTWALKER_TEST_X64_HOST)
   auto code = std::move(plan.srt_code);
 #else
   auto native = std::move(plan.srt_native);
@@ -124,7 +120,7 @@ inline bool EvaluateSrtValue(Libs::Graphics::ShaderRecompiler::IR::ResourcePlan 
   CompileSrtWalker(plan, {&value, 1});
   std::vector<uint32_t> flat;
   const bool known = WalkSrt(plan, runtime, flat, nullptr) && WalkedValue(plan, value, result);
-#if defined(__x86_64__) || defined(_M_X64)
+#if defined(KYTY_SRTWALKER_TEST_X64_HOST)
   plan.srt_code = std::move(code);
 #else
   plan.srt_native = std::move(native);
@@ -136,6 +132,10 @@ inline bool EvaluateSrtValue(Libs::Graphics::ShaderRecompiler::IR::ResourcePlan 
   if (inst != nullptr) inst->SetWalkOutput(output);
   return known;
 }
+
+#ifdef KYTY_SRTWALKER_TEST_X64_HOST
+#undef KYTY_SRTWALKER_TEST_X64_HOST
+#endif
 
 // Walks the plan's resources and reads back one descriptor.
 inline bool EvaluateSrtDescriptor(const Libs::Graphics::ShaderRecompiler::IR::ResourcePlan &plan,
