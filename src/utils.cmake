@@ -65,7 +65,17 @@ else()
 	SET(CMAKE_NINJA_FORCE_RESPONSE_FILE 1 CACHE INTERNAL "")
 endif()
 
-# Guest code runs natively and needs x86-64-v3 (AVX2, BMI2, FMA), so every host has it.
+# Select ISA-specific flags from the target architecture, not the build host.
+# A universal macOS build cannot use an x86-only flag for its arm64 slice.
+set(KYTY_USE_X86_64_V3 OFF)
+if(APPLE AND CMAKE_OSX_ARCHITECTURES)
+	if(CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64")
+		set(KYTY_USE_X86_64_V3 ON)
+	endif()
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|x64)$")
+	set(KYTY_USE_X86_64_V3 ON)
+endif()
+
 # No FMA contraction: a * b + c keeps both roundings.
 if(KYTY_CLANG_CL)
 	if(CMAKE_CXX_FLAGS MATCHES "/W[0-4]")
@@ -81,7 +91,10 @@ if(KYTY_CLANG_CL)
 	string(REGEX REPLACE "/MD" "/MT" CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE}")
 	string(REGEX REPLACE "/MD" "/MT" CMAKE_C_FLAGS "${CMAKE_C_FLAGS}")
 			
-	set(KYTY_CPP_FLAGS "${KYTY_CPP_FLAGS} /utf-8 /Oy- /clang:-march=x86-64-v3 /clang:-ffp-contract=off /wd4244 /wd4305 /wd4800 /wd4345")
+	set(KYTY_CPP_FLAGS "${KYTY_CPP_FLAGS} /utf-8 /Oy- /clang:-ffp-contract=off /wd4244 /wd4305 /wd4800 /wd4345")
+	if(KYTY_USE_X86_64_V3)
+		set(KYTY_CPP_FLAGS "${KYTY_CPP_FLAGS} /clang:-march=x86-64-v3")
+	endif()
   
 	if(KYTY_WARNINGS_ARE_ERRORS)
 		#set(KYTY_CPP_FLAGS "${KYTY_CPP_FLAGS} /WX")
@@ -105,7 +118,10 @@ elseif(CLANG OR GCC)
 	else()
 		set(KYTY_CPP_FLAGS "${KYTY_CPP_FLAGS} -fno-exceptions -fdiagnostics-color=always -finput-charset=UTF-8 -fexec-charset=UTF-8 -static-libgcc -static-libstdc++ -g -fno-strict-aliasing -fno-omit-frame-pointer -Wall -Wno-unused-value -fmessage-length=0")
 	endif()
-	set(KYTY_CPP_FLAGS "${KYTY_CPP_FLAGS} -march=x86-64-v3 -ffp-contract=off")
+	set(KYTY_CPP_FLAGS "${KYTY_CPP_FLAGS} -ffp-contract=off")
+	if(KYTY_USE_X86_64_V3)
+		set(KYTY_CPP_FLAGS "${KYTY_CPP_FLAGS} -march=x86-64-v3")
+	endif()
 	
     if(KYTY_WARNINGS_ARE_ERRORS)
         #set(KYTY_CPP_FLAGS "${KYTY_CPP_FLAGS} -Werror")
