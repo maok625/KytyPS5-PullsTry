@@ -196,6 +196,52 @@ void TestNativeWalkerMatchesXbyak() {
         "native C++ SRT walker diverged from the x86 reference");
 }
 
+void TestNativeWalkerMatchesXbyakArithmetic() {
+  Fixture fixture;
+  const auto low = fixture.Emit(ValueOpcode::IAdd32, {Value(0xffffffffu), Value(2u)});
+  const auto carry = fixture.Emit(ValueOpcode::ULessThan32, {low, Value(0xffffffffu)});
+  const auto high = fixture.Emit(ValueOpcode::SelectU32, {carry, Value(1u), Value(0u)});
+  const auto inserted = fixture.Emit(
+      ValueOpcode::BitFieldInsert,
+      {Value(0u), Value(0x89abcdefu), Value(0u), Value(32u)});
+  const auto sign = fixture.Emit(
+      ValueOpcode::BitFieldSExtract,
+      {Value(0x000000f0u), Value(4u), Value(4u)});
+  fixture.program.descriptor_sources.push_back(
+      {.dwords = {low, high, inserted, sign}, .dword_count = 4});
+
+  auto plan = ExtractResourcePlan(fixture.program);
+  const std::array values{
+      plan.descriptor_sources[0].dwords[0],
+      plan.descriptor_sources[0].dwords[1],
+      plan.descriptor_sources[0].dwords[2],
+      plan.descriptor_sources[0].dwords[3],
+  };
+  const std::array<uint32_t, 4> expected{1u, 1u, 0x89abcdefu, 0xffffffffu};
+  std::array<uint32_t, 4> jit_results{};
+  std::array<uint32_t, 4> native_results{};
+  std::vector<uint32_t> flat;
+
+  CompileSrtWalker(plan, values);
+  Check(WalkSrt(plan, {}, flat, nullptr),
+        "x86 reference arithmetic walker failed");
+  for (size_t index = 0; index < values.size(); ++index) {
+    Check(WalkedValue(plan, values[index], jit_results[index]),
+          "x86 reference arithmetic result was unknown");
+  }
+
+  CompileSrtWalkerNative(plan, values);
+  Check(WalkSrtNative(plan, {}, flat, nullptr),
+        "native C++ arithmetic walker failed");
+  for (size_t index = 0; index < values.size(); ++index) {
+    Check(WalkedValue(plan, values[index], native_results[index]),
+          "native C++ arithmetic result was unknown");
+  }
+  Check(jit_results == expected && native_results == expected &&
+            native_results == jit_results,
+        "native C++ arithmetic or bit-field evaluation diverged from x86");
+}
+
 void TestRawScalarComponentAlignment() {
   Fixture fixture;
   const auto memory = fixture.AddMemory(ResourceKind::ScalarAddress, 2);
@@ -984,6 +1030,7 @@ int main() {
   try {
     TestImmediateFlatteningAndGvn();
     TestNativeWalkerMatchesXbyak();
+    TestNativeWalkerMatchesXbyakArithmetic();
     TestRawScalarComponentAlignment();
     TestScalarMemoryDomainMismatchFails();
     TestDynamicReadRemainsTyped();
