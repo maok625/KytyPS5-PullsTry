@@ -127,6 +127,8 @@ bool ImmediateBits(Value value, uint64_t& bits) {
 	}
 }
 
+} // namespace
+
 class NativeSrtWalker {
 public:
 	struct Result {
@@ -159,6 +161,7 @@ public:
 		flat.assign(plan.srt_reads.size(), 0u);
 		m_captured.clear();
 		m_cache.clear();
+		m_required_user_data = 0u;
 
 		m_reachable.assign(plan.control_flow.size(), 0u);
 		if (!m_resources) {
@@ -257,6 +260,8 @@ public:
 			if (value.known) std::memcpy(output, &value.bits, sizeof(value.bits));
 		}
 
+		if (runtime.user_data.size() < m_required_user_data) return false;
+		plan.srt_user_data = m_required_user_data;
 		if (reads != nullptr) {
 			for (const auto address: m_captured) reads->emplace_back(address, sizeof(uint32_t));
 		}
@@ -396,6 +401,7 @@ private:
 				if (reg < m_plan->user_data_base ||
 				    reg - m_plan->user_data_base >= m_plan->user_data_count) return {};
 				const auto index = reg - m_plan->user_data_base;
+				m_required_user_data = std::max(m_required_user_data, index + 1u);
 				if (index >= m_runtime->user_data.size()) return {};
 				return {m_runtime->user_data[index], true};
 			}
@@ -466,8 +472,7 @@ private:
 				if ((descriptor_flags & (1u << 15u)) != 0u ||
 				    (static_cast<uint32_t>(flags.bits) & ((1u << 23u) | 0xf0000000u)) != 0u)
 					return {};
-				if ((descriptor_flags & 0x3fffu) == 0u ||
-				    (static_cast<uint32_t>(flags.bits) & (0x7fu << 12u)) == 0u ||
+				if ((static_cast<uint32_t>(flags.bits) & (0x7fu << 12u)) == 0u ||
 				    stride.bits == 0u) return {0u, true};
 			}
 			uint64_t size = stride.bits;
@@ -699,9 +704,8 @@ private:
 	std::vector<uint8_t> m_reachable;
 	std::map<std::pair<const Inst*, uint32_t>, Memo> m_cache;
 	std::vector<uint64_t> m_captured;
+	uint32_t m_required_user_data = 0u;
 };
-
-} // namespace
 
 void CompileSrtWalkerNative(ResourcePlan& plan, std::span<const Value> values) {
 	plan.srt_native = std::make_shared<NativeSrtWalker>(plan, values);
