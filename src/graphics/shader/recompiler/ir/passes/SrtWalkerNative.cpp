@@ -439,8 +439,14 @@ private:
 	Result EvalRead(const Inst& inst, uint32_t context) {
 		const auto op = inst.GetOpcode();
 		const auto* handle = inst.NumArgs() != 0u ? inst.Arg(0).ResolveInstruction() : nullptr;
-		if (!IsRawRead(*m_plan, inst) || handle == nullptr) return {};
+		const auto expected_handle = op == ValueOpcode::LoadAddressU32
+		    ? ValueOpcode::GetAddressResource : ValueOpcode::GetBufferResource;
+		if (!IsRawRead(*m_plan, inst) || handle == nullptr ||
+		    handle->GetOpcode() != expected_handle) return {};
 		const bool vector = op == ValueOpcode::LoadBufferU32;
+		if ((op == ValueOpcode::LoadAddressU32 && handle->NumArgs() != 2u) ||
+		    (op == ValueOpcode::ReadConstBuffer && inst.NumArgs() != 2u) ||
+		    (op == ValueOpcode::LoadBufferU32 && inst.NumArgs() != 5u)) return {};
 		if (vector) {
 			const auto guard = Eval(inst.Arg(4), context);
 			// Unknown guards cannot authorize a host-side read. A false guard reads zero.
