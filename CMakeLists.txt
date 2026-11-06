@@ -813,7 +813,6 @@ if(BUILD_TESTING)
 	add_custom_target(kyty_tests DEPENDS
 		ime_dialog_tests
 		shader_cfg_tests
-		scalar_provenance_tests
 		image_page_table_tests
 		memory_tracker_tests
 		page_manager_tests
@@ -826,8 +825,6 @@ if(BUILD_TESTING)
 		lru_cache_tests
 		common_tests
 		shader_vertex_metadata_tests
-		resource_materialization_tests
-		resource_tracking_tests
 		event_queue_lifetime_tests
 		kernel_file_system_tests
 		sync_on_address_tests
@@ -850,6 +847,13 @@ if(BUILD_TESTING)
 		http_uri_parse_tests
 		rtc_tests
 	)
+	if(KYTY_BUILD_X86_64_SRT_TESTS)
+		add_dependencies(kyty_tests
+			scalar_provenance_tests
+			resource_materialization_tests
+			resource_tracking_tests
+		)
+	endif()
 endif()
 
 # Test Darwin signal-context restoration for SSE4a instructions.
