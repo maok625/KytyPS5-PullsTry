@@ -3,7 +3,10 @@
 
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
+#if defined(__x86_64__) || defined(_M_X64)
+#define KYTY_SRTWALKER_TEST_X64_HOST
 #include <xbyak/xbyak.h>
+#endif
 
 #include <csignal>
 #include <cstddef>
@@ -27,21 +30,21 @@ public:
   explicit FakeGuestMemory(Libs::Graphics::ShaderRecompiler::IR::SrtMemoryReader reader = nullptr,
                            void *userdata = nullptr) {
     Current() = {reader, userdata};
-#if defined(__linux__) || defined(__APPLE__)
+#if defined(KYTY_SRTWALKER_TEST_X64_HOST) && (defined(__linux__) || defined(__APPLE__))
     struct sigaction action {};
     action.sa_sigaction = Handle;
     action.sa_flags = SA_SIGINFO;
     for (size_t index = 0; index < std::size(kSignals); ++index)
       sigaction(kSignals[index], &action, &m_previous[index]);
-#elif defined(_WIN32)
+#elif defined(KYTY_SRTWALKER_TEST_X64_HOST) && defined(_WIN32)
     m_handler = AddVectoredExceptionHandler(1, Handle);
 #endif
   }
   ~FakeGuestMemory() {
-#if defined(__linux__) || defined(__APPLE__)
+#if defined(KYTY_SRTWALKER_TEST_X64_HOST) && (defined(__linux__) || defined(__APPLE__))
     for (size_t index = 0; index < std::size(kSignals); ++index)
       sigaction(kSignals[index], &m_previous[index], nullptr);
-#elif defined(_WIN32)
+#elif defined(KYTY_SRTWALKER_TEST_X64_HOST) && defined(_WIN32)
     RemoveVectoredExceptionHandler(m_handler);
 #endif
     Current() = {};
@@ -60,7 +63,7 @@ private:
     const auto [reader, userdata] = Current();
     return reader != nullptr && reader(userdata, address, {&word, 1}) ? word : 0u;
   }
-#if defined(__linux__) || defined(__APPLE__)
+#if defined(KYTY_SRTWALKER_TEST_X64_HOST) && (defined(__linux__) || defined(__APPLE__))
 #if defined(__APPLE__)
   // macOS raises SIGBUS for some protection faults and SIGSEGV for others.
   static constexpr int kSignals[] = {SIGSEGV, SIGBUS};
@@ -84,7 +87,7 @@ private:
     rip += length;
   }
   struct sigaction m_previous[std::size(kSignals)] {};
-#elif defined(_WIN32)
+#elif defined(KYTY_SRTWALKER_TEST_X64_HOST) && defined(_WIN32)
   static LONG CALLBACK Handle(EXCEPTION_POINTERS *info) {
     auto &context = *info->ContextRecord;
     const auto length = Libs::Graphics::ShaderRecompiler::IR::SrtWalkerLoadLength(context.Rip);
@@ -97,6 +100,10 @@ private:
   void *m_handler = nullptr;
 #endif
 };
+
+#ifdef KYTY_SRTWALKER_TEST_X64_HOST
+#undef KYTY_SRTWALKER_TEST_X64_HOST
+#endif
 
 // Evaluates one value through a walker compiled for it, keeping the plan's resource walker.
 inline bool EvaluateSrtValue(Libs::Graphics::ShaderRecompiler::IR::ResourcePlan &plan,
