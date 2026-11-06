@@ -443,8 +443,9 @@ private:
 		const bool vector = op == ValueOpcode::LoadBufferU32;
 		if (vector) {
 			const auto guard = Eval(inst.Arg(4), context);
-			// A non-uniform or unavailable EXEC guard cannot authorize a host-side read.
-			if (!guard.known || guard.bits == 0u) return {0u, true};
+			// Unknown guards cannot authorize a host-side read. A false guard reads zero.
+			if (!guard.known) return {};
+			if (guard.bits == 0u) return {0u, true};
 		}
 		const bool buffer = op != ValueOpcode::LoadAddressU32;
 		if (buffer && handle->NumArgs() != 4u) return {};
@@ -472,7 +473,8 @@ private:
 				if ((descriptor_flags & (1u << 15u)) != 0u ||
 				    (static_cast<uint32_t>(flags.bits) & ((1u << 23u) | 0xf0000000u)) != 0u)
 					return {};
-				if ((static_cast<uint32_t>(flags.bits) & (0x7fu << 12u)) == 0u ||
+				if ((descriptor_flags & 0x3fffu) == 0u ||
+				    (static_cast<uint32_t>(flags.bits) & (0x7fu << 12u)) == 0u ||
 				    stride.bits == 0u) return {0u, true};
 			}
 			uint64_t size = stride.bits;
@@ -708,14 +710,16 @@ private:
 };
 
 void CompileSrtWalkerNative(ResourcePlan& plan, std::span<const Value> values) {
-	plan.srt_native = std::make_shared<NativeSrtWalker>(plan, values);
+	plan.srt_native_values.assign(values.begin(), values.end());
+	plan.srt_native = std::make_shared<NativeSrtWalker>(plan, plan.srt_native_values);
 }
 
 bool WalkSrtNative(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<uint32_t>& flat,
                    std::vector<std::pair<uint64_t, uint64_t>>* reads) {
 	auto& mutable_plan = const_cast<ResourcePlan&>(plan);
 	if (!mutable_plan.srt_native || !mutable_plan.srt_native->Matches(plan)) {
-		mutable_plan.srt_native = std::make_shared<NativeSrtWalker>(mutable_plan, {});
+		mutable_plan.srt_native =
+		    std::make_shared<NativeSrtWalker>(mutable_plan, mutable_plan.srt_native_values);
 	}
 	auto walker = mutable_plan.srt_native;
 	// The runtime is supplied per dispatch; don't retain it in the cached program.

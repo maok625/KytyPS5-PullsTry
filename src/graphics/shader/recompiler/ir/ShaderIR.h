@@ -717,6 +717,7 @@ struct ResourcePlan {
 	// Architecture-specific walker over the retained SRT, descriptor and condition values.
 	std::unique_ptr<Xbyak::CodeGenerator> srt_code;
 	mutable std::shared_ptr<NativeSrtWalker> srt_native;
+	std::vector<Value>                      srt_native_values;
 	uint32_t                              srt_user_data = 0; // User-data DWORDs the walker reads.
 	uint32_t                              srt_captures  = 0; // Scratch offset of loaded addresses.
 	// GPU-thread scratch for walker results and material keys.
