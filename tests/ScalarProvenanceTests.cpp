@@ -11,6 +11,13 @@
 #include <stdexcept>
 #include <unordered_map>
 
+namespace Libs::Graphics::ShaderRecompiler::IR {
+void CompileSrtWalkerNative(ResourcePlan& plan, std::span<const Value> values = {});
+bool WalkSrtNative(const ResourcePlan& plan, const SrtRuntime& runtime,
+                   std::vector<uint32_t>& flat,
+                   std::vector<std::pair<uint64_t, uint64_t>>* reads);
+} // namespace Libs::Graphics::ShaderRecompiler::IR
+
 namespace {
 
 using namespace Libs::Graphics::ShaderRecompiler::IR;
@@ -147,6 +154,46 @@ void TestImmediateFlatteningAndGvn() {
   Check(WalkSrt(ExtractResourcePlan(fixture.program), {}, flat, nullptr), "flattened SRT walk failed");
   Check(flat == std::vector<uint32_t>{0xfeedbeefu} && memory_image.reads == 1,
         "flattened SRT did not evaluate its canonical read once");
+}
+
+void TestNativeWalkerMatchesXbyak() {
+  Fixture fixture;
+  const auto memory = fixture.AddMemory(ResourceKind::ScalarAddress, 0x20);
+  const auto read = RawRead(
+      fixture, Address(fixture, Value(0x1000u), Value(0u)), Value(0u), memory);
+  LoadBuffer(fixture, {read, Value(0u), Value(16u), Value(0u)});
+  fixture.Plan();
+
+  TestMemory memory_image{{{0x1020u, 0xfeedbeefu}}};
+  FakeGuestMemory fake(ReadMemory, &memory_image);
+  const SrtRuntime runtime{
+      .userdata = &memory_image,
+      .read_specialization_memory = ReadMemory,
+  };
+  auto plan = ExtractResourcePlan(fixture.program);
+  std::vector<uint32_t> jit_flat;
+  std::vector<uint32_t> native_flat;
+  std::vector<std::pair<uint64_t, uint64_t>> jit_reads;
+  std::vector<std::pair<uint64_t, uint64_t>> native_reads;
+
+  Check(WalkSrt(plan, runtime, jit_flat, &jit_reads),
+        "x86 reference SRT walk failed");
+  DescriptorValue jit_descriptor{};
+  Check(!plan.descriptor_sources.empty() &&
+            WalkedDescriptor(plan, 0u, jit_descriptor),
+        "x86 reference walker did not produce its root descriptor");
+
+  CompileSrtWalkerNative(plan);
+  Check(WalkSrtNative(plan, runtime, native_flat, &native_reads),
+        "native C++ SRT walk failed");
+  DescriptorValue native_descriptor{};
+  Check(WalkedDescriptor(plan, 0u, native_descriptor),
+        "native C++ walker did not produce its root descriptor");
+  Check(jit_flat == native_flat &&
+            jit_descriptor.dword_count == native_descriptor.dword_count &&
+            jit_descriptor.dwords == native_descriptor.dwords &&
+            jit_reads == native_reads,
+        "native C++ SRT walker diverged from the x86 reference");
 }
 
 void TestRawScalarComponentAlignment() {
@@ -936,6 +983,7 @@ void DbgExitHandler(const char *, int, std::string_view text) {
 int main() {
   try {
     TestImmediateFlatteningAndGvn();
+    TestNativeWalkerMatchesXbyak();
     TestRawScalarComponentAlignment();
     TestScalarMemoryDomainMismatchFails();
     TestDynamicReadRemainsTyped();
