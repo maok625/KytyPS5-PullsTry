@@ -934,29 +934,6 @@ static void ForEachRelocation(Program* program, auto&& func) {
 	}
 	for (uint32_t i = 0; i < info.jmprela_table_size / sizeof(Elf64_Rela); ++i) {
 		func(info.jmprela_table + i, i, true);
-}
-
-__attribute__((naked)) static KYTY_SYSV_ABI void RelocateHandlerReturnStub() {
-#if defined(__x86_64__) || defined(_M_X64)
-	asm volatile("addq $8, %rsp\n\t"
-	             "retq\n");
-#else
-	// ARM64: not implemented - this stub is x86_64 only
-	asm volatile("ret\n");
-#endif
-}
-
-static KYTY_SYSV_ABI uint64_t RelocateHandler(RelocateHandlerStack s) {
-	auto*       stack     = s.stack;
-	auto*       program   = reinterpret_cast<Program*>(stack[-1]);
-	auto        rel_index = stack[0];
-	std::string name      = "<unknown function>";
-
-	if (program != nullptr && program->dynamic_info != nullptr &&
-	    program->dynamic_info->jmprela_table != nullptr) {
-		auto ri = GetRelocationInfo(program->dynamic_info->jmprela_table + rel_index, program);
-
-		name = ri.name.c_str();
 	}
 }
 

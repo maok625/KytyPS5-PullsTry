@@ -5,9 +5,12 @@
 #include <Zydis/Zydis.h>
 #include <bit>
 #include <cstring>
+#include <cstdlib>
+#if defined(__x86_64__) || defined(_M_X64)
 #include <emmintrin.h>
 #include <xmmintrin.h>
 #include <cpuid.h>
+#endif
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <windows.h> // IWYU pragma: keep
@@ -21,6 +24,7 @@
 
 namespace Loader::X64InstructionEmulator {
 
+#if defined(__x86_64__) || defined(_M_X64)
 static uint64_t ExtractBitField(uint64_t value, uint32_t length, uint32_t index) {
 	length &= 0x3fu;
 	index &= 0x3fu;
@@ -398,6 +402,8 @@ static bool ExecuteShaNiInsn(const ShaNiInsn& insn, const XmmWords& src2, const 
 	}
 }
 
+#endif
+
 // Keep instruction semantics shared; only access to the saved host context differs.
 struct Context {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -469,33 +475,22 @@ struct Context {
 			default: return nullptr;
 		}
 	}
-<<<<<<< HEAD
-	// The kernel hands AVX threads the longer context that carries YMM[255:128]; a plain SSE
-	// context has no such state to clear.
+	// The kernel supplies the extended x86 context when AVX state is present.
 	void ClearUpperYmm(uint8_t index) const {
-		if (index >= 16 || native->uc_mcsize < sizeof(_STRUCT_MCONTEXT_AVX64)) {
-			return;
-		}
+		if (index >= 16 || native->uc_mcsize < sizeof(_STRUCT_MCONTEXT_AVX64)) return;
 		auto* avx = reinterpret_cast<_STRUCT_MCONTEXT_AVX64*>(native->uc_mcontext);
 		auto* ymmh = &avx->__fs.__fpu_ymmh0;
 		ymmh[index] = {};
-=======
+	}
 #elif defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
 	ucontext_t* native;
-
-	[[nodiscard]] uint64_t Rip() const {
-		return static_cast<uint64_t>(native->uc_mcontext->__ss.__pc);
-	}
-	void Advance(size_t length) {
-		native->uc_mcontext->__ss.__pc += static_cast<uint64_t>(length);
-	}
-	// ARM64 uses NEON registers (v0-v31) instead of XMM
+	[[nodiscard]] uint64_t Rip() const { return static_cast<uint64_t>(native->uc_mcontext->__ss.__pc); }
+	void Advance(size_t length) { native->uc_mcontext->__ss.__pc += static_cast<uint64_t>(length); }
 	[[nodiscard]] void* Xmm(uint8_t index) const {
 		if (index >= 32) return nullptr;
-		// NEON registers are in __ns (neon state), not __ss
 		auto* ns = &native->uc_mcontext->__ns;
 		return &ns->__v[index];
->>>>>>> pr/63
+	}
 	}
 #else
 	ucontext_t* native;
@@ -551,6 +546,7 @@ struct Context {
 
 #if !defined(__APPLE__)
 
+#if defined(__x86_64__) || defined(_M_X64)
 static bool TryEmulateShaNi(Context& context) {
 	const auto* rip = reinterpret_cast<const uint8_t*>(context.Rip());
 	ShaNiInsn   insn {};
@@ -817,47 +813,37 @@ static bool TryEmulateReciprocalSquareRoot(Context& context) {
 	return true;
 }
 
+#endif
+
 bool TryEmulate(void* native_context) {
-	if (native_context == nullptr) {
-		return false;
-	}
+#if defined(__x86_64__) || defined(_M_X64)
+	if (native_context == nullptr) return false;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	Context context {static_cast<PCONTEXT>(native_context)};
-#elif defined(__APPLE__) && (defined(__x86_64__) || defined(_M_X64))
+#elif defined(__APPLE__)
 	auto* saved_context = static_cast<ucontext_t*>(native_context);
-	if (saved_context->uc_mcontext == nullptr) {
-		return false;
-	}
+	if (saved_context->uc_mcontext == nullptr) return false;
 	Context context {saved_context};
 #else
 	Context context {static_cast<ucontext_t*>(native_context)};
 #endif
-<<<<<<< HEAD
 	return TryEmulateReciprocalSquareRoot(context) || TryEmulateMonitorxMwaitx(context) ||
-	       TryEmulateSse4a(context) ||
-#if !defined(__APPLE__)
-	       TryEmulateShaNi(context) ||
-=======
-#if !defined(__APPLE__) || (defined(__APPLE__) && (defined(__x86_64__) || defined(_M_X64)))
-	if (TryEmulateReciprocalSquareRoot(context)) {
-		return true;
-	}
-	return TryEmulateMonitorxMwaitx(context) || TryEmulateSse4a(context) ||
-	       TryEmulateShaNi(context);
+	       TryEmulateSse4a(context) || TryEmulateShaNi(context) || TryEmulateCpuExtensions(context);
 #else
-	// ARM64: x86 SSE4a/SHA/Rsqrt emulators must not run on AArch64 hosts.
-	// Matching byte patterns in native ARM instructions would corrupt guest NEON state.
-	(void)context;
+	(void)native_context;
 	return false;
->>>>>>> pr/63
 #endif
-	       TryEmulateCpuExtensions(context);
 }
 
 void SkipLoad(void* native_context, size_t length) {
+#if defined(__x86_64__) || defined(_M_X64)
 	Context context {static_cast<decltype(Context::native)>(native_context)};
 	context.Gpr(0) = 0;
 	context.Advance(length);
+#else
+	(void)native_context; (void)length;
+	std::abort();
+#endif
 }
 
 } // namespace Loader::X64InstructionEmulator

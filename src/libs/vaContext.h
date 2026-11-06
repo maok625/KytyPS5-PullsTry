@@ -2,10 +2,16 @@
 #define EMULATOR_INCLUDE_EMULATOR_LIBS_VACONTEXT_H_
 
 #include <cstddef>
+#include <cstdint>
+#include <cstring>
 #include <bit>
 
 #if defined(__x86_64__)
 #include <xmmintrin.h>
+#endif
+
+#if defined(__aarch64__) || defined(__arm64__)
+using VaFpRegArg = uint64_t __attribute__((vector_size(16)));
 #endif
 
 #if defined(__x86_64__)
@@ -62,39 +68,37 @@ struct VaCharX16 {
 	char x[16];
 };
 #elif defined(__aarch64__) || defined(__arm64__)
-// ARM64 calling convention: x0-x7 for integer args, v0-v7 for FP args (128-bit NEON registers)
-// Use portable 16-byte type instead of x86 __m128 intrinsic
+// AArch64 vector parameters are explicitly typed so the compiler captures v0-v7.
+// The saved values are copied byte-for-byte into the portable register-save layout.
 // NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
-#define VA_ARGS                                                                                    \
-	uint64_t x0, uint64_t x1, uint64_t x2, uint64_t x3, uint64_t x4, uint64_t x5, uint64_t x6,      \
-	    uint64_t x7, uint64_t overflow_arg_area, uint64_t v0_lo, uint64_t v0_hi,                     \
-	    uint64_t v1_lo, uint64_t v1_hi, uint64_t v2_lo, uint64_t v2_hi, uint64_t v3_lo,             \
-	    uint64_t v3_hi, uint64_t v4_lo, uint64_t v4_hi, uint64_t v5_lo, uint64_t v5_hi,             \
-	    uint64_t v6_lo, uint64_t v6_hi, uint64_t v7_lo, uint64_t v7_hi, ...
+#define VA_ARGS \
+	uint64_t x0, uint64_t x1, uint64_t x2, uint64_t x3, uint64_t x4, uint64_t x5, uint64_t x6, \
+	    uint64_t x7, uint64_t overflow_arg_area, VaFpRegArg v0, VaFpRegArg v1, VaFpRegArg v2, \
+	    VaFpRegArg v3, VaFpRegArg v4, VaFpRegArg v5, VaFpRegArg v6, VaFpRegArg v7, ...
 
 // NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
-#define VA_CONTEXT(ctx)                                                                            \
-	alignas(16) VaContext ctx;                                                                     \
-	(ctx).reg_save_area.gp[0]       = x0;                                                          \
-	(ctx).reg_save_area.gp[1]       = x1;                                                          \
-	(ctx).reg_save_area.gp[2]       = x2;                                                          \
-	(ctx).reg_save_area.gp[3]       = x3;                                                          \
-	(ctx).reg_save_area.gp[4]       = x4;                                                          \
-	(ctx).reg_save_area.gp[5]       = x5;                                                          \
-	(ctx).reg_save_area.gp[6]       = x6;                                                          \
-	(ctx).reg_save_area.gp[7]       = x7;                                                          \
-	(ctx).reg_save_area.fp[0].lo    = v0_lo; (ctx).reg_save_area.fp[0].hi = v0_hi;                 \
-	(ctx).reg_save_area.fp[1].lo    = v1_lo; (ctx).reg_save_area.fp[1].hi = v1_hi;                 \
-	(ctx).reg_save_area.fp[2].lo    = v2_lo; (ctx).reg_save_area.fp[2].hi = v2_hi;                 \
-	(ctx).reg_save_area.fp[3].lo    = v3_lo; (ctx).reg_save_area.fp[3].hi = v3_hi;                 \
-	(ctx).reg_save_area.fp[4].lo    = v4_lo; (ctx).reg_save_area.fp[4].hi = v4_hi;                 \
-	(ctx).reg_save_area.fp[5].lo    = v5_lo; (ctx).reg_save_area.fp[5].hi = v5_hi;                 \
-	(ctx).reg_save_area.fp[6].lo    = v6_lo; (ctx).reg_save_area.fp[6].hi = v6_hi;                 \
-	(ctx).reg_save_area.fp[7].lo    = v7_lo; (ctx).reg_save_area.fp[7].hi = v7_hi;                 \
-	(ctx).va_list.reg_save_area     = &(ctx).reg_save_area;                                        \
-	(ctx).va_list.gp_offset         = offsetof(VaRegSave, gp);                                     \
-	(ctx).va_list.fp_offset         = offsetof(VaRegSave, fp);                                     \
-	(ctx).va_list.overflow_arg_area = &overflow_arg_area;
+#define VA_CONTEXT(ctx) \
+	alignas(16) VaContext ctx; \
+	(ctx).reg_save_area.gp[0] = x0; \
+	(ctx).reg_save_area.gp[1] = x1; \
+	(ctx).reg_save_area.gp[2] = x2; \
+	(ctx).reg_save_area.gp[3] = x3; \
+	(ctx).reg_save_area.gp[4] = x4; \
+	(ctx).reg_save_area.gp[5] = x5; \
+	(ctx).reg_save_area.gp[6] = x6; \
+	(ctx).reg_save_area.gp[7] = x7; \
+	std::memcpy(&(ctx).reg_save_area.fp[0], &v0, sizeof(v0)); \
+	std::memcpy(&(ctx).reg_save_area.fp[1], &v1, sizeof(v1)); \
+	std::memcpy(&(ctx).reg_save_area.fp[2], &v2, sizeof(v2)); \
+	std::memcpy(&(ctx).reg_save_area.fp[3], &v3, sizeof(v3)); \
+	std::memcpy(&(ctx).reg_save_area.fp[4], &v4, sizeof(v4)); \
+	std::memcpy(&(ctx).reg_save_area.fp[5], &v5, sizeof(v5)); \
+	std::memcpy(&(ctx).reg_save_area.fp[6], &v6, sizeof(v6)); \
+	std::memcpy(&(ctx).reg_save_area.fp[7], &v7, sizeof(v7)); \
+	(ctx).va_list.reg_save_area = &(ctx).reg_save_area; \
+	(ctx).va_list.gp_offset = offsetof(VaRegSave, gp); \
+	(ctx).va_list.fp_offset = offsetof(VaRegSave, fp); \
+	(ctx).va_list.overflow_arg_area = &(overflow_arg_area);
 
 namespace Libs {
 
@@ -151,6 +155,14 @@ struct VaCharX16 {
 	char x[16];
 };
 #endif
+
+inline constexpr uint32_t VaGpLastOffset =
+#if defined(__x86_64__)
+    40u;
+#else
+    56u;
+#endif
+inline constexpr uint32_t VaGpLastPairOffset = VaGpLastOffset - 8u;
 
 struct VaShortX8 {
 	short x[8]; // NOLINT(google-runtime-int)
@@ -225,8 +237,16 @@ inline VaFloatX4 VaArg_reg_save_area_fp<VaFloatX4, 32>(VaList* l) {
 	auto* addr =
 	    reinterpret_cast<VaFpReg*>(static_cast<uint8_t*>(l->reg_save_area) + l->fp_offset);
 	l->fp_offset += 32;
-	VaFloatX4 ret = {{static_cast<float>(addr[0].lo), static_cast<float>(addr[0].hi),
-	                  static_cast<float>(addr[1].lo), static_cast<float>(addr[1].hi)}};
+	const auto lo0 = addr[0].lo;
+	const auto hi0 = addr[0].hi;
+	const auto lo1 = addr[1].lo;
+	const auto hi1 = addr[1].hi;
+	VaFloatX4 ret = {{
+	    std::bit_cast<float>(static_cast<uint32_t>(lo0)),
+	    std::bit_cast<float>(static_cast<uint32_t>(lo0 >> 32u)),
+	    std::bit_cast<float>(static_cast<uint32_t>(hi0)),
+	    std::bit_cast<float>(static_cast<uint32_t>(hi0 >> 32u))
+	}};
 	return ret;
 }
 
@@ -263,7 +283,7 @@ inline double VaArg_double(VaList* l) {
 #endif
 
 inline int VaArg_int(VaList* l) {
-	if (l->gp_offset <= 40) {
+	if (l->gp_offset <= VaGpLastOffset) {
 		return VaArg_reg_save_area_gp<int, 8>(l);
 	}
 	return VaArg_overflow_arg_area<int, 1, 8>(l);
@@ -275,7 +295,7 @@ inline long double VaArg_long_double(VaList* l) {
 
 /*inline wint_t VaArg_wint_t(VaList* l)
 {
-    if (l->gp_offset <= 40)
+    if (l->gp_offset <= VaGpLastOffset)
     {
         return VaArg_reg_save_area_gp<wint_t, 8>(l);
     }
@@ -283,7 +303,7 @@ inline long double VaArg_long_double(VaList* l) {
 }*/
 
 inline VaCharX16 VaArg_char_x16(VaList* l) {
-	if (l->gp_offset <= 32) {
+	if (l->gp_offset <= VaGpLastPairOffset) {
 		return VaArg_reg_save_area_gp<VaCharX16, 16>(l);
 	}
 	return VaArg_overflow_arg_area<VaCharX16, 1, 16>(l);
@@ -291,14 +311,14 @@ inline VaCharX16 VaArg_char_x16(VaList* l) {
 
 inline long VaArg_long(VaList* l) // NOLINT(google-runtime-int)
 {
-	if (l->gp_offset <= 40) {
+	if (l->gp_offset <= VaGpLastOffset) {
 		return VaArg_reg_save_area_gp<long, 8>(l); // NOLINT(google-runtime-int)
 	}
 	return VaArg_overflow_arg_area<long, 1, 8>(l); // NOLINT(google-runtime-int)
 }
 
 inline intmax_t VaArg_intmax_t(VaList* l) {
-	if (l->gp_offset <= 40) {
+	if (l->gp_offset <= VaGpLastOffset) {
 		return VaArg_reg_save_area_gp<intmax_t, 8>(l);
 	}
 	return VaArg_overflow_arg_area<intmax_t, 1, 8>(l);
@@ -306,35 +326,35 @@ inline intmax_t VaArg_intmax_t(VaList* l) {
 
 inline long long VaArg_long_long(VaList* l) // NOLINT(google-runtime-int)
 {
-	if (l->gp_offset <= 40) {
+	if (l->gp_offset <= VaGpLastOffset) {
 		return VaArg_reg_save_area_gp<long long, 8>(l); // NOLINT(google-runtime-int)
 	}
 	return VaArg_overflow_arg_area<long long, 1, 8>(l); // NOLINT(google-runtime-int)
 }
 
 inline ptrdiff_t VaArg_ptrdiff_t(VaList* l) {
-	if (l->gp_offset <= 40) {
+	if (l->gp_offset <= VaGpLastOffset) {
 		return VaArg_reg_save_area_gp<ptrdiff_t, 8>(l);
 	}
 	return VaArg_overflow_arg_area<ptrdiff_t, 1, 8>(l);
 }
 
 inline size_t VaArg_size_t(VaList* l) {
-	if (l->gp_offset <= 40) {
+	if (l->gp_offset <= VaGpLastOffset) {
 		return VaArg_reg_save_area_gp<size_t, 8>(l);
 	}
 	return VaArg_overflow_arg_area<size_t, 1, 8>(l);
 }
 
 inline VaShortX8 VaArg_ShortX8(VaList* l) {
-	if (l->gp_offset <= 32) {
+	if (l->gp_offset <= VaGpLastPairOffset) {
 		return VaArg_reg_save_area_gp<VaShortX8, 16>(l);
 	}
 	return VaArg_overflow_arg_area<VaShortX8, 1, 16>(l);
 }
 
 inline VaIntX4 VaArg_IntX4(VaList* l) {
-	if (l->gp_offset <= 32) {
+	if (l->gp_offset <= VaGpLastPairOffset) {
 		return VaArg_reg_save_area_gp<VaIntX4, 16>(l);
 	}
 	return VaArg_overflow_arg_area<VaIntX4, 1, 16>(l);
@@ -351,7 +371,7 @@ inline VaFloatX4 VaArg_FloatX4(VaList* l) {
 
 template <class T>
 T* VaArg_ptr(VaList* l) {
-	if (l->gp_offset <= 40) {
+	if (l->gp_offset <= VaGpLastOffset) {
 		return VaArg_reg_save_area_gp<T*, 8>(l);
 	}
 	return VaArg_overflow_arg_area<T*, 1, 8>(l);
