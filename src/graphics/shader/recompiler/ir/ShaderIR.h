@@ -26,6 +26,8 @@ class CodeGenerator;
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
+class NativeSrtWalker;
+
 // Finite descriptor domains also bound the arithmetic used to prove their indices.
 constexpr uint32_t MaxIndirectDescriptorProbes = 65536u;
 
@@ -712,8 +714,9 @@ struct ResourcePlan {
 	bool                                resource_tracking_complete = false;
 	ShaderInfo                          info;
 	UniformFillPlan                     uniform_fill;
-	// x86 walker over the retained SRT, descriptor and condition values.
+	// Architecture-specific walker over the retained SRT, descriptor and condition values.
 	std::unique_ptr<Xbyak::CodeGenerator> srt_code;
+	mutable std::shared_ptr<NativeSrtWalker> srt_native;
 	uint32_t                              srt_user_data = 0; // User-data DWORDs the walker reads.
 	uint32_t                              srt_captures  = 0; // Scratch offset of loaded addresses.
 	// GPU-thread scratch for walker results and material keys.

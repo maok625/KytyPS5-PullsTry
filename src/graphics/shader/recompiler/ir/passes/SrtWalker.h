@@ -67,7 +67,7 @@ bool ValidateRuntimeValue(const ResourcePlan& program, Value value,
 // Uniform across a compute wave, including values derived from its workgroup ID.
 // This does not imply that the host can evaluate the value.
 bool ValidateWaveUniformValue(const ResourcePlan& program, Value value);
-// Compiles the plan's x86 walker. Without values it walks the plan's resources; otherwise it
+// Compiles the platform walker. Without values it walks the plan's resources; otherwise it
 // only evaluates the values, with every block reachable.
 void CompileSrtWalker(ResourcePlan& plan, std::span<const Value> values = {});
 // Runs the walker. flat receives the scalar reads of reachable blocks and reads, when non-null,
@@ -79,8 +79,8 @@ bool WalkedValue(const ResourcePlan& plan, Value value, uint32_t& result);
 bool WalkedDescriptor(const ResourcePlan& plan, uint32_t source, DescriptorValue& result);
 bool WalkedActive(const ResourcePlan& plan, uint32_t source);
 bool WalkedImageActive(const ResourcePlan& plan, uint32_t image);
-// Length of the guest load at rip if it belongs to the walker running on this thread, else 0.
-// The exception handler completes such a load as a zero read.
+// Length of an x86 guest load at rip if it belongs to the active JIT walker, else 0.
+// The x86 exception handler completes such a load as a zero read; native walkers return 0.
 uint32_t SrtWalkerLoadLength(uint64_t rip);
 
 // Nonnegative affine coefficients: element zero is constant, remaining elements are

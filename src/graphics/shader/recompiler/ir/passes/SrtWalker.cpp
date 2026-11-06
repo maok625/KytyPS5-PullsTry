@@ -4,7 +4,9 @@
 #include "common/assert.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
+#if defined(__x86_64__) || defined(_M_X64)
 #include <xbyak/xbyak.h>
+#endif
 
 #include <algorithm>
 #include <bit>
@@ -14,6 +16,11 @@
 #include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
+
+void CompileSrtWalkerNative(ResourcePlan& plan, std::span<const Value> values);
+bool WalkSrtNative(const ResourcePlan& plan, const SrtRuntime& runtime,
+                   std::vector<uint32_t>& flat,
+                   std::vector<std::pair<uint64_t, uint64_t>>* reads);
 
 SrtRuntime SrtReadCapture::ObservedRuntime() {
 	auto runtime = m_source;
@@ -166,6 +173,7 @@ const uint8_t* Scratch(const ResourcePlan& plan) {
 	return reinterpret_cast<const uint8_t*>(plan.srt_scratch.data());
 }
 
+#if defined(__x86_64__) || defined(_M_X64)
 thread_local const Xbyak::CodeGenerator* t_running_walker = nullptr;
 
 // Every guest load is mov eax, [r10] (41 8b 02), so a fault completes it as a zero read.
@@ -173,6 +181,8 @@ void LoadGuest(Xbyak::CodeGenerator& code, const Xbyak::RegExp& address) {
 	code.lea(code.r10, code.ptr[address]);
 	code.mov(code.eax, code.dword[code.r10]);
 }
+
+#endif
 
 class RuntimeValidator {
 public:
@@ -365,6 +375,7 @@ private:
 };
 
 
+#if defined(__x86_64__) || defined(_M_X64)
 // Emits one x86 function per plan. Each value, per EXEC-mask context, is a memoized thunk with a
 // state byte (0 unevaluated, 1 unknown or in progress, 2 known, 3 a control Phi holding its first
 // value) and a qword slot; a reference is `call thunk; cmp state, 2`. Operands that are unknown,
@@ -1363,15 +1374,22 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 	EXIT_IF(Xbyak::GetError() != 0);
 }
 
+#endif
 } // namespace
 
 void CompileSrtWalker(ResourcePlan& plan, std::span<const Value> values) {
+#if defined(__x86_64__) || defined(_M_X64)
+	plan.srt_native.reset();
 	plan.srt_code = std::make_unique<Xbyak::CodeGenerator>(4096, Xbyak::AutoGrow);
 	WalkerCompiler(plan, *plan.srt_code).Compile(values);
+#else
+	CompileSrtWalkerNative(plan, values);
+#endif
 }
 
 bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<uint32_t>& flat,
              std::vector<std::pair<uint64_t, uint64_t>>* reads) {
+#if defined(__x86_64__) || defined(_M_X64)
 	if (plan.srt_code == nullptr || runtime.user_data.size() < plan.srt_user_data) return false;
 	flat.assign(plan.srt_reads.size(), 0u);
 	using Walker = const uint64_t* KYTY_SYSV_ABI (*)(const uint32_t*, uint32_t*, uint64_t*, uint64_t);
@@ -1385,6 +1403,9 @@ bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<ui
 			reads->emplace_back(*read, sizeof(uint32_t));
 	}
 	return true;
+#else
+	return WalkSrtNative(plan, runtime, flat, reads);
+#endif
 }
 
 bool WalkedValue(const ResourcePlan& plan, Value value, uint32_t& result) {
@@ -1431,11 +1452,16 @@ bool ValidateWaveUniformValue(const ResourcePlan& program, Value value) {
 }
 
 uint32_t SrtWalkerLoadLength(uint64_t rip) {
+#if defined(__x86_64__) || defined(_M_X64)
 	if (t_running_walker == nullptr ||
 	    rip - reinterpret_cast<uint64_t>(t_running_walker->getCode()) >= t_running_walker->getSize())
 		return 0;
 	const auto* code = reinterpret_cast<const uint8_t*>(rip);
 	return code[0] == 0x41u && code[1] == 0x8bu && code[2] == 0x02u ? 3 : 0;
+#else
+	(void)rip;
+	return 0;
+#endif
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
