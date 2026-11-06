@@ -1131,11 +1131,21 @@ bool HandleStackFault(const Common::HostException::ExceptionInfo &info) {
 
 // A stack write must fault before any signal frame can use the protected stack.
 __attribute__((naked)) void WriteProtectedStack(void *) {
+#if defined(__x86_64__)
   asm volatile("mov %rsp, %rax\n"
                "mov %rdi, %rsp\n"
                "push %rax\n"
                "pop %rsp\n"
                "ret\n");
+#elif defined(__aarch64__)
+  asm volatile("mov x10, sp\n"
+               "mov sp, x0\n"
+               "str x10, [sp, #-16]!\n"
+               "mov sp, x10\n"
+               "ret\n");
+#else
+#error "WriteProtectedStack needs an architecture-specific implementation"
+#endif
 }
 
 void TestFaultOnProtectedStack() {
