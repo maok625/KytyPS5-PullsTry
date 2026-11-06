@@ -491,7 +491,6 @@ struct Context {
 		auto* ns = &native->uc_mcontext->__ns;
 		return &ns->__v[index];
 	}
-	}
 #else
 	ucontext_t* native;
 
@@ -537,11 +536,13 @@ struct Context {
 	}
 #endif
 
+#if defined(__x86_64__) || defined(_M_X64)
 	void LoadGprs(uint64_t (&gpr)[16]) const {
 		for (uint8_t i = 0; i < 16; ++i) {
 			gpr[i] = static_cast<uint64_t>(Gpr(i));
 		}
 	}
+#endif
 };
 
 #if !defined(__APPLE__)
