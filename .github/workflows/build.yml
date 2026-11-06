@@ -7,7 +7,7 @@ on:
   pull_request:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.ref == 'refs/heads/South' && github.sha || 'shared' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -183,6 +183,24 @@ jobs:
           glslangValidator --version
           echo "Host architecture: $(uname -m)"
           echo "QT_ROOT_DIR=$QT_ROOT_DIR"
+
+      - name: Verify macOS pthread support
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/kyty-pthread-smoke.c" <<'EOF'
+          #include <pthread.h>
+          static void* worker(void* value) { return value; }
+          int main(void) {
+            pthread_t thread;
+            void* result = 0;
+            if (pthread_create(&thread, 0, worker, (void*)42) != 0) return 1;
+            if (pthread_join(thread, &result) != 0) return 2;
+            return result == (void*)42 ? 0 : 3;
+          }
+          EOF
+          clang "$RUNNER_TEMP/kyty-pthread-smoke.c" -o "$RUNNER_TEMP/kyty-pthread-smoke"
+          "$RUNNER_TEMP/kyty-pthread-smoke"
+          echo "AppleClang can compile, link, and run a pthread program without extra thread flags."
 
       - name: Configure
         shell: bash
