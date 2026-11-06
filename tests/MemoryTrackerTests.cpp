@@ -1140,7 +1140,8 @@ __attribute__((naked)) void WriteProtectedStack(void *) {
 #elif defined(__aarch64__)
   asm volatile("mov x10, sp\n"
                "mov sp, x0\n"
-               "str x10, [sp, #-16]!\n"
+               "sub sp, sp, #16\n"
+               "str x10, [sp, #8]\n"
                "mov sp, x10\n"
                "ret\n");
 #else
