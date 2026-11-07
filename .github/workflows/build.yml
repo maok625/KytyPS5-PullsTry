@@ -295,10 +295,36 @@ jobs:
 
             dumped_entitlements="$RUNNER_TEMP/$(basename "$emulator").entitlements.plist"
             codesign -d --entitlements :- "$emulator" \
-              > "$dumped_entitlements" 2>/dev/null
-            plutil -extract com.apple.security.cs.allow-unsigned-executable-memory raw \
-              -o - "$dumped_entitlements" | grep -qx true
-            codesign -d --verbose=4 "$emulator" 2>&1 | grep -q 'flags=.*runtime'
+              > "$dumped_entitlements" 2> "$RUNNER_TEMP/codesign-entitlements.log"
+            if [[ ! -s "$dumped_entitlements" ]]; then
+              cat "$RUNNER_TEMP/codesign-entitlements.log"
+              echo "codesign did not return an entitlement plist for $emulator" >&2
+              exit 1
+            fi
+            /usr/bin/python3 - "$dumped_entitlements" <<'PY'
+            import plistlib
+            import sys
+
+            with open(sys.argv[1], "rb") as entitlement_file:
+                entitlements = plistlib.load(entitlement_file)
+
+            required = (
+                "com.apple.security.cs.allow-jit",
+                "com.apple.security.cs.allow-unsigned-executable-memory",
+            )
+            missing = [key for key in required if entitlements.get(key) is not True]
+            if missing:
+                raise SystemExit("Missing executable-memory entitlements: " + ", ".join(missing))
+            print("Verified executable-memory entitlements: " + ", ".join(required))
+            PY
+            signature_details="$RUNNER_TEMP/$(basename "$emulator").codesign.txt"
+            codesign -d --verbose=4 "$emulator" > /dev/null 2> "$signature_details"
+            if ! grep -Eq 'flags=.*runtime' "$signature_details"; then
+              cat "$signature_details"
+              echo "Hardened Runtime flag is missing from $emulator" >&2
+              exit 1
+            fi
+            echo "Verified Hardened Runtime signature: $emulator"
           done
 
           codesign --force --sign - --timestamp=none "$app_dir"
