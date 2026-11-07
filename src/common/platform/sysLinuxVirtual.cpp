@@ -8,6 +8,11 @@
 
 #include <sys/mman.h>
 
+#if defined(__APPLE__)
+#include <libkern/OSCacheControl.h>
+#include <pthread.h>
+#endif
+
 // IWYU pragma: no_include <asm/mman-common.h>
 // IWYU pragma: no_include <asm/mman.h>
 // IWYU pragma: no_include <linux/mman.h>
@@ -58,7 +63,36 @@ bool Protect(uint64_t address, uint64_t size, Mode mode) {
 	                get_protection_flag(mode)) == 0;
 }
 
-bool FlushInstructionCache(uint64_t /*address*/, uint64_t /*size*/) {
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+static thread_local unsigned g_jit_write_depth = 0;
+#endif
+
+void BeginJitWrite() {
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+	if (g_jit_write_depth++ == 0) {
+		pthread_jit_write_protect_np(0);
+	}
+#endif
+}
+
+void EndJitWrite() {
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+	if (g_jit_write_depth != 0 && --g_jit_write_depth == 0) {
+		pthread_jit_write_protect_np(1);
+	}
+#endif
+}
+
+bool FlushInstructionCache(uint64_t address, uint64_t size) {
+#if defined(__APPLE__)
+	if (size != 0) {
+		sys_icache_invalidate(reinterpret_cast<void*>(static_cast<uintptr_t>(address)),
+		                      static_cast<size_t>(size));
+	}
+#else
+	(void)address;
+	(void)size;
+#endif
 	return true;
 }
 
