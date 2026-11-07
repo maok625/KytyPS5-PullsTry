@@ -3204,6 +3204,14 @@ static uint64_t AllocateGuestRuntimeMemory(uint64_t search_addr, uint64_t size,
 	    VirtualMemory::IsExecute(mode) && type != VirtualRangeType::Stack;
 	uint64_t vaddr = 0;
 	if (fixed) {
+		if (!executable_allocation &&
+		    g_guest_address_space->OverlapsJitRange(search_addr, mapped_size)) {
+			Log::WriteToConsoleAndLog(fmt::sprintf(
+			    "guest ordinary allocation rejected inside JIT arena: name=%s addr=0x%016" PRIx64
+			    " size=0x%016" PRIx64 "\n",
+			    name, search_addr, mapped_size));
+			return 0;
+		}
 		vaddr = search_addr;
 	} else if (executable_allocation) {
 		auto current = std::max(search_addr, HOST_JIT_ARENA_ALLOC_BASE);
