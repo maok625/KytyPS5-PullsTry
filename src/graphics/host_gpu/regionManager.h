@@ -185,9 +185,9 @@ public:
 			bits.UnsetRange(start, end);
 		}
 		if constexpr (source == DirtySource::Cpu) {
-			UpdateProtection<!enable, false>(changed);
+			UpdateProtection<!enable, false>(&changed);
 		} else {
-			UpdateProtection<enable, true>(changed);
+			UpdateProtection<enable, true>(&changed);
 		}
 	}
 
@@ -227,7 +227,7 @@ public:
 				}
 				UpdateProtection<true, false>();
 			} else {
-				UpdateProtection<false, true>(mask);
+				UpdateProtection<false, true>(&mask);
 			}
 		}
 		for (const auto [first, last]: mask) {
@@ -333,13 +333,6 @@ public:
 	static void NoteFrame() noexcept { s_frame.fetch_add(1, std::memory_order_relaxed); }
 
 private:
-	// CPU-dirty pages are not write-watched; GPU-dirty pages are read-watched.
-	template <bool track, bool is_read>
-	void UpdateProtection(RegionBits& changed) {
-		if (!changed.None()) {
-			m_page_manager.UpdatePageWatchersForRegion<track, is_read>(m_cpu_addr, changed);
-	}
-	}
 	static uint32_t Frame() noexcept { return s_frame.load(std::memory_order_relaxed); }
 
 	void ForgetOldHeat() {
@@ -352,6 +345,12 @@ private:
 
 	template <bool track, bool is_read>
 	void UpdateProtection() {
+		if (changed != nullptr) {
+			if (!changed->None()) {
+				m_page_manager.UpdatePageWatchersForRegion<track, is_read>(m_cpu_addr, *changed);
+			}
+			return;
+		}
 		// Armed pages stay writable: the watch sees their writes.
 		const auto protection = is_read ? ~m_gpu_dirty : (m_cpu_dirty | m_armed);
 		auto&      previous   = is_read ? m_readable : m_writable;
