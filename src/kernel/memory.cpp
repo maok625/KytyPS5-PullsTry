@@ -3344,6 +3344,10 @@ bool FreeGuestMemory(uint64_t vaddr, uint64_t size) {
 	return FreeGuestMemoryOwner(vaddr, mapped_size);
 }
 
+bool IsJitGuestMemory(uint64_t vaddr, uint64_t size) {
+	return g_guest_address_space != nullptr && g_guest_address_space->IsJitRange(vaddr, size);
+}
+
 // The ABI entry points and batch operations hold g_memory_operation_mutex.
 static int ProtectMemory(const void* addr, size_t len, int prot) {
 	auto vaddr = reinterpret_cast<uint64_t>(addr);
