@@ -127,9 +127,12 @@ static KYTY_SYSV_ABI uint64_t UnresolvedImportStub(uint64_t record_id);
 
 static bool PatchGuestMemory64(uint64_t vaddr, uint64_t value) {
 #if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+	const bool is_jit = Libs::LibKernel::Memory::IsJitGuestMemory(vaddr, sizeof(value));
 	Common::VirtualMemory::Mode old_mode = Common::VirtualMemory::Mode::NoAccess;
-	EXIT_IF(!Libs::LibKernel::Memory::ProtectGuestMemory(
-	    vaddr, sizeof(value), Common::VirtualMemory::Mode::ReadWrite, &old_mode));
+	if (is_jit) {
+		EXIT_IF(!Libs::LibKernel::Memory::ProtectGuestMemory(
+		    vaddr, sizeof(value), Common::VirtualMemory::Mode::ReadWrite, &old_mode));
+	}
 #endif
 	bool changed = false;
 	{
@@ -139,7 +142,9 @@ static bool PatchGuestMemory64(uint64_t vaddr, uint64_t value) {
 		std::memcpy(ptr, &value, sizeof(value));
 	}
 #if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
-	EXIT_IF(!Libs::LibKernel::Memory::ProtectGuestMemory(vaddr, sizeof(value), old_mode));
+	if (is_jit) {
+		EXIT_IF(!Libs::LibKernel::Memory::ProtectGuestMemory(vaddr, sizeof(value), old_mode));
+	}
 #endif
 	return changed;
 }
