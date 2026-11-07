@@ -3214,11 +3214,12 @@ static uint64_t AllocateGuestRuntimeMemory(uint64_t search_addr, uint64_t size,
 		}
 		vaddr = search_addr;
 	} else if (executable_allocation) {
-		auto current = std::max(search_addr, HOST_JIT_ARENA_ALLOC_BASE);
-		while (current < HOST_JIT_ARENA_BASE + (1ull << 34u) &&
-		       mapped_size <= HOST_JIT_ARENA_BASE + (1ull << 34u) - current) {
+		// FindFreeJitAligned clamps the search to the runtime-selected MAP_JIT arena.
+		// Do not duplicate its bounds here: the arena is no longer at a fixed address.
+		auto current = search_addr;
+		while (current != UINT64_MAX) {
 			const auto candidate = g_guest_address_space->FindFreeJitAligned(
-			    current, HOST_JIT_ARENA_BASE + (1ull << 34u), mapped_size, GuestPageSize);
+			    current, UINT64_MAX, mapped_size, GuestPageSize);
 			if (candidate == 0) {
 				break;
 			}
@@ -3227,7 +3228,11 @@ static uint64_t AllocateGuestRuntimeMemory(uint64_t search_addr, uint64_t size,
 				vaddr = candidate;
 				break;
 			}
-			current = overlap.start + overlap.size;
+			const auto next = overlap.start + overlap.size;
+			if (next <= current) {
+				break;
+			}
+			current = next;
 		}
 	} else {
 		vaddr = FindGuestFreeRange(search_addr, mapped_size, GuestPageSize);
