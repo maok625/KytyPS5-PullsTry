@@ -344,7 +344,7 @@ private:
 	}
 
 	template <bool track, bool is_read>
-	void UpdateProtection() {
+	void UpdateProtection(RegionBits& changed) {
 		if (changed != nullptr) {
 			if (!changed->None()) {
 				m_page_manager.UpdatePageWatchersForRegion<track, is_read>(m_cpu_addr, *changed);
