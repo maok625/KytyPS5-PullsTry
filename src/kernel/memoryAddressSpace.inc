@@ -17,7 +17,7 @@ static constexpr uint64_t HOST_USER_MIN            = 0x1000000000ull;
 #endif
 static constexpr uint64_t HOST_USER_MAX = 0xfbffffffffull;
 #if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
-static constexpr uint64_t HOST_JIT_ARENA_BASE       = 0x7000000000ull;
+static constexpr uint64_t HOST_JIT_ARENA_BASE       = 0x7400000000ull;
 static constexpr uint64_t HOST_JIT_ARENA_SIZE       = 1ull << 34u;
 static constexpr uint64_t HOST_JIT_ARENA_ALLOC_BASE = HOST_JIT_ARENA_BASE + 0x200000ull;
 #endif
