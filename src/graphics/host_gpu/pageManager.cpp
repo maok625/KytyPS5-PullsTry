@@ -141,9 +141,13 @@ struct PageManager::Impl {
 			      static_cast<uint32_t>(info.dwPageSize));
 		}
 #elif defined(__APPLE__)
-		// Under Rosetta the host page size is 4 KB, matching TRACKER_PAGE_SIZE.
-		if (static_cast<uint64_t>(getpagesize()) != PAGE_SIZE) {
-			Fatal("unsupported host page size 0x%08" PRIx32, static_cast<uint32_t>(getpagesize()));
+		// Tracker ranges must align to host pages. A larger tracker page is valid when it
+		// consists of an integral number of host pages (for example, 16 KiB on Apple Silicon).
+		const auto host_page_size = getpagesize();
+		if (host_page_size <= 0 || static_cast<uint64_t>(host_page_size) > PAGE_SIZE ||
+		    PAGE_SIZE % static_cast<uint64_t>(host_page_size) != 0) {
+			Fatal("unsupported host page size 0x%08" PRIx32 " for tracker page size 0x%08" PRIx32,
+			      static_cast<uint32_t>(host_page_size), static_cast<uint32_t>(PAGE_SIZE));
 		}
 #else
 		const auto host_page_size = ::sysconf(_SC_PAGESIZE);
