@@ -245,7 +245,7 @@ constexpr uint64_t INVALID_OFFSET   = 0x040000000u;
 constexpr uint64_t CODE_BASE_OFFSET = 0x100000000u;
 constexpr uint64_t INVALID_MEMORY   = SYSTEM_RESERVED + INVALID_OFFSET;
 #if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
-constexpr uint64_t CODE_BASE_BEGIN = 0x7000200000ull;
+constexpr uint64_t CODE_BASE_BEGIN = 0x7400200000ull;
 #else
 constexpr uint64_t CODE_BASE_BEGIN = SYSTEM_RESERVED + CODE_BASE_OFFSET;
 #endif
