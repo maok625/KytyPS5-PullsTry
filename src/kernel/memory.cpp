@@ -2685,6 +2685,13 @@ int KYTY_SYSV_ABI KernelQueryMemoryProtection(void* addr, void** start, void** e
 }
 
 static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size) {
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+	// The JIT arena is a process-lifetime MAP_JIT mapping. It must never be converted
+	// into an ordinary Reserved range, even when its pages are currently PROT_NONE.
+	if (g_guest_address_space->OverlapsJitRange(start, size)) {
+		return false;
+	}
+#endif
 
 	struct ReplacedChunk {
 		VirtualRanges::Range                        range {};
@@ -3190,8 +3197,52 @@ static uint64_t AllocateGuestRuntimeMemory(uint64_t search_addr, uint64_t size,
 		return 0;
 	}
 	const auto mapped_size = (size + GuestPageSize - 1u) & ~(GuestPageSize - 1u);
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+	// Guest stacks stay in ordinary guest memory even if a caller requests an
+	// executable protection; the JIT arena is reserved for code/runtime allocations.
+	const bool executable_allocation =
+	    VirtualMemory::IsExecute(mode) && type != VirtualRangeType::Stack;
+	uint64_t vaddr = 0;
+	if (fixed) {
+		if (!executable_allocation &&
+		    g_guest_address_space->OverlapsJitRange(search_addr, mapped_size)) {
+			Log::WriteToConsoleAndLog(fmt::sprintf(
+			    "guest ordinary allocation rejected inside JIT arena: name=%s addr=0x%016" PRIx64
+			    " size=0x%016" PRIx64 "\n",
+			    name, search_addr, mapped_size));
+			return 0;
+		}
+		vaddr = search_addr;
+	} else if (executable_allocation) {
+		auto current = std::max(search_addr, HOST_JIT_ARENA_ALLOC_BASE);
+		while (current < HOST_JIT_ARENA_BASE + (1ull << 34u) &&
+		       mapped_size <= HOST_JIT_ARENA_BASE + (1ull << 34u) - current) {
+			const auto candidate = g_guest_address_space->FindFreeJitAligned(
+			    current, HOST_JIT_ARENA_BASE + (1ull << 34u), mapped_size, GuestPageSize);
+			if (candidate == 0) {
+				break;
+			}
+			VirtualRanges::Range overlap {};
+			if (!g_virtual_ranges->QueryOverlap(candidate, mapped_size, &overlap)) {
+				vaddr = candidate;
+				break;
+			}
+			current = overlap.start + overlap.size;
+		}
+	} else {
+		vaddr = FindGuestFreeRange(search_addr, mapped_size, GuestPageSize);
+	}
+	if (executable_allocation && !g_guest_address_space->IsJitRange(vaddr, mapped_size)) {
+		Log::WriteToConsoleAndLog(fmt::sprintf(
+		    "guest executable allocation failed: no JIT arena range; name=%s hint=0x%016" PRIx64
+		    " size=0x%016" PRIx64 " fixed=%d\n",
+		    name, search_addr, mapped_size, fixed ? 1 : 0));
+		return 0;
+	}
+#else
 	const auto vaddr =
 	    fixed ? search_addr : FindGuestFreeRange(search_addr, mapped_size, GuestPageSize);
+#endif
 	if (vaddr == 0) {
 		Log::WriteToConsoleAndLog(fmt::sprintf("guest runtime allocation failed: no free range; name=%s hint=0x%016" PRIx64
 		           " requested=0x%016" PRIx64 " mapped=0x%016" PRIx64
@@ -3251,8 +3302,14 @@ void SetProgramMemoryProtection(uint64_t vaddr, uint64_t size, VirtualMemory::Mo
 		     vaddr, size);
 	}
 
-	const auto host_mode = VirtualMemory::IsExecute(mode) ? VirtualMemory::Mode::ExecuteReadWrite
-	                                                      : VirtualMemory::Mode::ReadWrite;
+	const auto host_mode =
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+	    g_guest_address_space->IsJitRange(vaddr, size)
+	        ? mode
+	        :
+#endif
+	            (VirtualMemory::IsExecute(mode) ? VirtualMemory::Mode::ExecuteReadWrite
+	                                            : VirtualMemory::Mode::ReadWrite);
 	EXIT_IF(!g_guest_address_space->Protect(vaddr, size, host_mode));
 	g_virtual_ranges->Protect(vaddr, size, ProgramProtection(mode));
 }
@@ -3288,7 +3345,15 @@ bool ProtectGuestMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode,
 		*old_mode = static_cast<VirtualMemory::Mode>(
 		    ranges.front().protection & (PROT_CPU_READ | PROT_CPU_WRITE | PROT_CPU_EXEC));
 	}
-	if (!g_guest_address_space->Protect(aligned_addr, aligned_size, mode)) {
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+	const auto host_mode =
+	    (g_guest_address_space->IsJitRange(aligned_addr, aligned_size)
+	         ? mode
+	         : (VirtualMemory::IsExecute(mode) ? VirtualMemory::Mode::ExecuteReadWrite : mode));
+#else
+	const auto host_mode = mode;
+#endif
+	if (!g_guest_address_space->Protect(aligned_addr, aligned_size, host_mode)) {
 		return false;
 	}
 	g_virtual_ranges->Protect(aligned_addr, aligned_size, ProgramProtection(mode));
@@ -3310,6 +3375,10 @@ bool FreeGuestMemory(uint64_t vaddr, uint64_t size) {
 	(void)RequireGuestRuntimeMemory(vaddr, mapped_size);
 	UnmapGpuRange(vaddr, mapped_size);
 	return FreeGuestMemoryOwner(vaddr, mapped_size);
+}
+
+bool IsJitGuestMemory(uint64_t vaddr, uint64_t size) {
+	return g_guest_address_space != nullptr && g_guest_address_space->IsJitRange(vaddr, size);
 }
 
 // The ABI entry points and batch operations hold g_memory_operation_mutex.

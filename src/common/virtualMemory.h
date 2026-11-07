@@ -30,6 +30,20 @@ bool Free(uint64_t address, uint64_t size);
 bool Protect(uint64_t address, uint64_t size, Mode mode);
 bool FlushInstructionCache(uint64_t address, uint64_t size);
 
+// Temporarily enables writes to MAP_JIT pages on macOS ARM64. Nesting is supported.
+// Other platforms implement these as no-ops.
+void BeginJitWrite();
+void EndJitWrite();
+
+class JitWriteScope {
+public:
+	JitWriteScope() { BeginJitWrite(); }
+	~JitWriteScope() { EndJitWrite(); }
+
+	JitWriteScope(const JitWriteScope&) = delete;
+	JitWriteScope& operator=(const JitWriteScope&) = delete;
+};
+
 } // namespace VirtualMemory
 
 } // namespace Common
