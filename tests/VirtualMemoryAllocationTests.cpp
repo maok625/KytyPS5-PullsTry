@@ -4433,6 +4433,19 @@ void TestMacosArm64PersistentJitArenaLifecycle() {
 	constexpr uint64_t program_size = page * 2;
 	constexpr uint64_t worker_size = page;
 
+	const auto ordinary = Libs::LibKernel::Memory::AllocateRuntimeMemory(
+	    0, page, Common::VirtualMemory::Mode::ReadWrite, "macos_jit_ordinary");
+	Check(test, ordinary != 0 &&
+	                !(ordinary >= arena_base && ordinary < arena_end),
+	      "ordinary runtime allocation was routed into the JIT arena");
+	Check(test, Libs::LibKernel::Memory::FreeGuestMemory(ordinary, page),
+	      "failed to free the ordinary runtime allocation");
+	Check(test,
+	      Libs::LibKernel::Memory::AllocateRuntimeMemory(
+	          0x900000000ull, page, Common::VirtualMemory::Mode::ExecuteReadWrite,
+	          "macos_jit_outside", true) == 0,
+	      "fixed executable allocation outside the JIT arena was accepted");
+
 	const auto base = Libs::LibKernel::Memory::AllocateProgramMemory(
 	    0, program_size, Common::VirtualMemory::Mode::ExecuteReadWrite, "macos_jit_program");
 	Check(test, base >= arena_base + 0x200000 && base + program_size <= arena_end,
