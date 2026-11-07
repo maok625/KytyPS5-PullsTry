@@ -4424,6 +4424,91 @@ void TestProgramMemoryAllocationAndProtection() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+void TestMacosArm64PersistentJitArenaLifecycle() {
+	const char* test = "MacosArm64PersistentJitArenaLifecycle";
+	constexpr uint64_t page = SceKernelPageSize;
+	constexpr uint64_t arena_base = 0x7000000000ull;
+	constexpr uint64_t arena_end  = 0x7400000000ull;
+	constexpr uint64_t program_size = page * 2;
+	constexpr uint64_t worker_size = page;
+
+	const auto base = Libs::LibKernel::Memory::AllocateProgramMemory(
+	    0, program_size, Common::VirtualMemory::Mode::ExecuteReadWrite, "macos_jit_program");
+	Check(test, base >= arena_base + 0x200000 && base + program_size <= arena_end,
+	      "executable allocation did not come from the persistent JIT arena");
+	Check(test, Libs::LibKernel::Memory::TestGuestAddressRangeIsOwned(base, program_size),
+	      "JIT allocation escaped the guest address-space owner");
+
+	const auto write_arm64_return = [test](uint64_t address, uint32_t value) {
+		const std::array<uint32_t, 2> instructions {{
+		    0x52800000u | (value << 5u), // mov w0, #value
+		    0xd65f03c0u,                 // ret
+		}};
+		{
+			Common::VirtualMemory::JitWriteScope write_scope;
+			std::memcpy(reinterpret_cast<void*>(address), instructions.data(),
+			            sizeof(instructions));
+		}
+		Check(test, Common::VirtualMemory::FlushInstructionCache(address, sizeof(instructions)),
+		      "failed to invalidate the generated ARM64 instructions");
+	};
+
+	using JitFunction = uint32_t (*)();
+	write_arm64_return(base, 42);
+	Check(test, reinterpret_cast<JitFunction>(base)() == 42,
+	      "generated function in the JIT arena returned the wrong value");
+
+	Check(test,
+	      Libs::LibKernel::Memory::ProtectGuestMemory(
+	          base + page, page, Common::VirtualMemory::Mode::ReadWrite),
+	      "failed to keep the JIT region's data page writable");
+	constexpr uint64_t data_value = 0x4a49544441544131ull;
+	*reinterpret_cast<uint64_t*>(base + page) = data_value;
+	Check(test, *reinterpret_cast<const uint64_t*>(base + page) == data_value,
+	      "writable data page failed while another JIT page remained executable");
+	Check(test, reinterpret_cast<JitFunction>(base)() == 42,
+	      "data-page write damaged the executable JIT page");
+
+	const auto worker = Libs::LibKernel::Memory::AllocateRuntimeMemory(
+	    base + program_size, worker_size, Common::VirtualMemory::Mode::ExecuteReadWrite,
+	    "macos_jit_worker", true);
+	Check(test, worker == base + program_size,
+	      "fixed executable allocation could not consume the adjacent JIT range");
+
+	std::atomic<uint32_t> worker_result {0};
+	std::thread worker_thread([&] {
+		write_arm64_return(worker, 43);
+		worker_result.store(reinterpret_cast<JitFunction>(worker)(), std::memory_order_release);
+	});
+	worker_thread.join();
+	Check(test, worker_result.load(std::memory_order_acquire) == 43,
+	      "worker thread could not write and execute JIT code");
+
+	Check(test, Libs::LibKernel::Memory::FreeGuestMemory(worker, worker_size),
+	      "failed to release the worker JIT page");
+	Check(test, Libs::LibKernel::Memory::FreeGuestMemory(base, program_size),
+	      "failed to release the program JIT pages");
+	Check(test,
+	      Libs::LibKernel::Memory::TestPlaceholderRangeIsFree(base, program_size + worker_size),
+	      "released JIT pages were not returned to the JIT free list");
+
+	const auto reused = Libs::LibKernel::Memory::AllocateRuntimeMemory(
+	    base, program_size + worker_size, Common::VirtualMemory::Mode::ExecuteReadWrite,
+	    "macos_jit_reuse", true);
+	Check(test, reused == base, "released JIT range could not be reused at the same address");
+	for (uint64_t offset = 0; offset < program_size + worker_size; offset += sizeof(uint64_t)) {
+		Check(test, *reinterpret_cast<const uint64_t*>(reused + offset) == 0,
+		      "reused JIT pages were not explicitly zeroed");
+	}
+	Check(test,
+	      Libs::LibKernel::Memory::FreeGuestMemory(reused, program_size + worker_size),
+	      "failed to release the reused JIT range");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+#endif
+
 void TestModuleRelocationUsesWritableHostMapping() {
 	const char* test = "ModuleRelocationUsesWritableHostMapping";
 	Check(test, Loader::TestModuleRelocationUsesWritableHostMapping(),
@@ -5842,6 +5927,12 @@ int main(int argc, char** argv) {
 		RunTest(TestAsanPartialFreeAcrossSharedShadowBoundary);
 		return g_failed_tests == 0 ? 0 : 1;
 	}
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+	if (argc == 2 && std::strcmp(argv[1], "--macos-jit-only") == 0) {
+		RunTest(TestMacosArm64PersistentJitArenaLifecycle);
+		return g_failed_tests == 0 ? 0 : 1;
+	}
+#endif
 	if (argc == 2 && std::strcmp(argv[1], "--virtual-ranges-only") == 0) {
 		RunTest(TestFlexibleNoCoalescePreservesBoundaries);
 		RunTest(TestFlexibleRangeEditsCoalesce);
@@ -5995,6 +6086,9 @@ int main(int argc, char** argv) {
 	RunTest(TestFragmentedPoolDecommitOnSmallStack);
 	RunTest(TestMemoryPoolCommitDecommitQueryFlags);
 	RunTest(TestProgramMemoryAllocationAndProtection);
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+	RunTest(TestMacosArm64PersistentJitArenaLifecycle);
+#endif
 	RunTest(TestModuleRelocationUsesWritableHostMapping);
 	RunTest(TestModuleSegmentsUseFlexibleMemory);
 #if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
