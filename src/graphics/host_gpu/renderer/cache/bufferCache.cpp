@@ -193,16 +193,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferDownloadBytes, total_size);
 
 	PerfCounters::Add(PerfCounters::Counter::ReadbackBytes, total_size);
-	auto [mapped, offset] = m_download_buffer.Map(total_size, 64);
-	std::unique_ptr<Buffer> temporary;
-	if (mapped == nullptr) {
-		temporary = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
-		                                     vk::BufferUsageFlagBits::eTransferDst, total_size);
-		mapped = temporary->Mapped().data();
-	} else {
-		m_download_buffer.Commit();
-	}
-	const auto& download = temporary ? *temporary : m_download_buffer;
+	auto download = m_download_buffer.MapDownload(total_size, 64);
 	for (auto& copy: copies) {
 		copy.dstOffset += download.offset;
 	}

@@ -85,6 +85,7 @@ public:
 			case MemoryUsage::Stream: return m_stream_buffer;
 			case MemoryUsage::Download: return m_download_buffer;
 			case MemoryUsage::DeviceLocal: return m_device_buffer;
+			case MemoryUsage::Guest: break;
 		}
 		EXIT("BufferCache: invalid utility-buffer usage\n");
 	}
