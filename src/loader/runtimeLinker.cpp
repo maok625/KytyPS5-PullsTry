@@ -747,7 +747,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		// The faulting PC can be close to the beginning of a mapping. Do not
 		// require bytes before it: probing pc-48 can cross into an unmapped region
 		// and suppress the entire instruction dump.
-		uint64_t code_size = 32;
+		uint64_t code_size = 128;
 		while (code_size != 0 && !IsReadableRange(info->exception_address, code_size)) {
 			code_size /= 2;
 		}
@@ -1613,8 +1613,17 @@ int RuntimeLinker::StartModule(Program* program, size_t args, const void* argp,
 	const auto init_address = program->dynamic_info->init_vaddr + program->base_vaddr;
 	LOGF_COLOR(Log::Color::BrightYellow, "---\n--- Start module: %s\n---\n",
 	           Common::PathToString(program->file_name).c_str());
-	LOGF("module init address = 0x%016" PRIx64 " (offset=0x%016" PRIx64 ")\n",
-	     init_address, program->dynamic_info->init_vaddr);
+	LOGF("module init address = 0x%016" PRIx64 " (offset=0x%016" PRIx64
+	     "), image=[0x%016" PRIx64 ",0x%016" PRIx64 "), shared=%d\n",
+	     init_address, program->dynamic_info->init_vaddr, program->base_vaddr,
+	     program->base_vaddr + program->mapped_size, program->elf->IsShared() ? 1 : 0);
+	LOGF("module init call: args=%zu argp=0x%016" PRIx64 " func=0x%016" PRIx64
+	     ", TLS image=0x%016" PRIx64 " init_size=0x%016" PRIx64
+	     " image_size=0x%016" PRIx64 " tcb_offset=0x%016" PRIx64
+	     " handler=0x%016" PRIx64 "\n",
+	     args, reinterpret_cast<uint64_t>(argp), reinterpret_cast<uint64_t>(func),
+	     program->tls.image_vaddr, program->tls.init_size, program->tls.image_size,
+	     program->tls.tcb_offset, program->tls.handler_vaddr);
 
 	return reinterpret_cast<module_ini_fini_func_t>(init_address)(args, argp, func);
 }
