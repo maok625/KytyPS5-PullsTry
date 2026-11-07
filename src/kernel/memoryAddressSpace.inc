@@ -627,7 +627,7 @@ public:
 	// Writes the backed bytes of a range that holds no private mappings.
 	bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
 		// MAP_JIT pages are private anonymous guest memory, never part of the shared backing store.
-		if (IsJitRange(vaddr, size) || !Owns(vaddr, size)) {
+		if (OverlapsJitRange(vaddr, size) || !Owns(vaddr, size)) {
 			return false;
 		}
 		std::shared_lock lock(m_mutex);
@@ -691,7 +691,7 @@ public:
 	                GuestBackingStore::FailureReason* failure_reason = nullptr) {
 		std::lock_guard lock(m_mutex);
 #if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
-		if (IsJitRange(vaddr, size)) {
+		if (OverlapsJitRange(vaddr, size)) {
 			if (failure_reason != nullptr) {
 				*failure_reason = GuestBackingStore::FailureReason::AddressRangeUnavailable;
 			}
