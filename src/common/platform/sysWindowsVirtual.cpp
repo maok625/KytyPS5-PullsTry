@@ -78,6 +78,9 @@ bool Protect(uint64_t address, uint64_t size, Mode mode) {
 	return true;
 }
 
+void BeginJitWrite() {}
+void EndJitWrite() {}
+
 bool FlushInstructionCache(uint64_t address, uint64_t size) {
 	if (::FlushInstructionCache(GetCurrentProcess(),
 	                            reinterpret_cast<LPVOID>(static_cast<uintptr_t>(address)),

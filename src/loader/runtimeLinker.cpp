@@ -126,9 +126,27 @@ static constexpr uint64_t               UNRESOLVED_STUB_PAGE_SIZE      = 4096;
 static KYTY_SYSV_ABI uint64_t UnresolvedImportStub(uint64_t record_id);
 
 static bool PatchGuestMemory64(uint64_t vaddr, uint64_t value) {
-	auto* ptr     = reinterpret_cast<uint64_t*>(vaddr);
-	bool  changed = (*ptr != value);
-	std::memcpy(ptr, &value, sizeof(value));
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+	const bool is_jit = Libs::LibKernel::Memory::IsJitGuestMemory(vaddr, sizeof(value));
+	Common::VirtualMemory::Mode old_mode = Common::VirtualMemory::Mode::NoAccess;
+	if (is_jit) {
+		EXIT_IF(!Libs::LibKernel::Memory::ProtectGuestMemory(
+		    vaddr, sizeof(value), Common::VirtualMemory::Mode::ReadWrite, &old_mode));
+	}
+#endif
+	bool changed = false;
+	{
+		Common::VirtualMemory::JitWriteScope write_scope;
+		auto* ptr = reinterpret_cast<uint64_t*>(vaddr);
+		changed = (*ptr != value);
+		std::memcpy(ptr, &value, sizeof(value));
+	}
+	Common::VirtualMemory::FlushInstructionCache(vaddr, sizeof(value));
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+	if (is_jit) {
+		EXIT_IF(!Libs::LibKernel::Memory::ProtectGuestMemory(vaddr, sizeof(value), old_mode));
+	}
+#endif
 	return changed;
 }
 
@@ -161,8 +179,20 @@ static uint64_t AllocateUnresolvedImportThunk(uint64_t record_id) {
 	const auto target = reinterpret_cast<uint64_t>(UnresolvedImportStub);
 	std::memcpy(bytes + 6, &record_id, sizeof(record_id));
 	std::memcpy(bytes + 16, &target, sizeof(target));
-	std::memcpy(code, bytes, sizeof(bytes));
+	const auto thunk_page = g_unresolved_stub_thunk_pages.back();
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+	Common::VirtualMemory::Mode old_mode = Common::VirtualMemory::Mode::NoAccess;
+	EXIT_IF(!Libs::LibKernel::Memory::ProtectGuestMemory(
+	    thunk_page, 0x4000, Common::VirtualMemory::Mode::ReadWrite, &old_mode));
+#endif
+	{
+		Common::VirtualMemory::JitWriteScope write_scope;
+		std::memcpy(code, bytes, sizeof(bytes));
+	}
 	Common::VirtualMemory::FlushInstructionCache(reinterpret_cast<uint64_t>(code), thunk_size);
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+	EXIT_IF(!Libs::LibKernel::Memory::ProtectGuestMemory(thunk_page, 0x4000, old_mode));
+#endif
 	return reinterpret_cast<uint64_t>(code);
 }
 
@@ -214,8 +244,13 @@ constexpr uint64_t CODE_BASE_INCR   = 0x010000000u;
 constexpr uint64_t INVALID_OFFSET   = 0x040000000u;
 constexpr uint64_t CODE_BASE_OFFSET = 0x100000000u;
 constexpr uint64_t INVALID_MEMORY   = SYSTEM_RESERVED + INVALID_OFFSET;
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+constexpr uint64_t CODE_BASE_BEGIN = 0x7000200000ull;
+#else
+constexpr uint64_t CODE_BASE_BEGIN = SYSTEM_RESERVED + CODE_BASE_OFFSET;
+#endif
 
-static uint64_t g_desired_base_addr = SYSTEM_RESERVED + CODE_BASE_OFFSET;
+static uint64_t g_desired_base_addr = CODE_BASE_BEGIN;
 static uint64_t g_invalid_memory    = 0;
 
 static Program*              g_tls_main_program        = nullptr;
@@ -563,7 +598,7 @@ static bool IsReadableRange(uint64_t addr, uint64_t size);
 
 static int WalkGuestStack(uint64_t rbp, uint64_t rsp, void** stack, int capacity) {
 	constexpr uintptr_t STACK_SIZE = 1024u * 1024u;
-	const uintptr_t     code_start = SYSTEM_RESERVED + CODE_BASE_OFFSET;
+	const uintptr_t     code_start = CODE_BASE_BEGIN;
 	const uintptr_t     stack_end  = rsp + STACK_SIZE;
 	if (stack == nullptr || capacity <= 0 || rsp == 0 || rbp < rsp || stack_end < rsp ||
 	    g_desired_base_addr <= code_start) {
@@ -951,6 +986,7 @@ static KYTY_MS_ABI uint8_t* TlsMainGetAddr() {
 }
 
 static void PatchProgram(Program* program, uint64_t address, uint64_t size) {
+	Common::VirtualMemory::JitWriteScope write_scope;
 	EXIT_IF(program == nullptr);
 	EXIT_IF(program->elf == nullptr);
 
@@ -1337,7 +1373,7 @@ void RuntimeLinker::Clear() {
 	g_tls_main_program        = nullptr;
 	g_tls_cached_main_program = nullptr;
 	g_tls_cached_main_tcb     = nullptr;
-	g_desired_base_addr       = SYSTEM_RESERVED + CODE_BASE_OFFSET;
+	g_desired_base_addr       = CODE_BASE_BEGIN;
 	m_symbols.reset();
 }
 
@@ -1751,7 +1787,9 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 		    program->base_vaddr + program->base_size_aligned + program->instruction_trampoline_size;
 	}
 
-	g_desired_base_addr += CODE_BASE_INCR * (1 + program->mapped_size / CODE_BASE_INCR);
+	g_desired_base_addr =
+	    std::max(g_desired_base_addr, program->base_vaddr) +
+	    CODE_BASE_INCR * (1 + program->mapped_size / CODE_BASE_INCR);
 
 	EXIT_IF(program->base_size_aligned < program->base_size);
 	LOGF("base_vaddr             = 0x%016" PRIx64 "\n"
@@ -2046,8 +2084,15 @@ void RuntimeLinker::Relocate(Program* program) {
 	EXIT_IF(program == nullptr);
 
 	if (g_invalid_memory == 0) {
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+		// macOS ARM64 intentionally leaves the low system-managed guest range unreserved.
+		// The invalid-object sentinel only needs to be inaccessible, not at a fixed guest VA.
+		g_invalid_memory = Libs::LibKernel::Memory::AllocateRuntimeMemory(
+		    0, 4096, Common::VirtualMemory::Mode::NoAccess, "invalid_memory");
+#else
 		g_invalid_memory = Libs::LibKernel::Memory::AllocateRuntimeMemory(
 		    INVALID_MEMORY, 4096, Common::VirtualMemory::Mode::NoAccess, "invalid_memory", true);
+#endif
 		EXIT_NOT_IMPLEMENTED(g_invalid_memory == 0);
 	}
 
@@ -2183,19 +2228,22 @@ void RuntimeLinker::SetupTlsHandler(Program* program) {
 
 	g_tls_main_program = program;
 
-	auto* code = new (reinterpret_cast<void*>(program->tls.handler_vaddr)) Jit::SafeCall;
+	{
+		Common::VirtualMemory::JitWriteScope write_scope;
+		auto* code = new (reinterpret_cast<void*>(program->tls.handler_vaddr)) Jit::SafeCall;
+		code->SetFunc(TlsMainGetAddr);
 
-	code->SetFunc(TlsMainGetAddr);
+		for (uint8_t reg = 1; reg < 8; reg++) {
+			if (reg == 4) {
+				continue;
+			}
 
-	for (uint8_t reg = 1; reg < 8; reg++) {
-		if (reg == 4) {
-			continue;
+			auto* stub = new (reinterpret_cast<void*>(program->tls.handler_vaddr +
+			                                          Jit::TlsRegStub::GetOffset(reg)))
+			    Jit::TlsRegStub;
+			stub->SetFunc(program->tls.handler_vaddr);
+			stub->SetOutputReg(reg);
 		}
-
-		auto* stub = new (reinterpret_cast<void*>(program->tls.handler_vaddr +
-		                                          Jit::TlsRegStub::GetOffset(reg))) Jit::TlsRegStub;
-		stub->SetFunc(program->tls.handler_vaddr);
-		stub->SetOutputReg(reg);
 	}
 
 	EXIT_IF(!Libs::LibKernel::Memory::ProtectGuestMemory(program->tls.handler_vaddr,

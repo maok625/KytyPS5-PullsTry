@@ -16,6 +16,11 @@ static constexpr uint64_t HOST_SYSTEM_RESERVED_MAX = 0x0fffffffffull;
 static constexpr uint64_t HOST_USER_MIN            = 0x1000000000ull;
 #endif
 static constexpr uint64_t HOST_USER_MAX = 0xfbffffffffull;
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+static constexpr uint64_t HOST_JIT_ARENA_BASE       = 0x7000000000ull;
+static constexpr uint64_t HOST_JIT_ARENA_SIZE       = 1ull << 34u;
+static constexpr uint64_t HOST_JIT_ARENA_ALLOC_BASE = HOST_JIT_ARENA_BASE + 0x200000ull;
+#endif
 
 static bool GuestFreeRangeContains(uint64_t base, uint64_t range_size, uint64_t candidate,
                                    uint64_t size) {
@@ -621,7 +626,8 @@ public:
 
 	// Writes the backed bytes of a range that holds no private mappings.
 	bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
-		if (!Owns(vaddr, size)) {
+		// MAP_JIT pages are private anonymous guest memory, never part of the shared backing store.
+		if (OverlapsJitRange(vaddr, size) || !Owns(vaddr, size)) {
 			return false;
 		}
 		std::shared_lock lock(m_mutex);
@@ -684,6 +690,14 @@ public:
 	                VirtualMemory::Mode               mode,
 	                GuestBackingStore::FailureReason* failure_reason = nullptr) {
 		std::lock_guard lock(m_mutex);
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+		if (OverlapsJitRange(vaddr, size)) {
+			if (failure_reason != nullptr) {
+				*failure_reason = GuestBackingStore::FailureReason::AddressRangeUnavailable;
+			}
+			return false;
+		}
+#endif
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 		const bool replacing = ContainsMappedUnlocked(vaddr, size, MappingType::Backing);
 #else
@@ -730,19 +744,105 @@ public:
 		return FindFreeAlignedUnlocked(search_start, search_end, size, alignment);
 	}
 
+	uint64_t FindFreeJitAligned(uint64_t search_start, uint64_t search_end, uint64_t size,
+	                            uint64_t alignment) {
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+		alignment    = std::max<uint64_t>(alignment, PageSize());
+		search_start = std::max(search_start, HOST_JIT_ARENA_ALLOC_BASE);
+		search_end   = std::min(search_end, HOST_JIT_ARENA_BASE + HOST_JIT_ARENA_SIZE);
+		if (size == 0 || search_start >= search_end || size > search_end - search_start) {
+			return 0;
+		}
+		std::shared_lock lock(m_mutex);
+		auto it = m_jit_free.upper_bound(search_start);
+		if (it != m_jit_free.begin()) {
+			--it;
+		}
+		for (; it != m_jit_free.end() && it->first < search_end; ++it) {
+			const auto& [base, range_size] = *it;
+			const auto candidate = AlignUp(std::max(base, search_start), alignment);
+			if (candidate < search_end && size <= search_end - candidate &&
+			    GuestFreeRangeContains(base, range_size, candidate, size)) {
+				return candidate;
+			}
+		}
+		return 0;
+#else
+		return FindFreeAligned(search_start, search_end, size, alignment);
+#endif
+	}
+
+	[[nodiscard]] bool IsJitRange(uint64_t vaddr, uint64_t size) const {
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+		return size != 0 && vaddr >= HOST_JIT_ARENA_BASE &&
+		       vaddr < HOST_JIT_ARENA_BASE + HOST_JIT_ARENA_SIZE &&
+		       size <= HOST_JIT_ARENA_BASE + HOST_JIT_ARENA_SIZE - vaddr;
+#else
+		(void)vaddr;
+		(void)size;
+		return false;
+#endif
+	}
+
+	[[nodiscard]] bool OverlapsJitRange(uint64_t vaddr, uint64_t size) const {
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+		if (size == 0 || size > UINT64_MAX - vaddr) {
+			return false;
+		}
+		return vaddr < HOST_JIT_ARENA_BASE + HOST_JIT_ARENA_SIZE &&
+		       HOST_JIT_ARENA_BASE < vaddr + size;
+#else
+		(void)vaddr;
+		(void)size;
+		return false;
+#endif
+	}
+
 	bool ContainsFree(uint64_t vaddr, uint64_t size) {
 		std::shared_lock lock(m_mutex);
-		return FindContaining(vaddr, size) != m_free.end();
+		auto contains = [vaddr, size](const auto& ranges) {
+			auto next = ranges.upper_bound(vaddr);
+			if (next == ranges.begin()) {
+				return false;
+			}
+			const auto it = std::prev(next);
+			return GuestFreeRangeContains(it->first, it->second, vaddr, size);
+		};
+		if (contains(m_free)) {
+			return true;
+		}
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+		return contains(m_jit_free);
+#else
+		return false;
+#endif
 	}
 
 	bool Commit(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
 		std::lock_guard lock(m_mutex);
-		if (!ConsumeUnlocked(vaddr, size)) {
-			return false;
-		}
 		const auto host_mode = VirtualMemory::IsExecute(mode)
 		                           ? VirtualMemory::Mode::ExecuteReadWrite
 		                           : VirtualMemory::Mode::ReadWrite;
+
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+		if (IsJitRange(vaddr, size)) {
+			if (!ConsumeJitUnlocked(vaddr, size)) {
+				return false;
+			}
+			const auto jit_host_mode = GetJitHostMode(mode);
+			if (!VirtualMemory::Protect(vaddr, size, jit_host_mode)) {
+				AddFreeJitUnlocked(vaddr, size);
+				return false;
+			}
+			// The loader requests ExecuteReadWrite and receives RW while populating segments.
+			// Restored mappings with narrower semantic permissions retain W^X host protection.
+			AddMappedUnlocked(vaddr, size, MappingType::Jit);
+			return true;
+		}
+#endif
+		if (!ConsumeUnlocked(vaddr, size)) {
+			return false;
+		}
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		auto* ptr = VirtualAlloc2(GetCurrentProcess(), reinterpret_cast<void*>(vaddr), size,
@@ -772,7 +872,9 @@ public:
 			return false;
 		}
 		std::lock_guard lock(m_mutex);
-		if (!ContainsMappedUnlocked(vaddr, size, MappingType::Private)) {
+		const bool is_jit = IsJitRange(vaddr, size);
+		const auto mapping_type = (is_jit ? MappingType::Jit : MappingType::Private);
+		if (!ContainsMappedUnlocked(vaddr, size, mapping_type)) {
 			return false;
 		}
 		const auto end     = vaddr + size;
@@ -792,12 +894,61 @@ public:
 		// ReleaseCommitted also publishes the aggregate span as one logical free range.
 		EXIT_IF(regions.size() > 1 && !CoalescePlaceholders(vaddr, size));
 #else
-		for (const auto& [region_vaddr, region_size]: regions) {
-			RestorePlaceholder(region_vaddr, region_size);
+		if (is_jit) {
+			for (const auto& [region_vaddr, region_size]: regions) {
+				// macOS rejects a direct RWX/RW -> PROT_NONE transition on MAP_JIT.
+				// Passing through RX is required before making the pages inaccessible.
+				EXIT_IF(!VirtualMemory::Protect(region_vaddr, region_size,
+				                                VirtualMemory::Mode::ExecuteRead));
+				EXIT_IF(!VirtualMemory::Protect(region_vaddr, region_size,
+				                                VirtualMemory::Mode::NoAccess));
+
+				bool zeroed_without_faulting = false;
+#ifdef MADV_ZERO
+				// Newer XNU can discard and zero anonymous pages without touching every page
+				// from this process. This keeps large guest deallocations lazy and memory-safe.
+				zeroed_without_faulting =
+				    madvise(reinterpret_cast<void*>(region_vaddr), region_size, MADV_ZERO) == 0;
+#endif
+				if (zeroed_without_faulting) {
+#ifdef MADV_FREE
+					// The contents are known zero now, so let XNU reclaim the clean pages.
+					(void)madvise(reinterpret_cast<void*>(region_vaddr), region_size, MADV_FREE);
+#endif
+				} else {
+					// Older kernels or unsupported MAP_JIT ranges fall back to explicit clearing.
+					// This is slower and faults pages in, but guarantees zero-on-reuse.
+					EXIT_IF(!VirtualMemory::Protect(region_vaddr, region_size,
+					                                VirtualMemory::Mode::ReadWrite));
+					{
+						VirtualMemory::JitWriteScope write_scope;
+						std::memset(reinterpret_cast<void*>(region_vaddr), 0, region_size);
+					}
+					EXIT_IF(!VirtualMemory::Protect(region_vaddr, region_size,
+					                                VirtualMemory::Mode::ExecuteRead));
+					EXIT_IF(!VirtualMemory::Protect(region_vaddr, region_size,
+					                                VirtualMemory::Mode::NoAccess));
+#ifdef MADV_FREE
+					// The fallback contents are now zero, so they may be reclaimed lazily.
+					(void)madvise(reinterpret_cast<void*>(region_vaddr), region_size, MADV_FREE);
+#endif
+				}
+			}
+		} else {
+			for (const auto& [region_vaddr, region_size]: regions) {
+				RestorePlaceholder(region_vaddr, region_size);
+			}
 		}
 #endif
 		RemoveMappedUnlocked(vaddr, size);
-		AddFreeUnlocked(vaddr, size);
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+		if (is_jit) {
+			AddFreeJitUnlocked(vaddr, size);
+		} else
+#endif
+		{
+			AddFreeUnlocked(vaddr, size);
+		}
 		return true;
 	}
 
@@ -831,7 +982,7 @@ public:
 	}
 
 private:
-	enum class MappingType { Backing, Private };
+	enum class MappingType { Backing, Private, Jit };
 
 	struct MappedRegion {
 		uint64_t    vaddr = 0;
@@ -840,6 +991,23 @@ private:
 	};
 
 	static constexpr uint64_t PageSize() { return 0x4000; }
+
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+	static VirtualMemory::Mode GetJitHostMode(VirtualMemory::Mode mode) {
+		switch (mode) {
+			case VirtualMemory::Mode::NoAccess: return VirtualMemory::Mode::NoAccess;
+			case VirtualMemory::Mode::Read: return VirtualMemory::Mode::Read;
+			case VirtualMemory::Mode::Write:
+			case VirtualMemory::Mode::ReadWrite: return VirtualMemory::Mode::ReadWrite;
+			case VirtualMemory::Mode::Execute:
+			case VirtualMemory::Mode::ExecuteRead: return VirtualMemory::Mode::ExecuteRead;
+			case VirtualMemory::Mode::ExecuteWrite:
+			case VirtualMemory::Mode::ExecuteReadWrite:
+				return VirtualMemory::Mode::ExecuteReadWrite;
+			default: return VirtualMemory::Mode::NoAccess;
+		}
+	}
+#endif
 
 	static uint64_t AlignUp(uint64_t value, uint64_t alignment) {
 		const auto remainder = value % alignment;
@@ -877,7 +1045,16 @@ private:
 				continue;
 			}
 #endif
-			if (!VirtualMemory::Protect(range_start, range_end - range_start, mode)) {
+			const auto host_mode =
+			    (region.type == MappingType::Jit ? GetJitHostMode(mode) : mode);
+			if (region.type == MappingType::Jit && host_mode == VirtualMemory::Mode::NoAccess) {
+				// Keep MAP_JIT decommit transitions compatible with Apple Silicon's W^X rules.
+				if (!VirtualMemory::Protect(range_start, range_end - range_start,
+				                            VirtualMemory::Mode::ExecuteRead) ||
+				    !VirtualMemory::Protect(range_start, range_end - range_start, host_mode)) {
+					return false;
+				}
+			} else if (!VirtualMemory::Protect(range_start, range_end - range_start, host_mode)) {
 				return false;
 			}
 		}
@@ -922,7 +1099,8 @@ private:
 		}
 		for (; mapping != m_mapped.end() && mapping->second.vaddr < vaddr + size; ++mapping) {
 			const auto& region = mapping->second;
-			if (region.type == MappingType::Private && region.vaddr + region.size > vaddr) {
+			if ((region.type == MappingType::Private || region.type == MappingType::Jit) &&
+			    region.vaddr + region.size > vaddr) {
 				return true;
 			}
 		}
@@ -1119,15 +1297,14 @@ private:
 		// Start at the user region; the lower system region is intentionally skipped.
 		region_start_idx = 1;
 
-		auto reserve_range = [this](uint64_t start, uint64_t end) {
+		auto reserve_ordinary_range = [this](uint64_t start, uint64_t end) {
 			start = AlignUp(start, PageSize());
 			end   = AlignDown(end, PageSize());
 			if (start == 0 || end <= start) {
 				return;
 			}
 
-			// Keep each reservation below macOS' practical per-mmap range limits.
-			// Larger free gaps are represented by adjacent chunks and coalesced by AddFreeUnlocked.
+			// Keep each ordinary reservation below macOS' practical per-mmap range limits.
 			constexpr uint64_t MaxReservationChunk = 1ull << 34; // 16 GiB
 			for (uint64_t chunk_start = start; chunk_start < end;) {
 				const auto chunk_end  = std::min(chunk_start + MaxReservationChunk, end);
@@ -1138,8 +1315,8 @@ private:
 #elif defined(MAP_FIXED_NOREPLACE)
 				flags |= MAP_FIXED_NOREPLACE;
 #endif
-
-				void* ptr = mmap(reinterpret_cast<void*>(chunk_start), chunk_size, PROT_NONE, flags, -1, 0);
+				void* ptr = mmap(reinterpret_cast<void*>(chunk_start), chunk_size, PROT_NONE,
+				                 flags, -1, 0);
 				if (ptr == MAP_FAILED || reinterpret_cast<uint64_t>(ptr) != chunk_start) {
 					const int map_error = ptr == MAP_FAILED ? errno : 0;
 					const auto returned_address =
@@ -1147,16 +1324,90 @@ private:
 					if (ptr != MAP_FAILED) {
 						munmap(ptr, chunk_size);
 					}
-					Log::WriteToConsoleAndLog(fmt::sprintf("guest address-space reservation skipped: requested=0x%016" PRIx64
-					           " returned=0x%016" PRIx64 " size=0x%016" PRIx64 " errno=%d\n",
-					           chunk_start, returned_address, chunk_size, map_error));
+					Log::WriteToConsoleAndLog(fmt::sprintf(
+					    "guest address-space reservation skipped: requested=0x%016" PRIx64
+					    " returned=0x%016" PRIx64 " size=0x%016" PRIx64 " errno=%d\n",
+					    chunk_start, returned_address, chunk_size, map_error));
 					chunk_start = chunk_end;
 					continue;
 				}
-
 				AddFreeUnlocked(chunk_start, chunk_size);
 				m_owned.emplace_back(chunk_start, chunk_size);
 				chunk_start = chunk_end;
+			}
+		};
+
+		auto reserve_jit_arena = [this]() {
+			if (m_jit_size != 0) {
+				return true;
+			}
+			// Reserve the exact guest address first, then replace that reservation with the
+			// process's one persistent MAP_JIT mapping. MAP_FIXED cannot be combined with MAP_JIT.
+			void* reservation = mmap(reinterpret_cast<void*>(HOST_JIT_ARENA_BASE),
+			                         HOST_JIT_ARENA_SIZE, PROT_NONE,
+			                         MAP_PRIVATE | MAP_ANON, -1, 0);
+			if (reservation == MAP_FAILED ||
+			    reinterpret_cast<uint64_t>(reservation) != HOST_JIT_ARENA_BASE) {
+				const int map_error = reservation == MAP_FAILED ? errno : 0;
+				if (reservation != MAP_FAILED) {
+					munmap(reservation, HOST_JIT_ARENA_SIZE);
+				}
+				Log::WriteToConsoleAndLog(fmt::sprintf(
+				    "macOS JIT arena reservation failed: addr=0x%016" PRIx64
+				    " size=0x%016" PRIx64 " errno=%d\n",
+				    HOST_JIT_ARENA_BASE, HOST_JIT_ARENA_SIZE, map_error));
+				return false;
+			}
+			if (munmap(reinterpret_cast<void*>(HOST_JIT_ARENA_BASE), HOST_JIT_ARENA_SIZE) != 0) {
+				Log::WriteToConsoleAndLog(fmt::sprintf(
+				    "macOS JIT arena temporary reservation release failed: errno=%d\n", errno));
+				return false;
+			}
+			void* jit = mmap(reinterpret_cast<void*>(HOST_JIT_ARENA_BASE), HOST_JIT_ARENA_SIZE,
+			                 PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
+			if (jit == MAP_FAILED ||
+			    reinterpret_cast<uint64_t>(jit) != HOST_JIT_ARENA_BASE) {
+				const int map_error = jit == MAP_FAILED ? errno : 0;
+				const auto returned_address =
+				    jit == MAP_FAILED ? uint64_t {0} : reinterpret_cast<uint64_t>(jit);
+				if (jit != MAP_FAILED) {
+					munmap(jit, HOST_JIT_ARENA_SIZE);
+				}
+				Log::WriteToConsoleAndLog(fmt::sprintf(
+				    "macOS persistent MAP_JIT arena failed: requested=0x%016" PRIx64
+				    " returned=0x%016" PRIx64 " size=0x%016" PRIx64 " errno=%d\n",
+				    HOST_JIT_ARENA_BASE, returned_address, HOST_JIT_ARENA_SIZE, map_error));
+				return false;
+			}
+			m_jit_base = HOST_JIT_ARENA_BASE;
+			m_jit_size = HOST_JIT_ARENA_SIZE;
+			m_jit_free.emplace(HOST_JIT_ARENA_ALLOC_BASE,
+			                   HOST_JIT_ARENA_BASE + HOST_JIT_ARENA_SIZE -
+			                       HOST_JIT_ARENA_ALLOC_BASE);
+			m_owned.emplace_back(HOST_JIT_ARENA_BASE, HOST_JIT_ARENA_SIZE);
+			Log::WriteToConsoleAndLog(fmt::sprintf(
+			    "macOS persistent MAP_JIT arena: [0x%016" PRIx64 ",0x%016" PRIx64
+			    ") size=0x%016" PRIx64 "\n",
+			    HOST_JIT_ARENA_BASE, HOST_JIT_ARENA_BASE + HOST_JIT_ARENA_SIZE,
+			    HOST_JIT_ARENA_SIZE));
+			return true;
+		};
+
+		auto reserve_range = [&](uint64_t start, uint64_t end) {
+			start = AlignUp(start, PageSize());
+			end   = AlignDown(end, PageSize());
+			if (start == 0 || end <= start) {
+				return;
+			}
+			const auto jit_end = HOST_JIT_ARENA_BASE + HOST_JIT_ARENA_SIZE;
+			if (start < HOST_JIT_ARENA_BASE) {
+				reserve_ordinary_range(start, std::min(end, HOST_JIT_ARENA_BASE));
+			}
+			if (start <= HOST_JIT_ARENA_BASE && end >= jit_end) {
+				EXIT_IF(!reserve_jit_arena());
+			}
+			if (end > jit_end) {
+				reserve_ordinary_range(std::max(start, jit_end), end);
 			}
 		};
 
@@ -1186,6 +1437,7 @@ private:
 				reserve_range(current, region_end);
 			}
 		}
+		EXIT_IF(m_jit_size != HOST_JIT_ARENA_SIZE);
 #else
 		for (size_t i = region_start_idx; i < regions.size(); ++i) {
 			const auto& [start, end] = regions[i];
@@ -1349,6 +1601,56 @@ private:
 		}
 	}
 
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+	bool ConsumeJitUnlocked(uint64_t vaddr, uint64_t size) {
+		auto next = m_jit_free.upper_bound(vaddr);
+		if (next == m_jit_free.begin()) {
+			return false;
+		}
+		auto it = std::prev(next);
+		if (!GuestFreeRangeContains(it->first, it->second, vaddr, size)) {
+			return false;
+		}
+		const auto base = it->first;
+		const auto end  = base + it->second;
+		m_jit_free.erase(it);
+		if (base < vaddr) {
+			m_jit_free.emplace(base, vaddr - base);
+		}
+		if (vaddr + size < end) {
+			m_jit_free.emplace(vaddr + size, end - (vaddr + size));
+		}
+		return true;
+	}
+
+	void AddFreeJitUnlocked(uint64_t vaddr, uint64_t size) {
+		auto [it, inserted] = m_jit_free.emplace(vaddr, size);
+		if (!inserted) {
+			it->second = size;
+		}
+		auto base = it->first;
+		auto end  = it->first + it->second;
+		auto first = it;
+		while (first != m_jit_free.begin()) {
+			auto previous = std::prev(first);
+			if (previous->first + previous->second != base) {
+				break;
+			}
+			base  = previous->first;
+			first = previous;
+		}
+		auto last = std::next(it);
+		while (last != m_jit_free.end() && end == last->first) {
+			end  = last->first + last->second;
+			last = std::next(last);
+		}
+		if (base != it->first || end != it->first + it->second) {
+			m_jit_free.erase(first, last);
+			m_jit_free.emplace(base, end - base);
+		}
+	}
+#endif
+
 	void RestorePlaceholder(uint64_t vaddr, uint64_t size) {
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 		// The address remains owned for the process lifetime; MAP_FIXED only replaces one of our
@@ -1364,6 +1666,11 @@ private:
 
 	std::shared_mutex                          m_mutex;
 	std::map<uint64_t, uint64_t>               m_free;
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+	std::map<uint64_t, uint64_t>               m_jit_free;
+	uint64_t                                   m_jit_base = 0;
+	uint64_t                                   m_jit_size = 0;
+#endif
 	std::map<uint64_t, MappedRegion>            m_mapped;
 	std::vector<std::pair<uint64_t, uint64_t>> m_owned;
 	uint64_t                                   m_granularity = 0x10000;

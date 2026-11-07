@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/file.h"
 #include "common/logging/log.h"
+#include "common/virtualMemory.h"
 
 #include <cstring>
 #include <memory>
@@ -240,6 +241,7 @@ Elf64::~Elf64() {
 }
 
 void Elf64::LoadSegment(uint64_t vaddr, uint64_t file_offset, uint64_t size) {
+	Common::VirtualMemory::JitWriteScope write_scope;
 	EXIT_IF(m_f == nullptr);
 
 	if (m_self != nullptr) {
