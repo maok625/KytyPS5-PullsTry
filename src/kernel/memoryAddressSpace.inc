@@ -903,7 +903,12 @@ public:
 				zeroed_without_faulting =
 				    madvise(reinterpret_cast<void*>(region_vaddr), region_size, MADV_ZERO) == 0;
 #endif
-				if (!zeroed_without_faulting) {
+				if (zeroed_without_faulting) {
+#ifdef MADV_FREE
+					// The contents are known zero now, so let XNU reclaim the clean pages.
+					(void)madvise(reinterpret_cast<void*>(region_vaddr), region_size, MADV_FREE);
+#endif
+				} else {
 					// Older kernels or unsupported MAP_JIT ranges fall back to explicit clearing.
 					// This is slower and faults pages in, but guarantees zero-on-reuse.
 					EXIT_IF(!VirtualMemory::Protect(region_vaddr, region_size,
