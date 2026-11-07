@@ -1003,7 +1003,9 @@ private:
 			case VirtualMemory::Mode::ExecuteRead: return VirtualMemory::Mode::ExecuteRead;
 			case VirtualMemory::Mode::ExecuteWrite:
 			case VirtualMemory::Mode::ExecuteReadWrite:
-				return VirtualMemory::Mode::ExecuteReadWrite;
+				// MAP_JIT pages stay executable/readable. pthread_jit_write_protect_np()
+				// supplies temporary per-thread write access inside JitWriteScope.
+				return VirtualMemory::Mode::ExecuteRead;
 			default: return VirtualMemory::Mode::NoAccess;
 		}
 	}
