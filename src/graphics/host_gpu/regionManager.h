@@ -338,6 +338,8 @@ private:
 	void UpdateProtection(RegionBits& changed) {
 		if (!changed.None()) {
 			m_page_manager.UpdatePageWatchersForRegion<track, is_read>(m_cpu_addr, changed);
+	}
+	}
 	static uint32_t Frame() noexcept { return s_frame.load(std::memory_order_relaxed); }
 
 	void ForgetOldHeat() {
@@ -357,6 +359,8 @@ private:
 		if (mask.None()) {
 			return;
 		}
+		previous = protection;
+		m_page_manager.UpdatePageWatchersForRegion<track, is_read>(m_cpu_addr, mask);
 	}
 
 	template <DirtySource source>
