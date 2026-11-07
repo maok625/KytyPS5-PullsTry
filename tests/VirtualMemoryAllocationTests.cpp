@@ -4470,12 +4470,8 @@ void TestMacosArm64PersistentJitArenaLifecycle() {
 	          "macos_jit_outside", true) == 0,
 	      "fixed executable allocation outside the JIT arena was accepted");
 
-	std::printf("[jit-test] before executable allocation\n");
-	std::fflush(stdout);
 	const auto base = Libs::LibKernel::Memory::AllocateProgramMemory(
 	    0, program_size, Common::VirtualMemory::Mode::ExecuteReadWrite, "macos_jit_program");
-	std::printf("[jit-test] executable allocation returned 0x%016" PRIx64 "\n", base);
-	std::fflush(stdout);
 	Check(test, base >= arena_base + 0x200000 && base + program_size <= arena_end,
 	      "executable allocation did not come from the persistent JIT arena");
 	Check(test, Libs::LibKernel::Memory::TestGuestAddressRangeIsOwned(base, program_size),
@@ -4486,38 +4482,22 @@ void TestMacosArm64PersistentJitArenaLifecycle() {
 		    0x52800000u | (value << 5u), // mov w0, #value
 		    0xd65f03c0u,                 // ret
 		}};
-		std::printf("[jit-test] write scope begin at 0x%016" PRIx64 "\n", address);
-		std::fflush(stdout);
 		{
 			Common::VirtualMemory::JitWriteScope write_scope;
 			std::memcpy(reinterpret_cast<void*>(address), instructions.data(),
 			            sizeof(instructions));
 		}
-		std::printf("[jit-test] write scope end at 0x%016" PRIx64 "\n", address);
-		std::fflush(stdout);
 		Check(test, Common::VirtualMemory::FlushInstructionCache(address, sizeof(instructions)),
 		      "failed to invalidate the generated ARM64 instructions");
-		std::printf("[jit-test] instruction cache flushed at 0x%016" PRIx64 "\n", address);
-		std::fflush(stdout);
 	};
 
 	using JitFunction = uint32_t (*)();
-	std::printf("[jit-test] before first code write\n");
-	std::fflush(stdout);
 	write_arm64_return(base, 42);
-	std::printf("[jit-test] before first RX protection\n");
-	std::fflush(stdout);
 	Check(test,
 	      Libs::LibKernel::Memory::ProtectGuestMemory(
 	          base, page, Common::VirtualMemory::Mode::ExecuteRead),
 	      "failed to finalize the generated code page as RX");
-	std::printf("[jit-test] first RX protection completed\n");
-	std::fflush(stdout);
-	std::printf("[jit-test] before first code execution\n");
-	std::fflush(stdout);
 	const auto first_result = reinterpret_cast<JitFunction>(base)();
-	std::printf("[jit-test] first code execution returned %u\n", first_result);
-	std::fflush(stdout);
 	Check(test, first_result == 42,
 	      "generated function in the JIT arena returned the wrong value");
 
