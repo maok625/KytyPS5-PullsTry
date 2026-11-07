@@ -3186,7 +3186,7 @@ static uint64_t AllocateGuestRuntimeMemory(uint64_t search_addr, uint64_t size,
 	    (fixed && (search_addr == 0 || (search_addr & (GuestPageSize - 1u)) != 0))) {
 		LOGF_COLOR(Log::Color::Red,
 		           "guest runtime allocation rejected: name=%s hint=0x%016" PRIx64
-		           " size=0x%016" PRIx64 " fixed=%d\\n",
+		           " size=0x%016" PRIx64 " fixed=%d\n",
 		           name != nullptr ? name : "<null>", search_addr, size, fixed ? 1 : 0);
 		return 0;
 	}
@@ -3197,7 +3197,7 @@ static uint64_t AllocateGuestRuntimeMemory(uint64_t search_addr, uint64_t size,
 		LOGF_COLOR(Log::Color::Red,
 		           "guest runtime allocation failed: no free range; name=%s hint=0x%016" PRIx64
 		           " requested=0x%016" PRIx64 " mapped=0x%016" PRIx64
-		           " fixed=%d user=[0x%016" PRIx64 ",0x%016" PRIx64 "]\\n",
+		           " fixed=%d user=[0x%016" PRIx64 ",0x%016" PRIx64 "]\n",
 		           name, search_addr, size, mapped_size, fixed ? 1 : 0, HOST_USER_MIN,
 		           HOST_USER_MAX);
 		return 0;
@@ -3207,7 +3207,7 @@ static uint64_t AllocateGuestRuntimeMemory(uint64_t search_addr, uint64_t size,
 		LOGF_COLOR(Log::Color::Red,
 		           "guest runtime allocation failed: overlap; name=%s addr=0x%016" PRIx64
 		           " size=0x%016" PRIx64 " conflict=[0x%016" PRIx64
-	           ",0x%016" PRIx64 ") type=%s\\n",
+	           ",0x%016" PRIx64 ") type=%s\n",
 		           name, vaddr, mapped_size, overlap.start, overlap.start + overlap.size,
 		           magic_enum::enum_name(overlap.type));
 		return 0;
@@ -3216,14 +3216,14 @@ static uint64_t AllocateGuestRuntimeMemory(uint64_t search_addr, uint64_t size,
 	if (!g_guest_address_space->Commit(vaddr, mapped_size, mode)) {
 		LOGF_COLOR(Log::Color::Red,
 		           "guest runtime allocation failed: commit; name=%s addr=0x%016" PRIx64
-	           " size=0x%016" PRIx64 " mode=0x%08" PRIx32 " errno=%d\\n",
+	           " size=0x%016" PRIx64 " mode=0x%08" PRIx32 " errno=%d\n",
 		           name, vaddr, mapped_size, static_cast<uint32_t>(mode), errno);
 		return 0;
 	}
 	if (!g_virtual_ranges->Add(vaddr, mapped_size, 0, ProgramProtection(mode), 0, type, name)) {
 		LOGF_COLOR(Log::Color::Red,
 		           "guest runtime allocation failed: range registration; name=%s addr=0x%016" PRIx64
-	           " size=0x%016" PRIx64 "\\n",
+	           " size=0x%016" PRIx64 "\n",
 		           name, vaddr, mapped_size);
 		EXIT_IF(!g_guest_address_space->ReleaseCommitted(vaddr, mapped_size));
 		return 0;
