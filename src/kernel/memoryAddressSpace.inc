@@ -810,11 +810,8 @@ public:
 				AddFreeJitUnlocked(vaddr, size);
 				return false;
 			}
-			if (!VirtualMemory::Protect(vaddr, size, host_mode)) {
-				EXIT_IF(!VirtualMemory::Protect(vaddr, size, VirtualMemory::Mode::NoAccess));
-				AddFreeJitUnlocked(vaddr, size);
-				return false;
-			}
+			// Leave newly committed executable pages RW while the loader populates them.
+			// SetProgramMemoryProtection/ProtectGuestMemory finalizes executable segments as RX.
 			AddMappedUnlocked(vaddr, size, MappingType::Jit);
 			return true;
 		}
@@ -988,14 +985,18 @@ private:
 				continue;
 			}
 #endif
-			if (region.type == MappingType::Jit && mode == VirtualMemory::Mode::NoAccess) {
+			const auto host_mode =
+			    (region.type == MappingType::Jit && VirtualMemory::IsExecute(mode))
+			        ? VirtualMemory::Mode::ExecuteRead
+			        : mode;
+			if (region.type == MappingType::Jit && host_mode == VirtualMemory::Mode::NoAccess) {
 				// Keep MAP_JIT decommit transitions compatible with Apple Silicon's W^X rules.
 				if (!VirtualMemory::Protect(range_start, range_end - range_start,
 				                            VirtualMemory::Mode::ExecuteRead) ||
-				    !VirtualMemory::Protect(range_start, range_end - range_start, mode)) {
+				    !VirtualMemory::Protect(range_start, range_end - range_start, host_mode)) {
 					return false;
 				}
-			} else if (!VirtualMemory::Protect(range_start, range_end - range_start, mode)) {
+			} else if (!VirtualMemory::Protect(range_start, range_end - range_start, host_mode)) {
 				return false;
 			}
 		}
