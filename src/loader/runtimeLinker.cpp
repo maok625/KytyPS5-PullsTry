@@ -1787,7 +1787,9 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 		    program->base_vaddr + program->base_size_aligned + program->instruction_trampoline_size;
 	}
 
-	g_desired_base_addr += CODE_BASE_INCR * (1 + program->mapped_size / CODE_BASE_INCR);
+	g_desired_base_addr =
+	    std::max(g_desired_base_addr, program->base_vaddr) +
+	    CODE_BASE_INCR * (1 + program->mapped_size / CODE_BASE_INCR);
 
 	EXIT_IF(program->base_size_aligned < program->base_size);
 	LOGF("base_vaddr             = 0x%016" PRIx64 "\n"
