@@ -1010,9 +1010,9 @@ private:
 			case VirtualMemory::Mode::ExecuteRead: return VirtualMemory::Mode::ExecuteRead;
 			case VirtualMemory::Mode::ExecuteWrite:
 			case VirtualMemory::Mode::ExecuteReadWrite:
-				// Guest W+X pages need host RWX. The MAP_JIT thread switch still
-				// enforces per-thread write-vs-execute access for generated code.
-				return VirtualMemory::Mode::ExecuteReadWrite;
+				// Keep MAP_JIT host pages RX. Writers temporarily switch a page to RW
+				// and restore its guest protection; do not create host RWX mappings.
+				return VirtualMemory::Mode::ExecuteRead;
 			default: return VirtualMemory::Mode::NoAccess;
 		}
 	}
