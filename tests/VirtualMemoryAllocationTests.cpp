@@ -4440,6 +4440,14 @@ void TestMacosArm64PersistentJitArenaLifecycle() {
 	      "ordinary runtime allocation was routed into the JIT arena");
 	Check(test, Libs::LibKernel::Memory::FreeGuestMemory(ordinary, page),
 	      "failed to free the ordinary runtime allocation");
+
+	const auto stack = Libs::LibKernel::Memory::AllocateGuestStackMemory(
+	    0, page, Common::VirtualMemory::Mode::ReadWrite, "macos_jit_stack");
+	Check(test, stack != 0 && !(stack >= arena_base && stack < arena_end),
+	      "guest stack allocation was routed into the JIT arena");
+	Check(test, Libs::LibKernel::Memory::FreeGuestMemory(stack, page),
+	      "failed to free the ordinary guest stack");
+
 	Check(test,
 	      Libs::LibKernel::Memory::AllocateRuntimeMemory(
 	          0x900000000ull, page, Common::VirtualMemory::Mode::ExecuteReadWrite,
