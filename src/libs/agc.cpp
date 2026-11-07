@@ -4073,6 +4073,9 @@ int Initialize() {
 	if (result != OK) {
 		return result;
 	}
+	// The requested address is a placement hint unless fixed mapping is requested.
+	// On macOS ARM64, the guest address-space allocator skips the low system region,
+	// so the returned address can legitimately differ from DriverDmemBase.
 	void* address = reinterpret_cast<void*>(DriverDmemBase);
 	result = LibKernel::Memory::KernelMapNamedDirectMemory(
 	    &address, DriverDmemSize, 0x33, 0, physical_offset, DriverDmemSize, "SceAgcDriver");
@@ -4080,7 +4083,14 @@ int Initialize() {
 		EXIT_IF(LibKernel::Memory::KernelCheckedReleaseDirectMemory(physical_offset, DriverDmemSize) != OK);
 		return result;
 	}
-	EXIT_IF(reinterpret_cast<uint64_t>(address) != DriverDmemBase);
+	if (address == nullptr) {
+		EXIT_IF(LibKernel::Memory::KernelCheckedReleaseDirectMemory(physical_offset, DriverDmemSize) != OK);
+		return KERNEL_ERROR_ENOMEM;
+	}
+	const auto mapped_base = reinterpret_cast<uint64_t>(address);
+	LOGF("AGC driver DMEM: requested=0x%016" PRIx64 " mapped=0x%016" PRIx64
+	     " size=0x%08" PRIx32 "\\n",
+	     DriverDmemBase, mapped_base, DriverDmemSize);
 	std::memset(address, 0, DriverDmemSize);
 	struct FunctionShaderBindings {
 		uint64_t code;
@@ -4094,7 +4104,8 @@ int Initialize() {
 	    0xbf800000, 0x85ea807e, 0x88ea106a, 0xbf870003,
 	    0xbefc03ff, 0x8a6ca000, 0xbf920009, 0xbefd210e,
 	};
-	const auto base = DriverDmemBase + AgcDmemOffset;
+	// The descriptor and validator must use the address the kernel actually mapped.
+	const auto base = mapped_base + AgcDmemOffset;
 	const auto function_table = base + 0x60;
 	const auto code_address = base + 0x100; // Shader code requires 256-byte alignment.
 	std::array<FunctionShaderBindings, 8> functions {};
