@@ -829,14 +829,7 @@ public:
 			if (!ConsumeJitUnlocked(vaddr, size)) {
 				return false;
 			}
-			const auto jit_host_mode =
-			    (mode == VirtualMemory::Mode::ExecuteReadWrite)
-			        ? VirtualMemory::Mode::ReadWrite
-			        : (VirtualMemory::IsExecute(mode)
-			               ? VirtualMemory::Mode::ExecuteRead
-			               : (mode == VirtualMemory::Mode::NoAccess
-			                      ? VirtualMemory::Mode::NoAccess
-			                      : VirtualMemory::Mode::ReadWrite));
+			const auto jit_host_mode = GetJitHostMode(mode);
 			if (!VirtualMemory::Protect(vaddr, size, jit_host_mode)) {
 				AddFreeJitUnlocked(vaddr, size);
 				return false;
@@ -999,6 +992,23 @@ private:
 
 	static constexpr uint64_t PageSize() { return 0x4000; }
 
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+	static VirtualMemory::Mode GetJitHostMode(VirtualMemory::Mode mode) {
+		switch (mode) {
+			case VirtualMemory::Mode::NoAccess: return VirtualMemory::Mode::NoAccess;
+			case VirtualMemory::Mode::Read: return VirtualMemory::Mode::Read;
+			case VirtualMemory::Mode::Write:
+			case VirtualMemory::Mode::ReadWrite: return VirtualMemory::Mode::ReadWrite;
+			case VirtualMemory::Mode::Execute:
+			case VirtualMemory::Mode::ExecuteRead: return VirtualMemory::Mode::ExecuteRead;
+			case VirtualMemory::Mode::ExecuteWrite:
+			case VirtualMemory::Mode::ExecuteReadWrite:
+				return VirtualMemory::Mode::ExecuteReadWrite;
+			default: return VirtualMemory::Mode::NoAccess;
+		}
+	}
+#endif
+
 	static uint64_t AlignUp(uint64_t value, uint64_t alignment) {
 		const auto remainder = value % alignment;
 		return remainder != 0 ? value + (alignment - remainder) : value;
@@ -1036,9 +1046,7 @@ private:
 			}
 #endif
 			const auto host_mode =
-			    (region.type == MappingType::Jit && VirtualMemory::IsExecute(mode))
-			        ? VirtualMemory::Mode::ExecuteRead
-			        : mode;
+			    (region.type == MappingType::Jit ? GetJitHostMode(mode) : mode);
 			if (region.type == MappingType::Jit && host_mode == VirtualMemory::Mode::NoAccess) {
 				// Keep MAP_JIT decommit transitions compatible with Apple Silicon's W^X rules.
 				if (!VirtualMemory::Protect(range_start, range_end - range_start,
