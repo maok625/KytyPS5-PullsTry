@@ -4089,7 +4089,7 @@ int Initialize() {
 	}
 	const auto mapped_base = reinterpret_cast<uint64_t>(address);
 	LOGF("AGC driver DMEM: requested=0x%016" PRIx64 " mapped=0x%016" PRIx64
-	     " size=0x%08" PRIx32 "\\n",
+	     " size=0x%08" PRIx32 "\n",
 	     DriverDmemBase, mapped_base, DriverDmemSize);
 	std::memset(address, 0, DriverDmemSize);
 	struct FunctionShaderBindings {
