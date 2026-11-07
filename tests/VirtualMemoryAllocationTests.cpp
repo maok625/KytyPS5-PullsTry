@@ -4537,9 +4537,19 @@ void TestMacosArm64PersistentJitArenaLifecycle() {
 	      Libs::LibKernel::Memory::ProtectGuestMemory(
 	          base, page, Common::VirtualMemory::Mode::ExecuteReadWrite),
 	      "failed to restore guest W+X protection on a JIT page");
+	Common::VirtualMemory::Mode original_wx_mode = Common::VirtualMemory::Mode::NoAccess;
+	Check(test,
+	      Libs::LibKernel::Memory::ProtectGuestMemory(
+	          base, page, Common::VirtualMemory::Mode::ReadWrite, &original_wx_mode),
+	      "failed to temporarily make the guest W+X JIT page writable");
+	Check(test, original_wx_mode == Common::VirtualMemory::Mode::ExecuteReadWrite,
+	      "guest W+X protection metadata was not preserved");
 	write_arm64_return(base, 45);
+	Check(test,
+	      Libs::LibKernel::Memory::ProtectGuestMemory(base, page, original_wx_mode),
+	      "failed to restore guest W+X JIT protection after a write");
 	Check(test, reinterpret_cast<JitFunction>(base)() == 45,
-	      "W+X JIT page did not execute after a scoped write");
+	      "W+X JIT page did not execute after a scoped RW write");
 
 	Check(test,
 	      Libs::LibKernel::Memory::ProtectGuestMemory(
