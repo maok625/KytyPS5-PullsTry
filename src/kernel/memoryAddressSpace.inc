@@ -1126,24 +1126,37 @@ private:
 				return;
 			}
 
-			const auto size = end - start;
-			int flags = MAP_PRIVATE | MAP_ANON | MAP_NORESERVE;
+			// Keep each reservation below macOS' practical per-mmap range limits.
+			// Larger free gaps are represented by adjacent chunks and coalesced by AddFreeUnlocked.
+			constexpr uint64_t MaxReservationChunk = 1ull << 34; // 16 GiB
+			for (uint64_t chunk_start = start; chunk_start < end;) {
+				const auto chunk_end  = std::min(chunk_start + MaxReservationChunk, end);
+				const auto chunk_size = chunk_end - chunk_start;
+				int        flags      = MAP_PRIVATE | MAP_ANON | MAP_NORESERVE;
 #if defined(KYTY_LINKED_GUEST_ADDRESS_SPACE)
-			flags |= MAP_FIXED;
+				flags |= MAP_FIXED;
 #elif defined(MAP_FIXED_NOREPLACE)
-			flags |= MAP_FIXED_NOREPLACE;
+				flags |= MAP_FIXED_NOREPLACE;
 #endif
 
-			void* ptr = mmap(reinterpret_cast<void*>(start), size, PROT_NONE, flags, -1, 0);
-			if (ptr == MAP_FAILED || reinterpret_cast<uint64_t>(ptr) != start) {
-				if (ptr != MAP_FAILED) {
-					munmap(ptr, size);
+				void* ptr = mmap(reinterpret_cast<void*>(chunk_start), chunk_size, PROT_NONE, flags, -1, 0);
+				if (ptr == MAP_FAILED || reinterpret_cast<uint64_t>(ptr) != chunk_start) {
+					const int map_error = errno;
+					if (ptr != MAP_FAILED) {
+						munmap(ptr, chunk_size);
+					}
+					LOGF_COLOR(Log::Color::Yellow,
+					           "guest address-space reservation skipped: addr=0x%016" PRIx64
+					           " size=0x%016" PRIx64 " errno=%d\\n",
+					           chunk_start, chunk_size, map_error);
+					chunk_start = chunk_end;
+					continue;
 				}
-				return;
-			}
 
-			AddFreeUnlocked(start, size);
-			m_owned.emplace_back(start, size);
+				AddFreeUnlocked(chunk_start, chunk_size);
+				m_owned.emplace_back(chunk_start, chunk_size);
+				chunk_start = chunk_end;
+			}
 		};
 
 		for (size_t i = region_start_idx; i < regions.size(); ++i) {
