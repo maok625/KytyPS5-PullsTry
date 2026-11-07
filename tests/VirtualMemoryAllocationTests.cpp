@@ -4477,13 +4477,21 @@ void TestMacosArm64PersistentJitArenaLifecycle() {
 	      "fixed executable allocation could not consume the adjacent JIT range");
 
 	std::atomic<uint32_t> worker_result {0};
+	std::atomic<bool>     worker_completed {false};
 	std::thread worker_thread([&] {
-		write_arm64_return(worker, 43);
-		worker_result.store(reinterpret_cast<JitFunction>(worker)(), std::memory_order_release);
+		try {
+			write_arm64_return(worker, 43);
+			worker_result.store(reinterpret_cast<JitFunction>(worker)(), std::memory_order_release);
+			worker_completed.store(true, std::memory_order_release);
+		} catch (const TestFailure&) {
+			// Report worker failures on the main test thread after join.
+		}
 	});
 	worker_thread.join();
-	Check(test, worker_result.load(std::memory_order_acquire) == 43,
+	Check(test, worker_completed.load(std::memory_order_acquire),
 	      "worker thread could not write and execute JIT code");
+	Check(test, worker_result.load(std::memory_order_acquire) == 43,
+	      "worker thread JIT function returned the wrong value");
 
 	Check(test, Libs::LibKernel::Memory::FreeGuestMemory(worker, worker_size),
 	      "failed to release the worker JIT page");
