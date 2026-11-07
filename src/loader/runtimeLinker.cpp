@@ -1625,6 +1625,50 @@ int RuntimeLinker::StartModule(Program* program, size_t args, const void* argp,
 	     program->tls.image_vaddr, program->tls.init_size, program->tls.image_size,
 	     program->tls.tcb_offset, program->tls.handler_vaddr);
 
+	// Dump the relocated initializer/finalizer arrays before entering guest code.
+	// This is diagnostic only: it does not call or modify any array entry.
+	auto dump_module_array = [program](const char* name, uint64_t vaddr, uint64_t size) {
+		if (vaddr == 0 || size == 0) {
+			LOGF("module %s: absent\n", name);
+			return;
+		}
+		if (vaddr > UINT64_MAX - program->base_vaddr) {
+			LOGF("module %s: invalid address overflow (vaddr=0x%016" PRIx64 ")\n", name, vaddr);
+			return;
+		}
+		const auto address = program->base_vaddr + vaddr;
+		const auto count = size / sizeof(uint64_t);
+		const auto shown = std::min<uint64_t>(count, 32);
+		LOGF("module %s: address=0x%016" PRIx64 " size=0x%016" PRIx64
+		     " entries=%" PRIu64 " (showing=%" PRIu64 ")\n",
+		     name, address, size, count, shown);
+		if ((size % sizeof(uint64_t)) != 0 || shown == 0 ||
+		    !IsReadableRange(address, shown * sizeof(uint64_t))) {
+			LOGF("module %s: entries are not safely readable\n", name);
+			return;
+		}
+		const auto* entries = reinterpret_cast<const uint64_t*>(address);
+		for (uint64_t i = 0; i < shown; i++) {
+			const auto target = entries[i];
+			LOGF("module %s[%" PRIu64 "]: slot=0x%016" PRIx64 " target=0x%016" PRIx64,
+			     name, i, address + i * sizeof(uint64_t), target);
+			if (target != 0 && target != UINT64_MAX && IsReadableRange(target, 16)) {
+				const auto* bytes = reinterpret_cast<const uint8_t*>(target);
+				LOGF(" bytes=%02x %02x %02x %02x %02x %02x %02x %02x"
+				     " %02x %02x %02x %02x %02x %02x %02x %02x",
+				     bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+				     bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]);
+			}
+			LOGF("\\n");
+		}
+	};
+	dump_module_array("preinit_array", program->dynamic_info->preinit_array_vaddr,
+	                 program->dynamic_info->preinit_array_size);
+	dump_module_array("init_array", program->dynamic_info->init_array_vaddr,
+	                 program->dynamic_info->init_array_size);
+	dump_module_array("fini_array", program->dynamic_info->fini_array_vaddr,
+	                 program->dynamic_info->fini_array_size);
+
 	return reinterpret_cast<module_ini_fini_func_t>(init_address)(args, argp, func);
 }
 
