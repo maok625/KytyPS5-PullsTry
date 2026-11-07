@@ -766,7 +766,7 @@ public:
 
 	[[nodiscard]] bool IsJitRange(uint64_t vaddr, uint64_t size) const {
 #if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
-		return size != 0 && vaddr >= HOST_JIT_ARENA_ALLOC_BASE &&
+		return size != 0 && vaddr >= HOST_JIT_ARENA_BASE &&
 		       vaddr < HOST_JIT_ARENA_BASE + HOST_JIT_ARENA_SIZE &&
 		       size <= HOST_JIT_ARENA_BASE + HOST_JIT_ARENA_SIZE - vaddr;
 #else
