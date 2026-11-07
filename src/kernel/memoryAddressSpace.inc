@@ -815,12 +815,20 @@ public:
 			if (!ConsumeJitUnlocked(vaddr, size)) {
 				return false;
 			}
-			if (!VirtualMemory::Protect(vaddr, size, VirtualMemory::Mode::ReadWrite)) {
+			const auto jit_host_mode =
+			    (mode == VirtualMemory::Mode::ExecuteReadWrite)
+			        ? VirtualMemory::Mode::ReadWrite
+			        : (VirtualMemory::IsExecute(mode)
+			               ? VirtualMemory::Mode::ExecuteRead
+			               : (mode == VirtualMemory::Mode::NoAccess
+			                      ? VirtualMemory::Mode::NoAccess
+			                      : VirtualMemory::Mode::ReadWrite));
+			if (!VirtualMemory::Protect(vaddr, size, jit_host_mode)) {
 				AddFreeJitUnlocked(vaddr, size);
 				return false;
 			}
-			// Leave newly committed executable pages RW while the loader populates them.
-			// SetProgramMemoryProtection/ProtectGuestMemory finalizes executable segments as RX.
+			// The loader requests ExecuteReadWrite and receives RW while populating segments.
+			// Restored mappings with narrower semantic permissions retain W^X host protection.
 			AddMappedUnlocked(vaddr, size, MappingType::Jit);
 			return true;
 		}
