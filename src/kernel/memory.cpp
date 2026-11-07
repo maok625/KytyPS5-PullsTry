@@ -2685,6 +2685,13 @@ int KYTY_SYSV_ABI KernelQueryMemoryProtection(void* addr, void** start, void** e
 }
 
 static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size) {
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+	// The JIT arena is a process-lifetime MAP_JIT mapping. It must never be converted
+	// into an ordinary Reserved range, even when its pages are currently PROT_NONE.
+	if (g_guest_address_space->OverlapsJitRange(start, size)) {
+		return false;
+	}
+#endif
 
 	struct ReplacedChunk {
 		VirtualRanges::Range                        range {};
