@@ -626,7 +626,8 @@ public:
 
 	// Writes the backed bytes of a range that holds no private mappings.
 	bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
-		if (!Owns(vaddr, size)) {
+		// MAP_JIT pages are private anonymous guest memory, never part of the shared backing store.
+		if (IsJitRange(vaddr, size) || !Owns(vaddr, size)) {
 			return false;
 		}
 		std::shared_lock lock(m_mutex);
