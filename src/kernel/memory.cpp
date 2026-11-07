@@ -3268,8 +3268,14 @@ void SetProgramMemoryProtection(uint64_t vaddr, uint64_t size, VirtualMemory::Mo
 		     vaddr, size);
 	}
 
-	const auto host_mode = VirtualMemory::IsExecute(mode) ? VirtualMemory::Mode::ExecuteReadWrite
-	                                                      : VirtualMemory::Mode::ReadWrite;
+	const auto host_mode =
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+	    (g_guest_address_space->IsJitRange(vaddr, size) && VirtualMemory::IsExecute(mode))
+	        ? VirtualMemory::Mode::ExecuteRead
+	        :
+#endif
+	            (VirtualMemory::IsExecute(mode) ? VirtualMemory::Mode::ExecuteReadWrite
+	                                            : VirtualMemory::Mode::ReadWrite);
 	EXIT_IF(!g_guest_address_space->Protect(vaddr, size, host_mode));
 	g_virtual_ranges->Protect(vaddr, size, ProgramProtection(mode));
 }
@@ -3305,7 +3311,16 @@ bool ProtectGuestMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode,
 		*old_mode = static_cast<VirtualMemory::Mode>(
 		    ranges.front().protection & (PROT_CPU_READ | PROT_CPU_WRITE | PROT_CPU_EXEC));
 	}
-	if (!g_guest_address_space->Protect(aligned_addr, aligned_size, mode)) {
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+	const auto host_mode =
+	    (g_guest_address_space->IsJitRange(aligned_addr, aligned_size) &&
+	     VirtualMemory::IsExecute(mode))
+	        ? VirtualMemory::Mode::ExecuteRead
+	        : mode;
+#else
+	const auto host_mode = mode;
+#endif
+	if (!g_guest_address_space->Protect(aligned_addr, aligned_size, host_mode)) {
 		return false;
 	}
 	g_virtual_ranges->Protect(aligned_addr, aligned_size, ProgramProtection(mode));
