@@ -1408,16 +1408,17 @@ private:
 			return true;
 		};
 
-		auto reserve_range = [&](uint64_t start, uint64_t end) {
+		auto reserve_range = [&](uint64_t start, uint64_t end, bool allow_jit_arena) {
 			start = AlignUp(start, PageSize());
 			end   = AlignDown(end, PageSize());
 			if (start == 0 || end <= start) {
 				return;
 			}
 
-			// The arena may live in any gap large enough to hold it, rather than requiring
-			// one particular hard-coded address to be free.
-			if (m_jit_size == 0 && end - start >= HOST_JIT_ARENA_SIZE) {
+			// The arena may live in any host-user gap large enough to hold it, rather than
+			// requiring one particular hard-coded address to be free.
+			if (allow_jit_arena && m_jit_size == 0 &&
+			    end - start >= HOST_JIT_ARENA_SIZE) {
 				(void)reserve_jit_arena(start, end);
 			}
 
@@ -1448,7 +1449,7 @@ private:
 				}
 
 				if (mapping_start > current) {
-					reserve_range(current, std::min(mapping_start, region_end));
+					reserve_range(current, std::min(mapping_start, region_end), i == region_start_idx);
 				}
 
 				current = std::max(current, mapping_end);
@@ -1458,7 +1459,7 @@ private:
 			}
 
 			if (current < region_end) {
-				reserve_range(current, region_end);
+				reserve_range(current, region_end, i == region_start_idx);
 			}
 		}
 		if (m_jit_size != HOST_JIT_ARENA_SIZE) {
