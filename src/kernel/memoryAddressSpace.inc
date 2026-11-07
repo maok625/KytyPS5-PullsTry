@@ -810,10 +810,6 @@ public:
 				AddFreeJitUnlocked(vaddr, size);
 				return false;
 			}
-			{
-				VirtualMemory::JitWriteScope write_scope;
-				std::memset(reinterpret_cast<void*>(vaddr), 0, size);
-			}
 			if (!VirtualMemory::Protect(vaddr, size, host_mode)) {
 				EXIT_IF(!VirtualMemory::Protect(vaddr, size, VirtualMemory::Mode::NoAccess));
 				AddFreeJitUnlocked(vaddr, size);
@@ -879,14 +875,22 @@ public:
 #else
 		if (is_jit) {
 			for (const auto& [region_vaddr, region_size]: regions) {
-				// macOS rejects a direct RWX -> PROT_NONE transition on MAP_JIT.
+				// Anonymous MAP_JIT pages are demand-zero on first use. Clear them before
+				// MADV_FREE so an unreclaimed page is also safe to hand to the next guest owner.
+				EXIT_IF(!VirtualMemory::Protect(region_vaddr, region_size,
+				                                VirtualMemory::Mode::ReadWrite));
+				{
+					VirtualMemory::JitWriteScope write_scope;
+					std::memset(reinterpret_cast<void*>(region_vaddr), 0, region_size);
+				}
+				// macOS rejects a direct RWX/RW -> PROT_NONE transition on MAP_JIT.
 				// Passing through RX is required before making the pages inaccessible.
 				EXIT_IF(!VirtualMemory::Protect(region_vaddr, region_size,
 				                                VirtualMemory::Mode::ExecuteRead));
 				EXIT_IF(!VirtualMemory::Protect(region_vaddr, region_size,
 				                                VirtualMemory::Mode::NoAccess));
 #ifdef MADV_FREE
-				// MADV_FREE is advisory. Commit() explicitly zeroes pages before reuse.
+				// MADV_FREE is advisory; cleared contents remain zero if the kernel keeps them.
 				(void)madvise(reinterpret_cast<void*>(region_vaddr), region_size, MADV_FREE);
 #endif
 			}
