@@ -126,10 +126,21 @@ static constexpr uint64_t               UNRESOLVED_STUB_PAGE_SIZE      = 4096;
 static KYTY_SYSV_ABI uint64_t UnresolvedImportStub(uint64_t record_id);
 
 static bool PatchGuestMemory64(uint64_t vaddr, uint64_t value) {
-	Common::VirtualMemory::JitWriteScope write_scope;
-	auto* ptr     = reinterpret_cast<uint64_t*>(vaddr);
-	bool  changed = (*ptr != value);
-	std::memcpy(ptr, &value, sizeof(value));
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+	Common::VirtualMemory::Mode old_mode = Common::VirtualMemory::Mode::NoAccess;
+	EXIT_IF(!Libs::LibKernel::Memory::ProtectGuestMemory(
+	    vaddr, sizeof(value), Common::VirtualMemory::Mode::ReadWrite, &old_mode));
+#endif
+	bool changed = false;
+	{
+		Common::VirtualMemory::JitWriteScope write_scope;
+		auto* ptr = reinterpret_cast<uint64_t*>(vaddr);
+		changed = (*ptr != value);
+		std::memcpy(ptr, &value, sizeof(value));
+	}
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+	EXIT_IF(!Libs::LibKernel::Memory::ProtectGuestMemory(vaddr, sizeof(value), old_mode));
+#endif
 	return changed;
 }
 
@@ -162,11 +173,20 @@ static uint64_t AllocateUnresolvedImportThunk(uint64_t record_id) {
 	const auto target = reinterpret_cast<uint64_t>(UnresolvedImportStub);
 	std::memcpy(bytes + 6, &record_id, sizeof(record_id));
 	std::memcpy(bytes + 16, &target, sizeof(target));
+	const auto thunk_page = g_unresolved_stub_thunk_pages.back();
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+	Common::VirtualMemory::Mode old_mode = Common::VirtualMemory::Mode::NoAccess;
+	EXIT_IF(!Libs::LibKernel::Memory::ProtectGuestMemory(
+	    thunk_page, 0x4000, Common::VirtualMemory::Mode::ReadWrite, &old_mode));
+#endif
 	{
 		Common::VirtualMemory::JitWriteScope write_scope;
 		std::memcpy(code, bytes, sizeof(bytes));
 	}
 	Common::VirtualMemory::FlushInstructionCache(reinterpret_cast<uint64_t>(code), thunk_size);
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+	EXIT_IF(!Libs::LibKernel::Memory::ProtectGuestMemory(thunk_page, 0x4000, old_mode));
+#endif
 	return reinterpret_cast<uint64_t>(code);
 }
 
