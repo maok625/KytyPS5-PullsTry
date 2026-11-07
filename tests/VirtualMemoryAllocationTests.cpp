@@ -4463,6 +4463,18 @@ void TestMacosArm64PersistentJitArenaLifecycle() {
 	Check(test, reinterpret_cast<JitFunction>(base)() == 42,
 	      "generated function in the JIT arena returned the wrong value");
 
+	Common::VirtualMemory::Mode original_code_mode = Common::VirtualMemory::Mode::NoAccess;
+	Check(test,
+	      Libs::LibKernel::Memory::ProtectGuestMemory(
+	          base, page, Common::VirtualMemory::Mode::ReadWrite, &original_code_mode),
+	      "failed to temporarily make finalized code writable");
+	write_arm64_return(base, 44);
+	Check(test,
+	      Libs::LibKernel::Memory::ProtectGuestMemory(base, page, original_code_mode),
+	      "failed to restore the executable page protection");
+	Check(test, reinterpret_cast<JitFunction>(base)() == 44,
+	      "rewritten RX page did not execute the updated instructions");
+
 	Check(test,
 	      Libs::LibKernel::Memory::ProtectGuestMemory(
 	          base + page, page, Common::VirtualMemory::Mode::ReadWrite),
