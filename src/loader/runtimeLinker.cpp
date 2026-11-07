@@ -1722,7 +1722,7 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	const auto program_name = Common::PathToString(program->file_name.filename());
 	LOGF("Program memory allocation request: file=%s phnum=%u desired=0x%016" PRIx64
 	     " base_size=0x%016" PRIx64 " aligned=0x%016" PRIx64 " mapped=0x%016" PRIx64
-	     " mode=ExecuteReadWrite\\n",
+	     " mode=ExecuteReadWrite\n",
 	     program_name.c_str(), ehdr->e_phnum, g_desired_base_addr, program->base_size,
 	     program->base_size_aligned, program->mapped_size);
 	program->base_vaddr = Libs::LibKernel::Memory::AllocateProgramMemory(
@@ -1732,10 +1732,10 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 		LOGF_COLOR(Log::Color::Red,
 		           "Runtime linker could not allocate program memory: file=%s phnum=%u "
 		           "desired=0x%016" PRIx64 " base_size=0x%016" PRIx64
-		           " mapped=0x%016" PRIx64 "\\n",
+		           " mapped=0x%016" PRIx64 "\n",
 		           program_name.c_str(), ehdr->e_phnum, g_desired_base_addr, program->base_size,
 		           program->mapped_size);
-		EXIT("Runtime linker program-memory allocation failed\\n");
+		EXIT("Runtime linker program-memory allocation failed\n");
 	}
 	program->flexible_size = CalcFlexibleMemorySize(phdr, ehdr->e_phnum);
 	Libs::LibKernel::Memory::ChargeFlexibleMemory(program->flexible_size);
