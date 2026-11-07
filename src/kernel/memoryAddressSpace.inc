@@ -829,7 +829,14 @@ public:
 			if (!ConsumeJitUnlocked(vaddr, size)) {
 				return false;
 			}
-			const auto jit_host_mode = GetJitHostMode(mode);
+			// Fresh executable allocations must be writable while ELF segments and
+			// relocations are populated. They are finalized to RX by
+			// SetProgramMemoryProtection(); do not create host RWX mappings.
+			const auto jit_host_mode =
+			    (mode == VirtualMemory::Mode::ExecuteWrite ||
+			     mode == VirtualMemory::Mode::ExecuteReadWrite)
+			        ? VirtualMemory::Mode::ReadWrite
+			        : GetJitHostMode(mode);
 			if (!VirtualMemory::Protect(vaddr, size, jit_host_mode)) {
 				AddFreeJitUnlocked(vaddr, size);
 				return false;
