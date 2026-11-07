@@ -744,10 +744,17 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		            info->rax, info->rbx, info->rcx, info->rdx, info->rsi, info->rdi, info->rbp,
 		            info->rsp, info->r8, info->r9, info->r10, info->r11, info->r12, info->r13,
 		            info->r14, info->r15);
-		if (IsReadableRange(info->exception_address - 48, 96)) {
-			const auto* code = reinterpret_cast<const uint8_t*>(info->exception_address - 48);
-			std::printf("code (pc-48 .. pc+48, fault at byte 48):");
-			for (int i = 0; i < 96; i++) {
+		// The faulting PC can be close to the beginning of a mapping. Do not
+		// require bytes before it: probing pc-48 can cross into an unmapped region
+		// and suppress the entire instruction dump.
+		uint64_t code_size = 32;
+		while (code_size != 0 && !IsReadableRange(info->exception_address, code_size)) {
+			code_size /= 2;
+		}
+		if (code_size != 0) {
+			const auto* code = reinterpret_cast<const uint8_t*>(info->exception_address);
+			std::printf("code at pc (length=%" PRIu64 "):", code_size);
+			for (uint64_t i = 0; i < code_size; i++) {
 				std::printf("%s%02x", (i % 16 == 0) ? "\n " : " ", code[i]);
 			}
 			std::printf("\n");
@@ -1603,11 +1610,13 @@ int RuntimeLinker::StartModule(Program* program, size_t args, const void* argp,
 
 	EXIT_IF(std::find(m_programs.begin(), m_programs.end(), program) == m_programs.end());
 
+	const auto init_address = program->dynamic_info->init_vaddr + program->base_vaddr;
 	LOGF_COLOR(Log::Color::BrightYellow, "---\n--- Start module: %s\n---\n",
 	           Common::PathToString(program->file_name).c_str());
+	LOGF("module init address = 0x%016" PRIx64 " (offset=0x%016" PRIx64 ")\n",
+	     init_address, program->dynamic_info->init_vaddr);
 
-	return reinterpret_cast<module_ini_fini_func_t>(program->dynamic_info->init_vaddr +
-	                                                program->base_vaddr)(args, argp, func);
+	return reinterpret_cast<module_ini_fini_func_t>(init_address)(args, argp, func);
 }
 
 int RuntimeLinker::StopModule(Program* program, size_t args, const void* argp, module_func_t func) {
