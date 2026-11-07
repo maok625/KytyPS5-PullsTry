@@ -2084,8 +2084,15 @@ void RuntimeLinker::Relocate(Program* program) {
 	EXIT_IF(program == nullptr);
 
 	if (g_invalid_memory == 0) {
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+		// macOS ARM64 intentionally leaves the low system-managed guest range unreserved.
+		// The invalid-object sentinel only needs to be inaccessible, not at a fixed guest VA.
+		g_invalid_memory = Libs::LibKernel::Memory::AllocateRuntimeMemory(
+		    0, 4096, Common::VirtualMemory::Mode::NoAccess, "invalid_memory");
+#else
 		g_invalid_memory = Libs::LibKernel::Memory::AllocateRuntimeMemory(
 		    INVALID_MEMORY, 4096, Common::VirtualMemory::Mode::NoAccess, "invalid_memory", true);
+#endif
 		EXIT_NOT_IMPLEMENTED(g_invalid_memory == 0);
 	}
 
