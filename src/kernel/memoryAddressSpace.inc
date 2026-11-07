@@ -1046,7 +1046,11 @@ private:
 			}
 #endif
 			const auto host_mode =
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
 			    (region.type == MappingType::Jit ? GetJitHostMode(mode) : mode);
+#else
+			    mode;
+#endif
 			if (region.type == MappingType::Jit && host_mode == VirtualMemory::Mode::NoAccess) {
 				// Keep MAP_JIT decommit transitions compatible with Apple Silicon's W^X rules.
 				if (!VirtualMemory::Protect(range_start, range_end - range_start,
