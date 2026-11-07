@@ -784,6 +784,20 @@ public:
 #endif
 	}
 
+	[[nodiscard]] bool OverlapsJitRange(uint64_t vaddr, uint64_t size) const {
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+		if (size == 0 || size > UINT64_MAX - vaddr) {
+			return false;
+		}
+		return vaddr < HOST_JIT_ARENA_BASE + HOST_JIT_ARENA_SIZE &&
+		       HOST_JIT_ARENA_BASE < vaddr + size;
+#else
+		(void)vaddr;
+		(void)size;
+		return false;
+#endif
+	}
+
 	bool ContainsFree(uint64_t vaddr, uint64_t size) {
 		std::shared_lock lock(m_mutex);
 		auto contains = [vaddr, size](const auto& ranges) {
