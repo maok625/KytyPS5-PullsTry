@@ -211,8 +211,19 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 				reject(fmt::format("{} is not supported", name));
 			}
 		};
+		const auto warn_feature = [&](const char* name) {
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "WARNING: {} is not supported by {}. Continuing with reduced Vulkan functionality.\n",
+			    name, device_properties.deviceName.data()));
+		};
 
+#if defined(__APPLE__)
+		if (min_lod.minLod != VK_TRUE) {
+			warn_feature("image view minLod");
+		}
+#else
 		check_feature(min_lod.minLod, "image view minLod");
+#endif
 
 		check_feature(clip_control.depthClipControl, "depthClipControl");
 #if defined(__APPLE__)
@@ -234,7 +245,13 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		check_feature(features12.shaderOutputLayer, "shaderOutputLayer");
 		check_feature(features12.shaderOutputViewportIndex, "shaderOutputViewportIndex");
 		check_feature(features12.bufferDeviceAddress, "bufferDeviceAddress");
+#if defined(__APPLE__)
+		if (features12.shaderBufferInt64Atomics != VK_TRUE) {
+			warn_feature("shaderBufferInt64Atomics");
+		}
+#else
 		check_feature(features12.shaderBufferInt64Atomics, "shaderBufferInt64Atomics");
+#endif
 		check_feature(features12.shaderSampledImageArrayNonUniformIndexing,
 		              "shaderSampledImageArrayNonUniformIndexing");
 		check_feature(features12.shaderStorageImageArrayNonUniformIndexing,
@@ -248,13 +265,25 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		check_feature(features12.descriptorBindingPartiallyBound,
 		              "descriptorBindingPartiallyBound");
 		check_feature(features13.robustImageAccess, "robustImageAccess");
+#if defined(__APPLE__)
+		if (robustness2.nullDescriptor != VK_TRUE) {
+			warn_feature("nullDescriptor (null guest-resource descriptors may remain limited)");
+		}
+#else
 		check_feature(robustness2.nullDescriptor, "nullDescriptor");
+#endif
 		check_feature(features13.dynamicRendering, "dynamicRendering");
 		check_feature(features13.synchronization2, "synchronization2");
 		check_feature(device_features2.features.sampleRateShading, "sampleRateShading");
 		check_feature(device_features2.features.depthBiasClamp, "depthBiasClamp");
 		check_feature(device_features2.features.shaderClipDistance, "shaderClipDistance");
+#if defined(__APPLE__)
+		if (device_features2.features.shaderCullDistance != VK_TRUE) {
+			warn_feature("shaderCullDistance");
+		}
+#else
 		check_feature(device_features2.features.shaderCullDistance, "shaderCullDistance");
+#endif
 		check_feature(device_features2.features.largePoints, "largePoints");
 		check_feature(device_features2.features.multiViewport, "multiViewport");
 		check_feature(device_features2.features.fillModeNonSolid, "fillModeNonSolid");
@@ -293,6 +322,13 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 
 			for (const char* ext: device_extensions) {
 				if (!HasExtension(available_extensions, ext)) {
+#if defined(__APPLE__)
+					// Missing minLod is handled by remapping the image-view base mip.
+					if (std::strcmp(ext, VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME) == 0) {
+						warn_feature(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
+						continue;
+					}
+#endif
 					reject(fmt::format("{} is not supported", ext));
 				}
 			}
@@ -438,6 +474,26 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	}
 	Vr::OpenXrAppendExtensions(device_extensions, available_extensions, true);
 	physical_device.getFeatures2(&supported2);
+
+	// VK_EXT_image_view_min_lod is optional on Apple. Query it only when the
+	// extension exists; otherwise imageView.cpp remaps whole mip levels.
+	vk::PhysicalDeviceImageViewMinLodFeaturesEXT min_lod {};
+	const bool min_lod_extension_available =
+	    HasExtension(available_extensions, VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
+	if (min_lod_extension_available) {
+		vk::PhysicalDeviceFeatures2 min_lod_query {.pNext = &min_lod};
+		physical_device.getFeatures2(&min_lod_query);
+	}
+	graphics.supports_image_view_min_lod =
+	    min_lod_extension_available && min_lod.minLod == VK_TRUE;
+	graphics.has_view_min_lod = graphics.supports_image_view_min_lod;
+	graphics.min_lod_remap    = !graphics.has_view_min_lod;
+	if (!graphics.supports_image_view_min_lod) {
+		std::erase_if(device_extensions, [](const char* ext) {
+			return std::strcmp(ext, VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME) == 0;
+		});
+	}
+
 	const bool barycentric_supported = barycentric.fragmentShaderBarycentric == VK_TRUE;
 	if (!barycentric_supported) {
 		Log::WriteToConsoleAndLog(
@@ -450,6 +506,13 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	auto features12                     = WindowContext::RequiredVulkan12Features();
 	features12.shaderSharedInt64Atomics = supported12.shaderSharedInt64Atomics;
 	features12.samplerFilterMinmax      = supported12.samplerFilterMinmax;
+#if defined(__APPLE__)
+	// Never request a feature the Apple Vulkan implementation does not expose.
+	features12.shaderBufferInt64Atomics = supported12.shaderBufferInt64Atomics;
+#endif
+	graphics.shader_buffer_int64_atomics_enabled =
+	    features12.shaderBufferInt64Atomics == VK_TRUE;
+	graphics.null_descriptor_enabled = robustness2.nullDescriptor == VK_TRUE;
 	if (!features12.shaderSharedInt64Atomics || !workgroup_layout.workgroupMemoryExplicitLayout) {
 		Log::WriteToConsoleAndLog(fmt::format(
 		    "WARNING: Native 64-bit LDS atomics are unavailable: shaderSharedInt64Atomics={}, "
@@ -544,7 +607,13 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	device_features.sampleRateShading                    = VK_TRUE;
 	device_features.depthBiasClamp                       = VK_TRUE;
 	device_features.shaderClipDistance                   = VK_TRUE;
-	device_features.shaderCullDistance                   = VK_TRUE;
+#if defined(__APPLE__)
+	// Do not request shaderCullDistance when the host driver reports it unsupported.
+	device_features.shaderCullDistance = supported2.features.shaderCullDistance;
+#else
+	device_features.shaderCullDistance = VK_TRUE;
+#endif
+	graphics.shader_cull_distance_enabled = device_features.shaderCullDistance == VK_TRUE;
 	device_features.largePoints                          = VK_TRUE;
 	device_features.multiViewport                        = VK_TRUE;
 	device_features.fillModeNonSolid                      = VK_TRUE;
@@ -606,6 +675,9 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	    vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT {.extendedDynamicState = VK_TRUE}};
 	if (!workgroup_layout.workgroupMemoryExplicitLayout) {
 		create.unlink<vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR>();
+	}
+	if (!graphics.supports_image_view_min_lod) {
+		create.unlink<vk::PhysicalDeviceImageViewMinLodFeaturesEXT>();
 	}
 #if defined(__APPLE__)
 	// MoltenVK lacks these extensions (see CreateVulkan).
