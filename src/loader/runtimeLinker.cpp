@@ -744,10 +744,17 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		            info->rax, info->rbx, info->rcx, info->rdx, info->rsi, info->rdi, info->rbp,
 		            info->rsp, info->r8, info->r9, info->r10, info->r11, info->r12, info->r13,
 		            info->r14, info->r15);
-		if (IsReadableRange(info->exception_address - 48, 96)) {
-			const auto* code = reinterpret_cast<const uint8_t*>(info->exception_address - 48);
-			std::printf("code (pc-48 .. pc+48, fault at byte 48):");
-			for (int i = 0; i < 96; i++) {
+		// The faulting PC can be close to the beginning of a mapping. Do not
+		// require bytes before it: probing pc-48 can cross into an unmapped region
+		// and suppress the entire instruction dump.
+		uint64_t code_size = 128;
+		while (code_size != 0 && !IsReadableRange(info->exception_address, code_size)) {
+			code_size /= 2;
+		}
+		if (code_size != 0) {
+			const auto* code = reinterpret_cast<const uint8_t*>(info->exception_address);
+			std::printf("code at pc (length=%" PRIu64 "):", code_size);
+			for (uint64_t i = 0; i < code_size; i++) {
 				std::printf("%s%02x", (i % 16 == 0) ? "\n " : " ", code[i]);
 			}
 			std::printf("\n");
@@ -1603,11 +1610,72 @@ int RuntimeLinker::StartModule(Program* program, size_t args, const void* argp,
 
 	EXIT_IF(std::find(m_programs.begin(), m_programs.end(), program) == m_programs.end());
 
+	const auto init_address = program->dynamic_info->init_vaddr + program->base_vaddr;
 	LOGF_COLOR(Log::Color::BrightYellow, "---\n--- Start module: %s\n---\n",
 	           Common::PathToString(program->file_name).c_str());
+	LOGF("module init address = 0x%016" PRIx64 " (offset=0x%016" PRIx64
+	     "), image=[0x%016" PRIx64 ",0x%016" PRIx64 "), shared=%d\n",
+	     init_address, program->dynamic_info->init_vaddr, program->base_vaddr,
+	     program->base_vaddr + program->mapped_size, program->elf->IsShared() ? 1 : 0);
+	LOGF("module init call: args=%zu argp=0x%016" PRIx64 " func=0x%016" PRIx64
+	     ", TLS image=0x%016" PRIx64 " init_size=0x%016" PRIx64
+	     " image_size=0x%016" PRIx64 " tcb_offset=0x%016" PRIx64
+	     " handler=0x%016" PRIx64 "\n",
+	     args, reinterpret_cast<uint64_t>(argp), reinterpret_cast<uint64_t>(func),
+	     program->tls.image_vaddr, program->tls.init_size, program->tls.image_size,
+	     program->tls.tcb_offset, program->tls.handler_vaddr);
 
-	return reinterpret_cast<module_ini_fini_func_t>(program->dynamic_info->init_vaddr +
-	                                                program->base_vaddr)(args, argp, func);
+	// Dump the relocated initializer/finalizer arrays before entering guest code.
+	// This is diagnostic only: it does not call or modify any array entry.
+	auto dump_module_array = [program](const char* name, uint64_t vaddr, uint64_t size) {
+		if (vaddr == 0 || size == 0) {
+			LOGF("module %s: absent\n", name);
+			return;
+		}
+		if (vaddr > UINT64_MAX - program->base_vaddr) {
+			LOGF("module %s: invalid address overflow (vaddr=0x%016" PRIx64 ")\n", name, vaddr);
+			return;
+		}
+		const auto address = program->base_vaddr + vaddr;
+		const auto count = size / sizeof(uint64_t);
+		const auto shown = std::min<uint64_t>(count, 32);
+		LOGF("module %s: address=0x%016" PRIx64 " size=0x%016" PRIx64
+		     " entries=%" PRIu64 " (showing=%" PRIu64 ")\n",
+		     name, address, size, count, shown);
+		if ((size % sizeof(uint64_t)) != 0 || shown == 0 ||
+		    !IsReadableRange(address, shown * sizeof(uint64_t))) {
+			LOGF("module %s: entries are not safely readable\n", name);
+			return;
+		}
+		const auto* entries = reinterpret_cast<const uint64_t*>(address);
+		for (uint64_t i = 0; i < shown; i++) {
+			const auto target = entries[i];
+			LOGF("module %s[%" PRIu64 "]: slot=0x%016" PRIx64 " target=0x%016" PRIx64,
+			     name, i, address + i * sizeof(uint64_t), target);
+			if (target != 0 && target != UINT64_MAX && IsReadableRange(target, 16)) {
+				const auto* bytes = reinterpret_cast<const uint8_t*>(target);
+				LOGF(" bytes=%02x %02x %02x %02x %02x %02x %02x %02x"
+				     " %02x %02x %02x %02x %02x %02x %02x %02x",
+				     static_cast<unsigned>(bytes[0]), static_cast<unsigned>(bytes[1]),
+				     static_cast<unsigned>(bytes[2]), static_cast<unsigned>(bytes[3]),
+				     static_cast<unsigned>(bytes[4]), static_cast<unsigned>(bytes[5]),
+				     static_cast<unsigned>(bytes[6]), static_cast<unsigned>(bytes[7]),
+				     static_cast<unsigned>(bytes[8]), static_cast<unsigned>(bytes[9]),
+				     static_cast<unsigned>(bytes[10]), static_cast<unsigned>(bytes[11]),
+				     static_cast<unsigned>(bytes[12]), static_cast<unsigned>(bytes[13]),
+				     static_cast<unsigned>(bytes[14]), static_cast<unsigned>(bytes[15]));
+			}
+			LOGF("\n");
+		}
+	};
+	dump_module_array("preinit_array", program->dynamic_info->preinit_array_vaddr,
+	                 program->dynamic_info->preinit_array_size);
+	dump_module_array("init_array", program->dynamic_info->init_array_vaddr,
+	                 program->dynamic_info->init_array_size);
+	dump_module_array("fini_array", program->dynamic_info->fini_array_vaddr,
+	                 program->dynamic_info->fini_array_size);
+
+	return reinterpret_cast<module_ini_fini_func_t>(init_address)(args, argp, func);
 }
 
 int RuntimeLinker::StopModule(Program* program, size_t args, const void* argp, module_func_t func) {

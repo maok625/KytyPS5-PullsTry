@@ -3214,12 +3214,20 @@ static uint64_t AllocateGuestRuntimeMemory(uint64_t search_addr, uint64_t size,
 		}
 		vaddr = search_addr;
 	} else if (executable_allocation) {
-		auto current = std::max(search_addr, HOST_JIT_ARENA_ALLOC_BASE);
-		while (current < HOST_JIT_ARENA_BASE + (1ull << 34u) &&
-		       mapped_size <= HOST_JIT_ARENA_BASE + (1ull << 34u) - current) {
+		// The requested base is a preference for relocatable program memory. Search
+		// from that hint first, then wrap around to the start of the selected MAP_JIT
+		// arena if no range remains above it.
+		auto current = search_addr;
+		bool searched_from_arena_start = (search_addr == 0);
+		while (true) {
 			const auto candidate = g_guest_address_space->FindFreeJitAligned(
-			    current, HOST_JIT_ARENA_BASE + (1ull << 34u), mapped_size, GuestPageSize);
+			    current, UINT64_MAX, mapped_size, GuestPageSize);
 			if (candidate == 0) {
+				if (!searched_from_arena_start) {
+					current = 0;
+					searched_from_arena_start = true;
+					continue;
+				}
 				break;
 			}
 			VirtualRanges::Range overlap {};
@@ -3227,7 +3235,11 @@ static uint64_t AllocateGuestRuntimeMemory(uint64_t search_addr, uint64_t size,
 				vaddr = candidate;
 				break;
 			}
-			current = overlap.start + overlap.size;
+			const auto next = overlap.start + overlap.size;
+			if (next <= candidate) {
+				break;
+			}
+			current = next;
 		}
 	} else {
 		vaddr = FindGuestFreeRange(search_addr, mapped_size, GuestPageSize);
