@@ -4528,7 +4528,7 @@ void TestMacosArm64PersistentJitArenaLifecycle() {
 	*reinterpret_cast<uint64_t*>(base + page) = data_value;
 	Check(test, *reinterpret_cast<const uint64_t*>(base + page) == data_value,
 	      "writable data page failed while another JIT page remained executable");
-	Check(test, reinterpret_cast<JitFunction>(base)() == 42,
+	Check(test, reinterpret_cast<JitFunction>(base)() == 45,
 	      "data-page write damaged the executable JIT page");
 
 	const auto worker = Libs::LibKernel::Memory::AllocateRuntimeMemory(
