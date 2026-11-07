@@ -3192,12 +3192,28 @@ static uint64_t AllocateGuestRuntimeMemory(uint64_t search_addr, uint64_t size,
 	const auto mapped_size = (size + GuestPageSize - 1u) & ~(GuestPageSize - 1u);
 #if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
 	const bool executable_allocation = VirtualMemory::IsExecute(mode);
-	const auto vaddr =
-	    fixed ? search_addr
-	          : (executable_allocation
-	                   ? g_guest_address_space->FindFreeJitAligned(
-	                         search_addr, HOST_USER_MAX + 1u, mapped_size, GuestPageSize)
-	                   : FindGuestFreeRange(search_addr, mapped_size, GuestPageSize));
+	uint64_t   vaddr = 0;
+	if (fixed) {
+		vaddr = search_addr;
+	} else if (executable_allocation) {
+		auto current = std::max(search_addr, HOST_JIT_ARENA_ALLOC_BASE);
+		while (current < HOST_JIT_ARENA_BASE + (1ull << 34u) &&
+		       mapped_size <= HOST_JIT_ARENA_BASE + (1ull << 34u) - current) {
+			const auto candidate = g_guest_address_space->FindFreeJitAligned(
+			    current, HOST_JIT_ARENA_BASE + (1ull << 34u), mapped_size, GuestPageSize);
+			if (candidate == 0) {
+				break;
+			}
+			VirtualRanges::Range overlap {};
+			if (!g_virtual_ranges->QueryOverlap(candidate, mapped_size, &overlap)) {
+				vaddr = candidate;
+				break;
+			}
+			current = overlap.start + overlap.size;
+		}
+	} else {
+		vaddr = FindGuestFreeRange(search_addr, mapped_size, GuestPageSize);
+	}
 	if (executable_allocation && !g_guest_address_space->IsJitRange(vaddr, mapped_size)) {
 		Log::WriteToConsoleAndLog(fmt::sprintf(
 		    "guest executable allocation failed: no JIT arena range; name=%s hint=0x%016" PRIx64
