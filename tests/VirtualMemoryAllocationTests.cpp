@@ -4456,6 +4456,10 @@ void TestMacosArm64PersistentJitArenaLifecycle() {
 
 	using JitFunction = uint32_t (*)();
 	write_arm64_return(base, 42);
+	Check(test,
+	      Libs::LibKernel::Memory::ProtectGuestMemory(
+	          base, page, Common::VirtualMemory::Mode::ExecuteRead),
+	      "failed to finalize the generated code page as RX");
 	Check(test, reinterpret_cast<JitFunction>(base)() == 42,
 	      "generated function in the JIT arena returned the wrong value");
 
@@ -4481,6 +4485,10 @@ void TestMacosArm64PersistentJitArenaLifecycle() {
 	std::thread worker_thread([&] {
 		try {
 			write_arm64_return(worker, 43);
+			if (!Libs::LibKernel::Memory::ProtectGuestMemory(
+			        worker, worker_size, Common::VirtualMemory::Mode::ExecuteRead)) {
+				throw TestFailure {};
+			}
 			worker_result.store(reinterpret_cast<JitFunction>(worker)(), std::memory_order_release);
 			worker_completed.store(true, std::memory_order_release);
 		} catch (const TestFailure&) {
