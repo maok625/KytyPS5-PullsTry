@@ -9,7 +9,12 @@
 
 namespace Libs::Graphics {
 
+// macOS protection and guest mappings use a 16 KiB granularity on Apple Silicon.
+#if defined(__APPLE__)
+constexpr uint64_t TRACKER_PAGE_SIZE    = 16ull * 1024ull;
+#else
 constexpr uint64_t TRACKER_PAGE_SIZE    = 4ull * 1024ull;
+#endif
 constexpr uint64_t TRACKER_REGION_SIZE  = 4ull * 1024ull * 1024ull;
 constexpr uint64_t TRACKER_ADDRESS_SIZE = 1ull << 44u;
 constexpr uint64_t LOWER_ADDRESS_SIZE   = 1ull << 40u;
