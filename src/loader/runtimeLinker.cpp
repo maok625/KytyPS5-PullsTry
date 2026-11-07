@@ -1656,8 +1656,14 @@ int RuntimeLinker::StartModule(Program* program, size_t args, const void* argp,
 				const auto* bytes = reinterpret_cast<const uint8_t*>(target);
 				LOGF(" bytes=%02x %02x %02x %02x %02x %02x %02x %02x"
 				     " %02x %02x %02x %02x %02x %02x %02x %02x",
-				     bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-				     bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]);
+				     static_cast<unsigned>(bytes[0]), static_cast<unsigned>(bytes[1]),
+				     static_cast<unsigned>(bytes[2]), static_cast<unsigned>(bytes[3]),
+				     static_cast<unsigned>(bytes[4]), static_cast<unsigned>(bytes[5]),
+				     static_cast<unsigned>(bytes[6]), static_cast<unsigned>(bytes[7]),
+				     static_cast<unsigned>(bytes[8]), static_cast<unsigned>(bytes[9]),
+				     static_cast<unsigned>(bytes[10]), static_cast<unsigned>(bytes[11]),
+				     static_cast<unsigned>(bytes[12]), static_cast<unsigned>(bytes[13]),
+				     static_cast<unsigned>(bytes[14]), static_cast<unsigned>(bytes[15]));
 			}
 			LOGF("\n");
 		}
