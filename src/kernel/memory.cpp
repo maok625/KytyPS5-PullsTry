@@ -3304,8 +3304,8 @@ void SetProgramMemoryProtection(uint64_t vaddr, uint64_t size, VirtualMemory::Mo
 
 	const auto host_mode =
 #if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
-	    (g_guest_address_space->IsJitRange(vaddr, size) && VirtualMemory::IsExecute(mode))
-	        ? VirtualMemory::Mode::ExecuteRead
+	    g_guest_address_space->IsJitRange(vaddr, size)
+	        ? mode
 	        :
 #endif
 	            (VirtualMemory::IsExecute(mode) ? VirtualMemory::Mode::ExecuteReadWrite
@@ -3347,10 +3347,9 @@ bool ProtectGuestMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode,
 	}
 #if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
 	const auto host_mode =
-	    (g_guest_address_space->IsJitRange(aligned_addr, aligned_size) &&
-	     VirtualMemory::IsExecute(mode))
-	        ? VirtualMemory::Mode::ExecuteRead
-	        : mode;
+	    (g_guest_address_space->IsJitRange(aligned_addr, aligned_size)
+	         ? mode
+	         : (VirtualMemory::IsExecute(mode) ? VirtualMemory::Mode::ExecuteReadWrite : mode));
 #else
 	const auto host_mode = mode;
 #endif
