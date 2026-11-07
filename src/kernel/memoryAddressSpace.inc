@@ -690,6 +690,14 @@ public:
 	                VirtualMemory::Mode               mode,
 	                GuestBackingStore::FailureReason* failure_reason = nullptr) {
 		std::lock_guard lock(m_mutex);
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+		if (IsJitRange(vaddr, size)) {
+			if (failure_reason != nullptr) {
+				*failure_reason = GuestBackingStore::FailureReason::AddressRangeUnavailable;
+			}
+			return false;
+		}
+#endif
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 		const bool replacing = ContainsMappedUnlocked(vaddr, size, MappingType::Backing);
 #else
@@ -873,24 +881,38 @@ public:
 #else
 		if (is_jit) {
 			for (const auto& [region_vaddr, region_size]: regions) {
-				// Anonymous MAP_JIT pages are demand-zero on first use. Clear them before
-				// MADV_FREE so an unreclaimed page is also safe to hand to the next guest owner.
-				EXIT_IF(!VirtualMemory::Protect(region_vaddr, region_size,
-				                                VirtualMemory::Mode::ReadWrite));
-				{
-					VirtualMemory::JitWriteScope write_scope;
-					std::memset(reinterpret_cast<void*>(region_vaddr), 0, region_size);
-				}
 				// macOS rejects a direct RWX/RW -> PROT_NONE transition on MAP_JIT.
 				// Passing through RX is required before making the pages inaccessible.
 				EXIT_IF(!VirtualMemory::Protect(region_vaddr, region_size,
 				                                VirtualMemory::Mode::ExecuteRead));
 				EXIT_IF(!VirtualMemory::Protect(region_vaddr, region_size,
 				                                VirtualMemory::Mode::NoAccess));
-#ifdef MADV_FREE
-				// MADV_FREE is advisory; cleared contents remain zero if the kernel keeps them.
-				(void)madvise(reinterpret_cast<void*>(region_vaddr), region_size, MADV_FREE);
+
+				bool zeroed_without_faulting = false;
+#ifdef MADV_ZERO
+				// Newer XNU can discard and zero anonymous pages without touching every page
+				// from this process. This keeps large guest deallocations lazy and memory-safe.
+				zeroed_without_faulting =
+				    madvise(reinterpret_cast<void*>(region_vaddr), region_size, MADV_ZERO) == 0;
 #endif
+				if (!zeroed_without_faulting) {
+					// Older kernels or unsupported MAP_JIT ranges fall back to explicit clearing.
+					// This is slower and faults pages in, but guarantees zero-on-reuse.
+					EXIT_IF(!VirtualMemory::Protect(region_vaddr, region_size,
+					                                VirtualMemory::Mode::ReadWrite));
+					{
+						VirtualMemory::JitWriteScope write_scope;
+						std::memset(reinterpret_cast<void*>(region_vaddr), 0, region_size);
+					}
+					EXIT_IF(!VirtualMemory::Protect(region_vaddr, region_size,
+					                                VirtualMemory::Mode::ExecuteRead));
+					EXIT_IF(!VirtualMemory::Protect(region_vaddr, region_size,
+					                                VirtualMemory::Mode::NoAccess));
+#ifdef MADV_FREE
+					// The fallback contents are now zero, so they may be reclaimed lazily.
+					(void)madvise(reinterpret_cast<void*>(region_vaddr), region_size, MADV_FREE);
+#endif
+				}
 			}
 		} else {
 			for (const auto& [region_vaddr, region_size]: regions) {
