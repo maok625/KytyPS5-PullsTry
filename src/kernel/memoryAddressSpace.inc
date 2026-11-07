@@ -1141,14 +1141,16 @@ private:
 
 				void* ptr = mmap(reinterpret_cast<void*>(chunk_start), chunk_size, PROT_NONE, flags, -1, 0);
 				if (ptr == MAP_FAILED || reinterpret_cast<uint64_t>(ptr) != chunk_start) {
-					const int map_error = errno;
+					const int map_error = ptr == MAP_FAILED ? errno : 0;
+					const auto returned_address =
+					    ptr == MAP_FAILED ? uint64_t {0} : reinterpret_cast<uint64_t>(ptr);
 					if (ptr != MAP_FAILED) {
 						munmap(ptr, chunk_size);
 					}
 					LOGF_COLOR(Log::Color::Yellow,
-					           "guest address-space reservation skipped: addr=0x%016" PRIx64
-					           " size=0x%016" PRIx64 " errno=%d\\n",
-					           chunk_start, chunk_size, map_error);
+					           "guest address-space reservation skipped: requested=0x%016" PRIx64
+					           " returned=0x%016" PRIx64 " size=0x%016" PRIx64 " errno=%d\\n",
+					           chunk_start, returned_address, chunk_size, map_error);
 					chunk_start = chunk_end;
 					continue;
 				}
