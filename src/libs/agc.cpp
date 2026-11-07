@@ -4085,7 +4085,7 @@ int Initialize() {
 	}
 	if (address == nullptr) {
 		EXIT_IF(LibKernel::Memory::KernelCheckedReleaseDirectMemory(physical_offset, DriverDmemSize) != OK);
-		return KERNEL_ERROR_ENOMEM;
+		return LibKernel::KERNEL_ERROR_ENOMEM;
 	}
 	const auto mapped_base = reinterpret_cast<uint64_t>(address);
 	LOGF("AGC driver DMEM: requested=0x%016" PRIx64 " mapped=0x%016" PRIx64
