@@ -3190,8 +3190,25 @@ static uint64_t AllocateGuestRuntimeMemory(uint64_t search_addr, uint64_t size,
 		return 0;
 	}
 	const auto mapped_size = (size + GuestPageSize - 1u) & ~(GuestPageSize - 1u);
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+	const bool executable_allocation = VirtualMemory::IsExecute(mode);
+	const auto vaddr =
+	    fixed ? search_addr
+	          : (executable_allocation
+	                   ? g_guest_address_space->FindFreeJitAligned(
+	                         search_addr, HOST_USER_MAX + 1u, mapped_size, GuestPageSize)
+	                   : FindGuestFreeRange(search_addr, mapped_size, GuestPageSize));
+	if (executable_allocation && !g_guest_address_space->IsJitRange(vaddr, mapped_size)) {
+		Log::WriteToConsoleAndLog(fmt::sprintf(
+		    "guest executable allocation failed: no JIT arena range; name=%s hint=0x%016" PRIx64
+		    " size=0x%016" PRIx64 " fixed=%d\n",
+		    name, search_addr, mapped_size, fixed ? 1 : 0));
+		return 0;
+	}
+#else
 	const auto vaddr =
 	    fixed ? search_addr : FindGuestFreeRange(search_addr, mapped_size, GuestPageSize);
+#endif
 	if (vaddr == 0) {
 		Log::WriteToConsoleAndLog(fmt::sprintf("guest runtime allocation failed: no free range; name=%s hint=0x%016" PRIx64
 		           " requested=0x%016" PRIx64 " mapped=0x%016" PRIx64
