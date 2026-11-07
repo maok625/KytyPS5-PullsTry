@@ -4433,6 +4433,17 @@ void TestMacosArm64PersistentJitArenaLifecycle() {
 	constexpr uint64_t program_size = page * 2;
 	constexpr uint64_t worker_size = page;
 
+	constexpr uint64_t fixed_reservation_probe = arena_base + 0x1000000;
+	void*               reserved_jit_page =
+	    reinterpret_cast<void*>(fixed_reservation_probe);
+	CheckFailed(test,
+	            Libs::LibKernel::Memory::KernelReserveVirtualRange(
+	                &reserved_jit_page, page, SceKernelMapFixed, page),
+	            "fixed ordinary reservation inside MAP_JIT arena");
+	Check(test, Libs::LibKernel::Memory::IsJitGuestMemory(fixed_reservation_probe, page) &&
+	                Libs::LibKernel::Memory::TestPlaceholderRangeIsFree(fixed_reservation_probe, page),
+	      "failed fixed reservation altered JIT arena ownership");
+
 	const auto ordinary = Libs::LibKernel::Memory::AllocateRuntimeMemory(
 	    0, page, Common::VirtualMemory::Mode::ReadWrite, "macos_jit_ordinary");
 	Check(test, ordinary != 0 &&
