@@ -2226,6 +2226,11 @@ void RuntimeLinker::SetupTlsHandler(Program* program) {
 	EXIT_IF(program->elf->IsShared());
 	EXIT_IF(program->tls.handler_vaddr == 0);
 
+	Common::VirtualMemory::Mode old_mode = Common::VirtualMemory::Mode::NoAccess;
+	EXIT_IF(!Libs::LibKernel::Memory::ProtectGuestMemory(
+	    program->tls.handler_vaddr, Jit::SafeCall::GetSize(),
+	    Common::VirtualMemory::Mode::ReadWrite, &old_mode));
+
 	g_tls_main_program = program;
 
 	{
@@ -2246,11 +2251,10 @@ void RuntimeLinker::SetupTlsHandler(Program* program) {
 		}
 	}
 
-	EXIT_IF(!Libs::LibKernel::Memory::ProtectGuestMemory(program->tls.handler_vaddr,
-	                                                     Jit::SafeCall::GetSize(),
-	                                                     Common::VirtualMemory::Mode::Execute));
 	Common::VirtualMemory::FlushInstructionCache(program->tls.handler_vaddr,
 	                                             Jit::SafeCall::GetSize());
+	EXIT_IF(!Libs::LibKernel::Memory::ProtectGuestMemory(
+	    program->tls.handler_vaddr, Jit::SafeCall::GetSize(), old_mode));
 }
 
 void RuntimeLinker::DeleteTlss(int thread_id) {
