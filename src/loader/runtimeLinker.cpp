@@ -126,6 +126,7 @@ static constexpr uint64_t               UNRESOLVED_STUB_PAGE_SIZE      = 4096;
 static KYTY_SYSV_ABI uint64_t UnresolvedImportStub(uint64_t record_id);
 
 static bool PatchGuestMemory64(uint64_t vaddr, uint64_t value) {
+	Common::VirtualMemory::JitWriteScope write_scope;
 	auto* ptr     = reinterpret_cast<uint64_t*>(vaddr);
 	bool  changed = (*ptr != value);
 	std::memcpy(ptr, &value, sizeof(value));
@@ -161,7 +162,10 @@ static uint64_t AllocateUnresolvedImportThunk(uint64_t record_id) {
 	const auto target = reinterpret_cast<uint64_t>(UnresolvedImportStub);
 	std::memcpy(bytes + 6, &record_id, sizeof(record_id));
 	std::memcpy(bytes + 16, &target, sizeof(target));
-	std::memcpy(code, bytes, sizeof(bytes));
+	{
+		Common::VirtualMemory::JitWriteScope write_scope;
+		std::memcpy(code, bytes, sizeof(bytes));
+	}
 	Common::VirtualMemory::FlushInstructionCache(reinterpret_cast<uint64_t>(code), thunk_size);
 	return reinterpret_cast<uint64_t>(code);
 }
@@ -214,8 +218,13 @@ constexpr uint64_t CODE_BASE_INCR   = 0x010000000u;
 constexpr uint64_t INVALID_OFFSET   = 0x040000000u;
 constexpr uint64_t CODE_BASE_OFFSET = 0x100000000u;
 constexpr uint64_t INVALID_MEMORY   = SYSTEM_RESERVED + INVALID_OFFSET;
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+constexpr uint64_t CODE_BASE_BEGIN = 0x7000200000ull;
+#else
+constexpr uint64_t CODE_BASE_BEGIN = SYSTEM_RESERVED + CODE_BASE_OFFSET;
+#endif
 
-static uint64_t g_desired_base_addr = SYSTEM_RESERVED + CODE_BASE_OFFSET;
+static uint64_t g_desired_base_addr = CODE_BASE_BEGIN;
 static uint64_t g_invalid_memory    = 0;
 
 static Program*              g_tls_main_program        = nullptr;
@@ -563,7 +572,7 @@ static bool IsReadableRange(uint64_t addr, uint64_t size);
 
 static int WalkGuestStack(uint64_t rbp, uint64_t rsp, void** stack, int capacity) {
 	constexpr uintptr_t STACK_SIZE = 1024u * 1024u;
-	const uintptr_t     code_start = SYSTEM_RESERVED + CODE_BASE_OFFSET;
+	const uintptr_t     code_start = CODE_BASE_BEGIN;
 	const uintptr_t     stack_end  = rsp + STACK_SIZE;
 	if (stack == nullptr || capacity <= 0 || rsp == 0 || rbp < rsp || stack_end < rsp ||
 	    g_desired_base_addr <= code_start) {
@@ -951,6 +960,7 @@ static KYTY_MS_ABI uint8_t* TlsMainGetAddr() {
 }
 
 static void PatchProgram(Program* program, uint64_t address, uint64_t size) {
+	Common::VirtualMemory::JitWriteScope write_scope;
 	EXIT_IF(program == nullptr);
 	EXIT_IF(program->elf == nullptr);
 
@@ -1337,7 +1347,7 @@ void RuntimeLinker::Clear() {
 	g_tls_main_program        = nullptr;
 	g_tls_cached_main_program = nullptr;
 	g_tls_cached_main_tcb     = nullptr;
-	g_desired_base_addr       = SYSTEM_RESERVED + CODE_BASE_OFFSET;
+	g_desired_base_addr       = CODE_BASE_BEGIN;
 	m_symbols.reset();
 }
 
@@ -2175,6 +2185,7 @@ void RuntimeLinker::CreateSymbolDatabase(Program* program) {
 }
 
 void RuntimeLinker::SetupTlsHandler(Program* program) {
+	Common::VirtualMemory::JitWriteScope write_scope;
 	EXIT_IF(program == nullptr);
 	EXIT_IF(g_tls_main_program != nullptr);
 	EXIT_IF(program->elf == nullptr);
