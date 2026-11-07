@@ -284,6 +284,23 @@ jobs:
           install -d -m 755 "$app_dir/Contents/Frameworks" "$app_dir/Contents/Resources"
           install -m 755 "$moltenvk" "$app_dir/Contents/Frameworks/libMoltenVK.dylib"
           install -m 644 "$package/LICENSE" "$app_dir/Contents/Resources/LICENSE.MoltenVK"
+          # The emulator commits guest code memory as RWX. Sign both the flat CLI
+          # binary and the app-bundled copy with the macOS executable-memory entitlements.
+          entitlements="$GITHUB_WORKSPACE/src/macos_jit.entitlements"
+          for emulator in "$install_dir/kyty_emulator" "$app_dir/Contents/MacOS/kyty_emulator"; do
+            test -x "$emulator"
+            codesign --force --sign - --options runtime \
+              --entitlements "$entitlements" --timestamp=none "$emulator"
+            codesign --verify --strict --verbose=2 "$emulator"
+
+            dumped_entitlements="$RUNNER_TEMP/$(basename "$emulator").entitlements.plist"
+            codesign -d --entitlements :- "$emulator" \
+              > "$dumped_entitlements" 2>/dev/null
+            plutil -extract com.apple.security.cs.allow-unsigned-executable-memory raw \
+              -o - "$dumped_entitlements" | grep -qx true
+            codesign -d --verbose=4 "$emulator" 2>&1 | grep -q 'flags=.*runtime'
+          done
+
           codesign --force --sign - --timestamp=none "$app_dir"
 
       - name: Verify artifacts
