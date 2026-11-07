@@ -15,6 +15,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <cerrno>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
@@ -41,7 +42,6 @@
 #define MEM_COALESCE_PLACEHOLDERS 0x00000001
 #endif
 #elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
-#include <cerrno>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
