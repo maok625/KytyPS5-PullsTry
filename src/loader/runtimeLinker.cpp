@@ -141,6 +141,7 @@ static bool PatchGuestMemory64(uint64_t vaddr, uint64_t value) {
 		changed = (*ptr != value);
 		std::memcpy(ptr, &value, sizeof(value));
 	}
+	Common::VirtualMemory::FlushInstructionCache(vaddr, sizeof(value));
 #if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
 	if (is_jit) {
 		EXIT_IF(!Libs::LibKernel::Memory::ProtectGuestMemory(vaddr, sizeof(value), old_mode));
@@ -2210,7 +2211,6 @@ void RuntimeLinker::CreateSymbolDatabase(Program* program) {
 }
 
 void RuntimeLinker::SetupTlsHandler(Program* program) {
-	Common::VirtualMemory::JitWriteScope write_scope;
 	EXIT_IF(program == nullptr);
 	EXIT_IF(g_tls_main_program != nullptr);
 	EXIT_IF(program->elf == nullptr);
@@ -2219,19 +2219,22 @@ void RuntimeLinker::SetupTlsHandler(Program* program) {
 
 	g_tls_main_program = program;
 
-	auto* code = new (reinterpret_cast<void*>(program->tls.handler_vaddr)) Jit::SafeCall;
+	{
+		Common::VirtualMemory::JitWriteScope write_scope;
+		auto* code = new (reinterpret_cast<void*>(program->tls.handler_vaddr)) Jit::SafeCall;
+		code->SetFunc(TlsMainGetAddr);
 
-	code->SetFunc(TlsMainGetAddr);
+		for (uint8_t reg = 1; reg < 8; reg++) {
+			if (reg == 4) {
+				continue;
+			}
 
-	for (uint8_t reg = 1; reg < 8; reg++) {
-		if (reg == 4) {
-			continue;
+			auto* stub = new (reinterpret_cast<void*>(program->tls.handler_vaddr +
+			                                          Jit::TlsRegStub::GetOffset(reg)))
+			    Jit::TlsRegStub;
+			stub->SetFunc(program->tls.handler_vaddr);
+			stub->SetOutputReg(reg);
 		}
-
-		auto* stub = new (reinterpret_cast<void*>(program->tls.handler_vaddr +
-		                                          Jit::TlsRegStub::GetOffset(reg))) Jit::TlsRegStub;
-		stub->SetFunc(program->tls.handler_vaddr);
-		stub->SetOutputReg(reg);
 	}
 
 	EXIT_IF(!Libs::LibKernel::Memory::ProtectGuestMemory(program->tls.handler_vaddr,
