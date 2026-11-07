@@ -301,7 +301,7 @@ jobs:
               echo "codesign did not return an entitlement plist for $emulator" >&2
               exit 1
             fi
-            /usr/bin/python3 - "$dumped_entitlements" <<'PY'
+            /usr/bin/python3 -c '
             import plistlib
             import sys
 
@@ -316,7 +316,7 @@ jobs:
             if missing:
                 raise SystemExit("Missing executable-memory entitlements: " + ", ".join(missing))
             print("Verified executable-memory entitlements: " + ", ".join(required))
-            PY
+            ' "$dumped_entitlements"
             signature_details="$RUNNER_TEMP/$(basename "$emulator").codesign.txt"
             codesign -d --verbose=4 "$emulator" > /dev/null 2> "$signature_details"
             if ! grep -Eq 'flags=.*runtime' "$signature_details"; then
