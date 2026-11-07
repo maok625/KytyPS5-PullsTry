@@ -17,9 +17,10 @@ static constexpr uint64_t HOST_USER_MIN            = 0x1000000000ull;
 #endif
 static constexpr uint64_t HOST_USER_MAX = 0xfbffffffffull;
 #if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
-static constexpr uint64_t HOST_JIT_ARENA_BASE       = 0x7400000000ull;
-static constexpr uint64_t HOST_JIT_ARENA_SIZE       = 1ull << 34u;
-static constexpr uint64_t HOST_JIT_ARENA_ALLOC_BASE = HOST_JIT_ARENA_BASE + 0x200000ull;
+// Prefer the previous address when it is free, but select the actual arena from a
+// sufficiently large free gap at runtime. Process mappings can occupy any fixed address.
+static constexpr uint64_t HOST_JIT_ARENA_PREFERRED_BASE = 0x7400000000ull;
+static constexpr uint64_t HOST_JIT_ARENA_SIZE           = 1ull << 34u;
 #endif
 
 static bool GuestFreeRangeContains(uint64_t base, uint64_t range_size, uint64_t candidate,
@@ -747,13 +748,16 @@ public:
 	uint64_t FindFreeJitAligned(uint64_t search_start, uint64_t search_end, uint64_t size,
 	                            uint64_t alignment) {
 #if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
-		alignment    = std::max<uint64_t>(alignment, PageSize());
-		search_start = std::max(search_start, HOST_JIT_ARENA_ALLOC_BASE);
-		search_end   = std::min(search_end, HOST_JIT_ARENA_BASE + HOST_JIT_ARENA_SIZE);
+		alignment = std::max<uint64_t>(alignment, PageSize());
+		std::shared_lock lock(m_mutex);
+		if (m_jit_size == 0) {
+			return 0;
+		}
+		search_start = std::max(search_start, m_jit_base + 0x200000ull);
+		search_end   = std::min(search_end, m_jit_base + m_jit_size);
 		if (size == 0 || search_start >= search_end || size > search_end - search_start) {
 			return 0;
 		}
-		std::shared_lock lock(m_mutex);
 		auto it = m_jit_free.upper_bound(search_start);
 		if (it != m_jit_free.begin()) {
 			--it;
@@ -774,9 +778,9 @@ public:
 
 	[[nodiscard]] bool IsJitRange(uint64_t vaddr, uint64_t size) const {
 #if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
-		return size != 0 && vaddr >= HOST_JIT_ARENA_BASE &&
-		       vaddr < HOST_JIT_ARENA_BASE + HOST_JIT_ARENA_SIZE &&
-		       size <= HOST_JIT_ARENA_BASE + HOST_JIT_ARENA_SIZE - vaddr;
+		return m_jit_size != 0 && size != 0 && vaddr >= m_jit_base &&
+		       vaddr < m_jit_base + m_jit_size &&
+		       size <= m_jit_base + m_jit_size - vaddr;
 #else
 		(void)vaddr;
 		(void)size;
@@ -789,8 +793,8 @@ public:
 		if (size == 0 || size > UINT64_MAX - vaddr) {
 			return false;
 		}
-		return vaddr < HOST_JIT_ARENA_BASE + HOST_JIT_ARENA_SIZE &&
-		       HOST_JIT_ARENA_BASE < vaddr + size;
+		return m_jit_size != 0 && vaddr < m_jit_base + m_jit_size &&
+		       m_jit_base < vaddr + size;
 #else
 		(void)vaddr;
 		(void)size;
@@ -1350,59 +1354,57 @@ private:
 			}
 		};
 
-		auto reserve_jit_arena = [this]() {
+		auto reserve_jit_arena = [this](uint64_t gap_start, uint64_t gap_end) {
 			if (m_jit_size != 0) {
 				return true;
 			}
-			// Reserve the exact guest address first, then replace that reservation with the
-			// process's one persistent MAP_JIT mapping. MAP_FIXED cannot be combined with MAP_JIT.
-			void* reservation = mmap(reinterpret_cast<void*>(HOST_JIT_ARENA_BASE),
-			                         HOST_JIT_ARENA_SIZE, PROT_NONE,
-			                         MAP_PRIVATE | MAP_ANON, -1, 0);
-			if (reservation == MAP_FAILED ||
-			    reinterpret_cast<uint64_t>(reservation) != HOST_JIT_ARENA_BASE) {
-				const int map_error = reservation == MAP_FAILED ? errno : 0;
-				if (reservation != MAP_FAILED) {
-					munmap(reservation, HOST_JIT_ARENA_SIZE);
-				}
-				Log::WriteToConsoleAndLog(fmt::sprintf(
-				    "macOS JIT arena reservation failed: addr=0x%016" PRIx64
-				    " size=0x%016" PRIx64 " errno=%d\n",
-				    HOST_JIT_ARENA_BASE, HOST_JIT_ARENA_SIZE, map_error));
+			if (gap_end <= gap_start || gap_end - gap_start < HOST_JIT_ARENA_SIZE) {
 				return false;
 			}
-			if (munmap(reinterpret_cast<void*>(HOST_JIT_ARENA_BASE), HOST_JIT_ARENA_SIZE) != 0) {
-				Log::WriteToConsoleAndLog(fmt::sprintf(
-				    "macOS JIT arena temporary reservation release failed: errno=%d\n", errno));
+
+			const auto latest_base = gap_end - HOST_JIT_ARENA_SIZE;
+			auto       candidate   = gap_start;
+			if (HOST_JIT_ARENA_PREFERRED_BASE >= gap_start &&
+			    HOST_JIT_ARENA_PREFERRED_BASE <= latest_base) {
+				candidate = HOST_JIT_ARENA_PREFERRED_BASE;
+			}
+			candidate = AlignUp(candidate, PageSize());
+			if (candidate > latest_base) {
 				return false;
 			}
-			void* jit = mmap(reinterpret_cast<void*>(HOST_JIT_ARENA_BASE), HOST_JIT_ARENA_SIZE,
-			                 PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
-			if (jit == MAP_FAILED ||
-			    reinterpret_cast<uint64_t>(jit) != HOST_JIT_ARENA_BASE) {
-				const int map_error = jit == MAP_FAILED ? errno : 0;
-				const auto returned_address =
-				    jit == MAP_FAILED ? uint64_t {0} : reinterpret_cast<uint64_t>(jit);
-				if (jit != MAP_FAILED) {
-					munmap(jit, HOST_JIT_ARENA_SIZE);
+
+			// MAP_JIT cannot be combined with MAP_FIXED. Pass an address from the free gap
+			// as a hint, then accept the mapping only if macOS returns that exact address.
+			void* jit = mmap(reinterpret_cast<void*>(candidate), HOST_JIT_ARENA_SIZE, PROT_NONE,
+			                 MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
+			const int map_error = jit == MAP_FAILED ? errno : 0;
+			const auto returned_address =
+			    jit == MAP_FAILED ? uint64_t {0} : reinterpret_cast<uint64_t>(jit);
+			if (jit == MAP_FAILED || returned_address != candidate) {
+				if (jit != MAP_FAILED && munmap(jit, HOST_JIT_ARENA_SIZE) != 0) {
+					EXIT("macOS MAP_JIT arena returned an unexpected address and could not be unmapped"
+					     ": addr=0x%016" PRIx64 " errno=%d\n",
+					     returned_address, errno);
 				}
 				Log::WriteToConsoleAndLog(fmt::sprintf(
-				    "macOS persistent MAP_JIT arena failed: requested=0x%016" PRIx64
+				    "macOS persistent MAP_JIT arena attempt failed: gap=[0x%016" PRIx64
+				    ",0x%016" PRIx64 ") requested=0x%016" PRIx64
 				    " returned=0x%016" PRIx64 " size=0x%016" PRIx64 " errno=%d\n",
-				    HOST_JIT_ARENA_BASE, returned_address, HOST_JIT_ARENA_SIZE, map_error));
+				    gap_start, gap_end, candidate, returned_address, HOST_JIT_ARENA_SIZE,
+				    map_error));
 				return false;
 			}
-			m_jit_base = HOST_JIT_ARENA_BASE;
+
+			m_jit_base = returned_address;
 			m_jit_size = HOST_JIT_ARENA_SIZE;
-			m_jit_free.emplace(HOST_JIT_ARENA_ALLOC_BASE,
-			                   HOST_JIT_ARENA_BASE + HOST_JIT_ARENA_SIZE -
-			                       HOST_JIT_ARENA_ALLOC_BASE);
-			m_owned.emplace_back(HOST_JIT_ARENA_BASE, HOST_JIT_ARENA_SIZE);
+			const auto jit_alloc_base = m_jit_base + 0x200000ull;
+			m_jit_free.emplace(jit_alloc_base,
+			                   m_jit_base + m_jit_size - jit_alloc_base);
+			m_owned.emplace_back(m_jit_base, m_jit_size);
 			Log::WriteToConsoleAndLog(fmt::sprintf(
 			    "macOS persistent MAP_JIT arena: [0x%016" PRIx64 ",0x%016" PRIx64
 			    ") size=0x%016" PRIx64 "\n",
-			    HOST_JIT_ARENA_BASE, HOST_JIT_ARENA_BASE + HOST_JIT_ARENA_SIZE,
-			    HOST_JIT_ARENA_SIZE));
+			    m_jit_base, m_jit_base + m_jit_size, m_jit_size));
 			return true;
 		};
 
@@ -1412,12 +1414,21 @@ private:
 			if (start == 0 || end <= start) {
 				return;
 			}
-			const auto jit_end = HOST_JIT_ARENA_BASE + HOST_JIT_ARENA_SIZE;
-			if (start < HOST_JIT_ARENA_BASE) {
-				reserve_ordinary_range(start, std::min(end, HOST_JIT_ARENA_BASE));
+
+			// The arena may live in any gap large enough to hold it, rather than requiring
+			// one particular hard-coded address to be free.
+			if (m_jit_size == 0 && end - start >= HOST_JIT_ARENA_SIZE) {
+				(void)reserve_jit_arena(start, end);
 			}
-			if (start <= HOST_JIT_ARENA_BASE && end >= jit_end) {
-				EXIT_IF(!reserve_jit_arena());
+
+			if (m_jit_size == 0) {
+				reserve_ordinary_range(start, end);
+				return;
+			}
+
+			const auto jit_end = m_jit_base + m_jit_size;
+			if (start < m_jit_base) {
+				reserve_ordinary_range(start, std::min(end, m_jit_base));
 			}
 			if (end > jit_end) {
 				reserve_ordinary_range(std::max(start, jit_end), end);
@@ -1450,7 +1461,10 @@ private:
 				reserve_range(current, region_end);
 			}
 		}
-		EXIT_IF(m_jit_size != HOST_JIT_ARENA_SIZE);
+		if (m_jit_size != HOST_JIT_ARENA_SIZE) {
+			EXIT("macOS ARM64 could not find a free 16 GiB guest address-space gap for the "
+			     "persistent MAP_JIT arena\n");
+		}
 #else
 		for (size_t i = region_start_idx; i < regions.size(); ++i) {
 			const auto& [start, end] = regions[i];
