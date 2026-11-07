@@ -3184,47 +3184,42 @@ static uint64_t AllocateGuestRuntimeMemory(uint64_t search_addr, uint64_t size,
 	constexpr uint64_t GuestPageSize = 0x4000;
 	if (size == 0 || size > UINT64_MAX - (GuestPageSize - 1u) || name == nullptr ||
 	    (fixed && (search_addr == 0 || (search_addr & (GuestPageSize - 1u)) != 0))) {
-		LOGF_COLOR(Log::Color::Red,
-		           "guest runtime allocation rejected: name=%s hint=0x%016" PRIx64
+		Log::WriteToConsoleAndLog(fmt::sprintf("guest runtime allocation rejected: name=%s hint=0x%016" PRIx64
 		           " size=0x%016" PRIx64 " fixed=%d\n",
-		           name != nullptr ? name : "<null>", search_addr, size, fixed ? 1 : 0);
+		           name != nullptr ? name : "<null>", search_addr, size, fixed ? 1 : 0));
 		return 0;
 	}
 	const auto mapped_size = (size + GuestPageSize - 1u) & ~(GuestPageSize - 1u);
 	const auto vaddr =
 	    fixed ? search_addr : FindGuestFreeRange(search_addr, mapped_size, GuestPageSize);
 	if (vaddr == 0) {
-		LOGF_COLOR(Log::Color::Red,
-		           "guest runtime allocation failed: no free range; name=%s hint=0x%016" PRIx64
+		Log::WriteToConsoleAndLog(fmt::sprintf("guest runtime allocation failed: no free range; name=%s hint=0x%016" PRIx64
 		           " requested=0x%016" PRIx64 " mapped=0x%016" PRIx64
 		           " fixed=%d user=[0x%016" PRIx64 ",0x%016" PRIx64 "]\n",
 		           name, search_addr, size, mapped_size, fixed ? 1 : 0, HOST_USER_MIN,
-		           HOST_USER_MAX);
+		           HOST_USER_MAX));
 		return 0;
 	}
 	VirtualRanges::Range overlap {};
 	if (g_virtual_ranges->QueryOverlap(vaddr, mapped_size, &overlap)) {
-		LOGF_COLOR(Log::Color::Red,
-		           "guest runtime allocation failed: overlap; name=%s addr=0x%016" PRIx64
+		Log::WriteToConsoleAndLog(fmt::sprintf("guest runtime allocation failed: overlap; name=%s addr=0x%016" PRIx64
 		           " size=0x%016" PRIx64 " conflict=[0x%016" PRIx64
 	           ",0x%016" PRIx64 ") type=%s\n",
 		           name, vaddr, mapped_size, overlap.start, overlap.start + overlap.size,
-		           magic_enum::enum_name(overlap.type));
+		           magic_enum::enum_name(overlap.type)));
 		return 0;
 	}
 	UnmapGpuRange(vaddr, mapped_size);
 	if (!g_guest_address_space->Commit(vaddr, mapped_size, mode)) {
-		LOGF_COLOR(Log::Color::Red,
-		           "guest runtime allocation failed: commit; name=%s addr=0x%016" PRIx64
+		Log::WriteToConsoleAndLog(fmt::sprintf("guest runtime allocation failed: commit; name=%s addr=0x%016" PRIx64
 	           " size=0x%016" PRIx64 " mode=0x%08" PRIx32 " errno=%d\n",
-		           name, vaddr, mapped_size, static_cast<uint32_t>(mode), errno);
+		           name, vaddr, mapped_size, static_cast<uint32_t>(mode), errno));
 		return 0;
 	}
 	if (!g_virtual_ranges->Add(vaddr, mapped_size, 0, ProgramProtection(mode), 0, type, name)) {
-		LOGF_COLOR(Log::Color::Red,
-		           "guest runtime allocation failed: range registration; name=%s addr=0x%016" PRIx64
+		Log::WriteToConsoleAndLog(fmt::sprintf("guest runtime allocation failed: range registration; name=%s addr=0x%016" PRIx64
 	           " size=0x%016" PRIx64 "\n",
-		           name, vaddr, mapped_size);
+		           name, vaddr, mapped_size));
 		EXIT_IF(!g_guest_address_space->ReleaseCommitted(vaddr, mapped_size));
 		return 0;
 	}
