@@ -3191,8 +3191,11 @@ static uint64_t AllocateGuestRuntimeMemory(uint64_t search_addr, uint64_t size,
 	}
 	const auto mapped_size = (size + GuestPageSize - 1u) & ~(GuestPageSize - 1u);
 #if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
-	const bool executable_allocation = VirtualMemory::IsExecute(mode);
-	uint64_t   vaddr = 0;
+	// Guest stacks stay in ordinary guest memory even if a caller requests an
+	// executable protection; the JIT arena is reserved for code/runtime allocations.
+	const bool executable_allocation =
+	    VirtualMemory::IsExecute(mode) && type != VirtualRangeType::Stack;
+	uint64_t vaddr = 0;
 	if (fixed) {
 		vaddr = search_addr;
 	} else if (executable_allocation) {
