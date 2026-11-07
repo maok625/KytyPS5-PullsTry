@@ -4428,8 +4428,8 @@ void TestProgramMemoryAllocationAndProtection() {
 void TestMacosArm64PersistentJitArenaLifecycle() {
 	const char* test = "MacosArm64PersistentJitArenaLifecycle";
 	constexpr uint64_t page = SceKernelPageSize;
-	constexpr uint64_t arena_base = 0x7000000000ull;
-	constexpr uint64_t arena_end  = 0x7400000000ull;
+	constexpr uint64_t arena_base = 0x7400000000ull;
+	constexpr uint64_t arena_end  = 0x7800000000ull;
 	constexpr uint64_t program_size = page * 2;
 	constexpr uint64_t worker_size = page;
 
