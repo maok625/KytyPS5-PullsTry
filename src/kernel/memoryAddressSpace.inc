@@ -1149,7 +1149,7 @@ private:
 					}
 					LOGF_COLOR(Log::Color::Yellow,
 					           "guest address-space reservation skipped: requested=0x%016" PRIx64
-					           " returned=0x%016" PRIx64 " size=0x%016" PRIx64 " errno=%d\\n",
+					           " returned=0x%016" PRIx64 " size=0x%016" PRIx64 " errno=%d\n",
 					           chunk_start, returned_address, chunk_size, map_error);
 					chunk_start = chunk_end;
 					continue;
